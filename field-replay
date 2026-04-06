@@ -1,0 +1,699 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Sequence
+
+
+DEFAULT_RECORDINGS_DIR = Path("~/recordings").expanduser()
+DEFAULT_SESSION_PREFIX = "run"
+DEFAULT_PLAYLIST_NAME = "live.m3u8"
+DEFAULT_TIMESHIFT_NAME = "timeshift.ts"
+DEFAULT_ARCHIVE_STEM = "archive"
+DEFAULT_SEGMENT_PATTERN = "segment-%06d.ts"
+DEFAULT_CONCAT_NAME = "segments.ffconcat"
+
+
+@dataclass
+class SessionPaths:
+    recordings_dir: Path
+    session_dir: Path
+    archive_path: Path
+    timeshift_path: Path
+    playlist_path: Path
+    metadata_path: Path
+    concat_path: Path
+    latest_link: Path
+    segment_pattern: str
+
+
+def default_session_name(prefix: str) -> str:
+    timestamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
+    return f"{prefix}-{timestamp}"
+
+
+def make_session_paths(
+    recordings_dir: Path, session_name: str, archive_format: str
+) -> SessionPaths:
+    session_dir = recordings_dir / session_name
+    archive_path = session_dir / f"{DEFAULT_ARCHIVE_STEM}.{archive_format}"
+    timeshift_path = session_dir / DEFAULT_TIMESHIFT_NAME
+    playlist_path = session_dir / DEFAULT_PLAYLIST_NAME
+    metadata_path = session_dir / "session.json"
+    concat_path = session_dir / DEFAULT_CONCAT_NAME
+    latest_link = recordings_dir / "latest"
+    return SessionPaths(
+        recordings_dir=recordings_dir,
+        session_dir=session_dir,
+        archive_path=archive_path,
+        timeshift_path=timeshift_path,
+        playlist_path=playlist_path,
+        metadata_path=metadata_path,
+        concat_path=concat_path,
+        latest_link=latest_link,
+        segment_pattern=DEFAULT_SEGMENT_PATTERN,
+    )
+
+
+def build_ffmpeg_command(paths: SessionPaths, args: argparse.Namespace) -> list[str]:
+    command = [
+        args.ffmpeg_bin,
+        "-hide_banner",
+        "-stats",
+        "-thread_queue_size",
+        str(args.thread_queue_size),
+        "-fflags",
+        "+genpts",
+        "-f",
+        "v4l2",
+        "-framerate",
+        str(args.framerate),
+        "-video_size",
+        args.video_size,
+    ]
+
+    if args.timestamp_source == "device":
+        command.extend(["-timestamps", args.timestamps])
+    else:
+        command.extend(["-use_wallclock_as_timestamps", "1"])
+
+    command.extend(
+        [
+            "-i",
+            args.device,
+        ]
+    )
+
+    if args.audio:
+        command.extend(
+            [
+                "-thread_queue_size",
+                str(args.audio_thread_queue_size),
+                "-f",
+                "alsa",
+                "-sample_rate",
+                str(args.audio_input_rate),
+                "-channels",
+                str(args.audio_input_channels),
+                "-i",
+                args.audio_device,
+            ]
+        )
+
+    command.extend(
+        [
+            "-map",
+            "0:v:0",
+        ]
+    )
+
+    if args.audio:
+        command.extend(["-map", "1:a:0"])
+
+    command.extend(
+        [
+            "-vf",
+            f"fps={args.framerate},settb=AVTB,setpts=N/({args.framerate}*TB)",
+            "-fps_mode",
+            "cfr",
+            "-c:v",
+            args.encoder,
+            "-preset",
+            args.preset,
+            "-pix_fmt",
+            "yuv420p",
+            "-g",
+            str(args.gop),
+            "-keyint_min",
+            str(args.gop),
+        ]
+    )
+
+    if args.video_bitrate:
+        command.extend(["-b:v", args.video_bitrate])
+    if args.maxrate:
+        command.extend(["-maxrate", args.maxrate])
+    if args.bufsize:
+        command.extend(["-bufsize", args.bufsize])
+
+    if args.audio:
+        command.extend(
+            [
+                "-af",
+                f"volume={args.audio_gain_db}dB",
+                "-c:a",
+                args.audio_encoder,
+                "-b:a",
+                args.audio_bitrate,
+                "-ac",
+                str(args.audio_channels),
+                "-ar",
+                str(args.audio_sample_rate),
+            ]
+        )
+
+    command.extend(
+        [
+            "-f",
+            "mpegts",
+            "-mpegts_flags",
+            "+initial_discontinuity",
+            "-muxdelay",
+            "0",
+            "-muxpreload",
+            "0",
+            str(paths.timeshift_path.name),
+        ]
+    )
+    return command
+
+
+def choose_player(preferred: str | None) -> str | None:
+    if preferred:
+        return shutil.which(preferred) or preferred
+    for name in ("vlc", "mpv", "ffplay", "cvlc"):
+        resolved = shutil.which(name)
+        if resolved:
+            return resolved
+    return None
+
+
+def list_alsa_cards() -> list[tuple[str, str]]:
+    cards_path = Path("/proc/asound/cards")
+    if not cards_path.exists():
+        return []
+
+    cards: list[tuple[str, str]] = []
+    lines = cards_path.read_text().splitlines()
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or "[" not in stripped or "]" not in stripped:
+            continue
+        parts = stripped.split()
+        index = parts[0]
+        card_id = stripped.split("[", 1)[1].split("]", 1)[0].strip()
+        cards.append((index, card_id))
+    return cards
+
+
+def alsa_device_exists(device_name: str) -> bool:
+    if not device_name.startswith("hw:"):
+        return False
+
+    card_token = device_name[3:].split(",", 1)[0]
+    cards = list_alsa_cards()
+    return any(card_token in pair for pair in cards)
+
+
+def ensure_parent_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def update_latest_symlink(paths: SessionPaths) -> None:
+    try:
+        if paths.latest_link.is_symlink() or paths.latest_link.exists():
+            paths.latest_link.unlink()
+        paths.latest_link.symlink_to(paths.session_dir.name)
+    except OSError as exc:
+        print(f"warning: could not update latest symlink: {exc}", file=sys.stderr)
+
+
+def segment_files(paths: SessionPaths) -> list[Path]:
+    return sorted(paths.session_dir.glob("segment-*.ts"))
+
+
+def has_timeshift_session(paths: SessionPaths) -> bool:
+    return paths.timeshift_path.exists() and paths.timeshift_path.stat().st_size > 0
+
+
+def write_concat_file(paths: SessionPaths) -> list[Path]:
+    segments = segment_files(paths)
+    lines = ["ffconcat version 1.0"]
+    for segment in segments:
+        lines.append(f"file '{segment.name}'")
+    paths.concat_path.write_text("\n".join(lines) + "\n")
+    return segments
+
+
+def build_concat_archive_command(
+    paths: SessionPaths, ffmpeg_bin: str, archive_format: str
+) -> list[str]:
+    command = [
+        ffmpeg_bin,
+        "-hide_banner",
+        "-y",
+        "-f",
+        "concat",
+        "-safe",
+        "0",
+        "-i",
+        paths.concat_path.name,
+        "-c",
+        "copy",
+    ]
+    if archive_format == "mp4":
+        command.extend(["-movflags", "+faststart"])
+    command.append(paths.archive_path.name)
+    return command
+
+
+def build_timeshift_archive_command(
+    paths: SessionPaths, ffmpeg_bin: str, archive_format: str
+) -> list[str]:
+    command = [
+        ffmpeg_bin,
+        "-hide_banner",
+        "-y",
+        "-i",
+        paths.timeshift_path.name,
+        "-c",
+        "copy",
+    ]
+    if archive_format == "mp4":
+        command.extend(["-movflags", "+faststart"])
+    command.append(paths.archive_path.name)
+    return command
+
+
+def create_archive(paths: SessionPaths, args: argparse.Namespace) -> tuple[bool, str]:
+    if has_timeshift_session(paths):
+        archive_command = build_timeshift_archive_command(
+            paths, args.ffmpeg_bin, args.archive_format
+        )
+        source_label = paths.timeshift_path.name
+    else:
+        segments = write_concat_file(paths)
+        if not segments:
+            return False, "no recording data was captured"
+        archive_command = build_concat_archive_command(
+            paths, args.ffmpeg_bin, args.archive_format
+        )
+        source_label = f"{len(segments)} HLS segments"
+
+    print("Archive:", shlex.join(archive_command))
+    result = subprocess.run(archive_command, cwd=paths.session_dir, check=False)
+    if result.returncode != 0:
+        return False, f"archive remux failed with exit code {result.returncode}"
+    if not paths.archive_path.exists() or paths.archive_path.stat().st_size == 0:
+        return False, "archive file was created but is empty"
+    return True, f"archived from {source_label}"
+
+
+def write_metadata(
+    paths: SessionPaths,
+    args: argparse.Namespace,
+    ffmpeg_command: Sequence[str],
+    state: str,
+    exit_code: int | None = None,
+    archive_status: str | None = None,
+) -> None:
+    payload = {
+        "state": state,
+        "created_at": datetime.now().astimezone().isoformat(),
+        "session_dir": str(paths.session_dir),
+        "archive_path": str(paths.archive_path),
+        "timeshift_path": str(paths.timeshift_path),
+        "playlist_path": str(paths.playlist_path),
+        "device": args.device,
+        "audio_enabled": args.audio,
+        "audio_device": args.audio_device,
+        "audio_channels": args.audio_channels,
+        "audio_sample_rate": args.audio_sample_rate,
+        "audio_bitrate": args.audio_bitrate,
+        "framerate": args.framerate,
+        "video_size": args.video_size,
+        "encoder": args.encoder,
+        "preset": args.preset,
+        "archive_format": args.archive_format,
+        "ffmpeg_command": list(ffmpeg_command),
+        "exit_code": exit_code,
+        "archive_status": archive_status,
+    }
+    paths.metadata_path.write_text(json.dumps(payload, indent=2) + "\n")
+
+
+def resolve_watch_target(recordings_dir: Path, target: str | None) -> Path:
+    if target:
+        resolved = Path(target).expanduser()
+        if resolved.is_dir():
+            timeshift = resolved / DEFAULT_TIMESHIFT_NAME
+            playlist = resolved / DEFAULT_PLAYLIST_NAME
+            return timeshift if timeshift.exists() else playlist
+        return resolved
+
+    latest_link = recordings_dir / "latest"
+    if not latest_link.exists():
+        raise FileNotFoundError(
+            f"no latest session found under {recordings_dir}; run record first"
+        )
+    resolved = latest_link.resolve()
+    timeshift = resolved / DEFAULT_TIMESHIFT_NAME
+    playlist = resolved / DEFAULT_PLAYLIST_NAME
+    return timeshift if timeshift.exists() else playlist
+
+
+def build_player_command(player: str, target_path: Path, file_caching_ms: int) -> list[str]:
+    player_name = Path(player).name
+    if player_name == "ffplay":
+        return [player, str(target_path)]
+    if player_name == "mpv":
+        cache_seconds = max(file_caching_ms / 1000.0, 0.1)
+        return [
+            player,
+            "--hwdec=no",
+            "--cache=yes",
+            f"--demuxer-readahead-secs={cache_seconds:.1f}",
+            f"--audio-buffer={cache_seconds:.1f}",
+            "--cache-pause=no",
+            "--keep-open=yes",
+            "--force-seekable=yes",
+            "--hr-seek=no",
+            str(target_path),
+        ]
+    return [player, f"--file-caching={file_caching_ms}", str(target_path)]
+
+
+def print_session_summary(paths: SessionPaths) -> None:
+    print(f"Session:   {paths.session_dir}")
+    print(f"Archive:   {paths.archive_path}")
+    print(f"DVR File:  {paths.timeshift_path}")
+
+
+def command_record(args: argparse.Namespace) -> int:
+    ffmpeg_path = shutil.which(args.ffmpeg_bin)
+    if not ffmpeg_path:
+        print(f"ffmpeg binary not found: {args.ffmpeg_bin}", file=sys.stderr)
+        return 1
+
+    recordings_dir = args.recordings_dir.expanduser()
+    session_name = args.session_name or default_session_name(args.session_prefix)
+    paths = make_session_paths(recordings_dir, session_name, args.archive_format)
+    ffmpeg_command = build_ffmpeg_command(paths, args)
+
+    print_session_summary(paths)
+    print("FFmpeg:", shlex.join(ffmpeg_command))
+
+    if args.dry_run:
+        return 0
+
+    if paths.session_dir.exists():
+        print(f"session directory already exists: {paths.session_dir}", file=sys.stderr)
+        return 1
+
+    ensure_parent_dir(paths.session_dir)
+    update_latest_symlink(paths)
+    write_metadata(paths, args, ffmpeg_command, state="starting")
+
+    process = subprocess.Popen(ffmpeg_command, cwd=paths.session_dir)
+    interrupted = False
+    try:
+        exit_code = process.wait()
+    except KeyboardInterrupt:
+        interrupted = True
+        print("\nStopping recording...")
+        process.send_signal(signal.SIGINT)
+        exit_code = process.wait()
+
+    capture_ok = exit_code == 0 or (interrupted and exit_code == 255)
+    archive_ok = False
+    archive_status = None
+
+    if capture_ok:
+        archive_ok, archive_status = create_archive(paths, args)
+    else:
+        archive_status = f"capture failed with exit code {exit_code}"
+
+    final_state = "finished" if capture_ok and archive_ok else "partial"
+    write_metadata(
+        paths,
+        args,
+        ffmpeg_command,
+        state=final_state,
+        exit_code=exit_code,
+        archive_status=archive_status,
+    )
+
+    if not capture_ok:
+        return exit_code
+    return 0 if archive_ok else 1
+
+
+def command_watch(args: argparse.Namespace) -> int:
+    player = choose_player(args.player)
+    if not player:
+        print("no player found; install VLC or use ffplay", file=sys.stderr)
+        return 1
+
+    try:
+        target_path = resolve_watch_target(args.recordings_dir.expanduser(), args.target)
+    except FileNotFoundError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+
+    if not target_path.exists():
+        print(f"watch target not found: {target_path}", file=sys.stderr)
+        return 1
+
+    command = build_player_command(player, target_path, args.file_caching_ms)
+    print("Player:", shlex.join(command))
+    if args.dry_run:
+        return 0
+
+    return subprocess.call(command)
+
+
+def check_ffmpeg_support(ffmpeg_bin: str) -> tuple[str | None, bool]:
+    ffmpeg_path = shutil.which(ffmpeg_bin)
+    if not ffmpeg_path:
+        return None, False
+
+    result = subprocess.run(
+        [ffmpeg_path, "-hide_banner", "-encoders"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return ffmpeg_path, "h264_nvenc" in result.stdout
+
+
+def command_doctor(args: argparse.Namespace) -> int:
+    ffmpeg_path, has_nvenc = check_ffmpeg_support(args.ffmpeg_bin)
+    player = choose_player(args.player)
+    device_exists = Path(args.device).exists()
+    audio_ok = alsa_device_exists(args.audio_device) if args.audio else True
+
+    print(f"ffmpeg:   {ffmpeg_path or 'missing'}")
+    print(f"nvenc:    {'yes' if has_nvenc else 'no'}")
+    print(f"player:   {player or 'missing'}")
+    print(f"device:   {args.device} ({'ok' if device_exists else 'missing'})")
+    print(
+        f"audio:    {args.audio_device if args.audio else 'disabled'} "
+        f"({'ok' if audio_ok else 'missing'})"
+    )
+    print(f"outputs:  {args.recordings_dir.expanduser()}")
+
+    if not ffmpeg_path or not device_exists or not audio_ok:
+        return 1
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Record a capture card with ffmpeg and watch the latest session like a DVR."
+    )
+    parser.add_argument(
+        "--recordings-dir",
+        type=Path,
+        default=DEFAULT_RECORDINGS_DIR,
+        help="Base directory for session folders. Default: %(default)s",
+    )
+    parser.add_argument(
+        "--ffmpeg-bin",
+        default="ffmpeg",
+        help="FFmpeg binary to run. Default: %(default)s",
+    )
+    parser.add_argument(
+        "--player",
+        help="Preferred player for watch mode. Defaults to vlc, then mpv, ffplay, cvlc.",
+    )
+
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    record = subparsers.add_parser("record", help="Start a new capture session.")
+    record.add_argument("--device", default="/dev/video2", help="Video device path.")
+    record.add_argument(
+        "--audio",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Capture audio from the USB capture device.",
+    )
+    record.add_argument(
+        "--audio-device",
+        default="hw:Capture,0",
+        help="ALSA capture device. Default matches the MACROSILICON USB audio card.",
+    )
+    record.add_argument(
+        "--audio-input-rate",
+        type=int,
+        default=48000,
+        help="Audio input sample rate from ALSA.",
+    )
+    record.add_argument(
+        "--audio-input-channels",
+        type=int,
+        default=2,
+        help="Audio input channel count from ALSA.",
+    )
+    record.add_argument(
+        "--audio-thread-queue-size",
+        type=int,
+        default=1024,
+        help="Audio input queue size.",
+    )
+    record.add_argument(
+        "--audio-gain-db",
+        type=float,
+        default=18.0,
+        help="Audio gain boost in dB. Default helps very quiet capture-card audio.",
+    )
+    record.add_argument(
+        "--audio-encoder",
+        default="aac",
+        help="Audio encoder for the DVR stream.",
+    )
+    record.add_argument(
+        "--audio-bitrate",
+        default="32k",
+        help="Output audio bitrate. Default is intentionally lightweight.",
+    )
+    record.add_argument(
+        "--audio-sample-rate",
+        type=int,
+        default=32000,
+        help="Output audio sample rate for the DVR stream.",
+    )
+    record.add_argument(
+        "--audio-channels",
+        type=int,
+        default=1,
+        help="Output audio channels. Default is mono for lighter files.",
+    )
+    record.add_argument(
+        "--timestamp-source",
+        choices=("generated", "device"),
+        default="generated",
+        help="Use generated timestamps by default to sidestep broken capture-card timing.",
+    )
+    record.add_argument(
+        "--timestamps",
+        choices=("default", "abs", "mono2abs"),
+        default="abs",
+        help="V4L2 timestamp mode when --timestamp-source=device.",
+    )
+    record.add_argument(
+        "--thread-queue-size",
+        type=int,
+        default=512,
+        help="Input queue size to absorb short capture hiccups.",
+    )
+    record.add_argument("--framerate", type=int, default=30, help="Capture framerate.")
+    record.add_argument(
+        "--video-size", default="1920x1080", help="Input resolution, like 1920x1080."
+    )
+    record.add_argument(
+        "--encoder", default="h264_nvenc", help="Video encoder, like h264_nvenc."
+    )
+    record.add_argument("--preset", default="fast", help="Encoder preset.")
+    record.add_argument(
+        "--gop",
+        type=int,
+        default=30,
+        help="Keyframe interval. Default writes one keyframe per second at 30 fps.",
+    )
+    record.add_argument("--video-bitrate", help="Optional target bitrate, like 8M.")
+    record.add_argument("--maxrate", help="Optional max bitrate, like 10M.")
+    record.add_argument("--bufsize", help="Optional rate-control buffer, like 20M.")
+    record.add_argument(
+        "--archive-format",
+        choices=("mkv", "mp4"),
+        default="mkv",
+        help="Archive container. mkv is safer if recording stops unexpectedly.",
+    )
+    record.add_argument(
+        "--session-prefix",
+        default=DEFAULT_SESSION_PREFIX,
+        help="Prefix for timestamped session directories.",
+    )
+    record.add_argument(
+        "--session-name",
+        help="Explicit session name. Overrides the generated timestamped name.",
+    )
+    record.add_argument(
+        "--dry-run", action="store_true", help="Print the ffmpeg command and exit."
+    )
+    record.set_defaults(func=command_record)
+
+    watch = subparsers.add_parser(
+        "watch", help="Open the latest growing DVR file in VLC or ffplay."
+    )
+    watch.add_argument(
+        "target",
+        nargs="?",
+        help="Optional session directory or file. Defaults to the latest session.",
+    )
+    watch.add_argument(
+        "--player",
+        help="Preferred player for watch mode. Defaults to vlc, then mpv, ffplay, cvlc.",
+    )
+    watch.add_argument(
+        "--dry-run", action="store_true", help="Print the player command and exit."
+    )
+    watch.add_argument(
+        "--file-caching-ms",
+        type=int,
+        default=300,
+        help="VLC file cache in milliseconds for DVR playback.",
+    )
+    watch.set_defaults(func=command_watch)
+
+    doctor = subparsers.add_parser(
+        "doctor", help="Check the main dependencies and device path."
+    )
+    doctor.add_argument("--device", default="/dev/video2", help="Video device path.")
+    doctor.add_argument(
+        "--audio",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Check the configured audio capture device too.",
+    )
+    doctor.add_argument(
+        "--audio-device",
+        default="hw:Capture,0",
+        help="ALSA capture device to check.",
+    )
+    doctor.add_argument(
+        "--player",
+        help="Preferred player to check. Defaults to vlc, then mpv, ffplay, cvlc.",
+    )
+    doctor.set_defaults(func=command_doctor)
+
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
