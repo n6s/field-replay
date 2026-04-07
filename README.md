@@ -35,7 +35,7 @@ Start a recording:
 ./field-replay record
 ```
 
-If you already have a saved profile, `record` now offers a quick-start summary first. In the common case, pressing `Enter` immediately starts with the last-used setup, and `e` drops you back into the full editor if you need to change devices or storage.
+If you already have saved profiles, `record` now starts with a profile picker. In the common case, pressing `Enter` immediately starts the default profile, and `Manual / edit setup` drops you into the full editor if you need to change devices or storage.
 
 By default, `record` now opens a simple interactive flow so you can choose:
 
@@ -43,6 +43,14 @@ By default, `record` now opens a simple interactive flow so you can choose:
 - the current video device
 - the current audio device or no audio
 - the storage destination for the session
+
+If you want a one-tab workflow, try:
+
+```bash
+./field-replay go
+```
+
+`go` uses the same setup/profile flow as `record`, keeps FFmpeg in the foreground so `Ctrl-C` still stops and archives cleanly, and launches the player in the background once the DVR file is live.
 
 That creates a session folder like `~/recordings/run-20260406-154331/` with:
 
@@ -129,6 +137,8 @@ The default capture settings are:
 ./field-replay setup
 ./field-replay setup --video-input-format mjpeg
 ./field-replay setup --profile portable-capture --no-interactive --no-probe
+./field-replay go
+./field-replay go --player vlc
 ./field-replay record --device /dev/video3
 ./field-replay record --video-input-format mjpeg
 ./field-replay record --no-audio

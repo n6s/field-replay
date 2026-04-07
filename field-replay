@@ -138,7 +138,8 @@ def prompt_menu(
     options: Sequence[tuple[str, str]],
     default_value: str | None = None,
 ) -> str:
-    print(title)
+    if title:
+        print(title)
     default_index = None
     for index, (value, label) in enumerate(options, start=1):
         marker = ""
@@ -908,6 +909,16 @@ def profile_summary_lines(profile_name: str, profile: dict) -> list[str]:
     ]
 
 
+def profile_menu_label(profile_name: str, profile: dict) -> str:
+    details = [profile.get("device", "unknown device")]
+    if profile.get("video_size") and profile.get("framerate"):
+        details.append(f"{profile['video_size']} @ {profile['framerate']} fps")
+    recordings_dir = profile.get("recordings_dir")
+    if recordings_dir:
+        details.append(str(Path(recordings_dir).expanduser()))
+    return f"{profile_name} ({'; '.join(details)})"
+
+
 def apply_profile(args: argparse.Namespace, profile: dict) -> None:
     args.device = profile.get("device", args.device)
     args.video_input_format = profile.get(
@@ -927,14 +938,21 @@ def apply_profile(args: argparse.Namespace, profile: dict) -> None:
         args.recordings_dir = Path(recordings_dir).expanduser()
 
 
-def prompt_record_quick_start(profile_name: str, profile: dict) -> str:
-    for line in profile_summary_lines(profile_name, profile):
-        print(line)
-    return prompt_choice(
-        "Press Enter to start now, type 'e' to edit, or 'q' to cancel",
-        {"e": "edit", "q": "cancel"},
-        default="start",
-    )
+def choose_record_profile(config: dict, preferred_profile: str | None = None) -> str | None:
+    profiles = config.get("profiles", {})
+    if not profiles:
+        return None
+
+    options = [
+        (name, profile_menu_label(name, profile))
+        for name, profile in sorted(profiles.items())
+    ]
+    options.append(("__manual__", "Manual / edit setup"))
+    default_value = preferred_profile or config.get("last_profile")
+    if default_value not in profiles:
+        default_value = options[0][0]
+    print("Choose a recording setup")
+    return prompt_menu("", options, default_value=default_value)
 
 
 def configure_record_interactively(
@@ -1413,7 +1431,21 @@ def print_session_summary(paths: SessionPaths) -> None:
     print(f"DVR File:  {paths.timeshift_path}")
 
 
-def command_record(args: argparse.Namespace) -> int:
+def launch_background_player(
+    player: str, target_path: Path, file_caching_ms: int
+) -> subprocess.Popen[bytes]:
+    command = build_player_command(player, target_path, file_caching_ms)
+    print("Player:", shlex.join(command))
+    return subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def run_record_command(args: argparse.Namespace, *, launch_player: bool = False) -> int:
     config_path = args.config_file.expanduser()
     config = load_config(config_path)
     profiles = config.get("profiles", {})
@@ -1426,32 +1458,17 @@ def command_record(args: argparse.Namespace) -> int:
         config["last_profile"] = args.profile
 
     if interactive_mode_enabled(args):
-        quick_start_profile_name = args.profile or config.get("last_profile")
-        if not quick_start_profile_name and len(profiles) == 1:
-            quick_start_profile_name = next(iter(profiles))
-
-        if quick_start_profile_name and quick_start_profile_name in profiles:
-            quick_profile = profiles[quick_start_profile_name]
-            apply_profile(args, quick_profile)
-            config["last_profile"] = quick_start_profile_name
-            action = prompt_record_quick_start(quick_start_profile_name, quick_profile)
-            if action == "q":
-                return 0
-            if action == "e":
-                print()
-                configure_record_interactively(
-                    args,
-                    config,
-                    choose_profile=False,
-                    selected_profile_name=quick_start_profile_name,
-                )
-                print()
-                if not prompt_yes_no("Start recording now?", default=True):
-                    return 0
-                print()
-                save_config(config_path, config)
-            else:
-                save_config(config_path, config)
+        selected_profile_name = choose_record_profile(
+            config, preferred_profile=args.profile
+        )
+        if selected_profile_name and selected_profile_name != "__manual__":
+            selected_profile = profiles[selected_profile_name]
+            apply_profile(args, selected_profile)
+            config["last_profile"] = selected_profile_name
+            for line in profile_summary_lines(selected_profile_name, selected_profile):
+                print(line)
+            print()
+            save_config(config_path, config)
         else:
             configure_record_interactively(args, config)
             print()
@@ -1476,6 +1493,14 @@ def command_record(args: argparse.Namespace) -> int:
         )
         args.encoder = resolved_encoder
 
+    player = None
+    if launch_player:
+        player = choose_player(args.player)
+        if not player:
+            requested = args.player or "vlc/mpv/ffplay"
+            print(f"player not found: {requested}", file=sys.stderr)
+            return 1
+
     recordings_dir = args.recordings_dir.expanduser()
     session_name = args.session_name or default_session_name(args.session_prefix)
     paths = make_session_paths(recordings_dir, session_name, args.archive_format)
@@ -1484,6 +1509,13 @@ def command_record(args: argparse.Namespace) -> int:
     if args.dry_run:
         print_session_summary(paths)
         print("FFmpeg:", shlex.join(ffmpeg_command))
+        if launch_player and player:
+            print(
+                "Player:",
+                shlex.join(
+                    build_player_command(player, paths.timeshift_path, args.file_caching_ms)
+                ),
+            )
         return 0
 
     if paths.session_dir.exists():
@@ -1504,6 +1536,7 @@ def command_record(args: argparse.Namespace) -> int:
     process = subprocess.Popen(ffmpeg_command, cwd=paths.session_dir)
     interrupted = False
     capture_started = False
+    player_process = None
     try:
         capture_started = wait_for_capture_output(paths, process)
         if capture_started:
@@ -1511,6 +1544,10 @@ def command_record(args: argparse.Namespace) -> int:
             config["last_recordings_dir"] = str(recordings_dir)
             config["last_session_dir"] = str(paths.session_dir)
             save_config(config_path, config)
+            if launch_player and player:
+                player_process = launch_background_player(
+                    player, paths.timeshift_path, args.file_caching_ms
+                )
         exit_code = process.wait()
     except KeyboardInterrupt:
         interrupted = True
@@ -1547,6 +1584,14 @@ def command_record(args: argparse.Namespace) -> int:
     if capture_ok:
         return 0 if archive_ok else 1
     return 1 if archive_ok else exit_code
+
+
+def command_record(args: argparse.Namespace) -> int:
+    return run_record_command(args, launch_player=False)
+
+
+def command_go(args: argparse.Namespace) -> int:
+    return run_record_command(args, launch_player=True)
 
 
 def command_watch(args: argparse.Namespace) -> int:
@@ -1612,6 +1657,148 @@ def command_doctor(args: argparse.Namespace) -> int:
     if not ffmpeg_path or not resolved_encoder or not device_exists or not audio_ok:
         return 1
     return 0
+
+
+def add_record_arguments(
+    parser: argparse.ArgumentParser, *, include_player_options: bool = False
+) -> None:
+    parser.add_argument("--device", default="/dev/video2", help="Video device path.")
+    parser.add_argument(
+        "--video-input-format",
+        default=DEFAULT_VIDEO_INPUT_FORMAT,
+        help="Preferred V4L2 input format, such as mjpeg or yuyv422.",
+    )
+    parser.add_argument(
+        "--audio",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Capture audio from the USB capture device.",
+    )
+    parser.add_argument(
+        "--audio-device",
+        default="hw:Capture,0",
+        help="ALSA capture device. Default matches the MACROSILICON USB audio card.",
+    )
+    parser.add_argument(
+        "--audio-input-rate",
+        type=int,
+        default=48000,
+        help="Audio input sample rate from ALSA.",
+    )
+    parser.add_argument(
+        "--audio-input-channels",
+        type=int,
+        default=2,
+        help="Audio input channel count from ALSA.",
+    )
+    parser.add_argument(
+        "--audio-thread-queue-size",
+        type=int,
+        default=1024,
+        help="Audio input queue size.",
+    )
+    parser.add_argument(
+        "--audio-gain-db",
+        type=float,
+        default=18.0,
+        help="Audio gain boost in dB. Default helps very quiet capture-card audio.",
+    )
+    parser.add_argument(
+        "--audio-encoder",
+        default="aac",
+        help="Audio encoder for the DVR stream.",
+    )
+    parser.add_argument(
+        "--audio-bitrate",
+        default="32k",
+        help="Output audio bitrate. Default is intentionally lightweight.",
+    )
+    parser.add_argument(
+        "--audio-sample-rate",
+        type=int,
+        default=32000,
+        help="Output audio sample rate for the DVR stream.",
+    )
+    parser.add_argument(
+        "--audio-channels",
+        type=int,
+        default=1,
+        help="Output audio channels. Default is mono for lighter files.",
+    )
+    parser.add_argument(
+        "--timestamp-source",
+        choices=("generated", "device"),
+        default="generated",
+        help="Use generated timestamps by default to sidestep broken capture-card timing.",
+    )
+    parser.add_argument(
+        "--timestamps",
+        choices=("default", "abs", "mono2abs"),
+        default="abs",
+        help="V4L2 timestamp mode when --timestamp-source=device.",
+    )
+    parser.add_argument(
+        "--thread-queue-size",
+        type=int,
+        default=512,
+        help="Input queue size to absorb short capture hiccups.",
+    )
+    parser.add_argument("--framerate", type=int, default=30, help="Capture framerate.")
+    parser.add_argument(
+        "--video-size", default="1920x1080", help="Input resolution, like 1920x1080."
+    )
+    parser.add_argument(
+        "--encoder", default=DEFAULT_ENCODER, help="Video encoder, like h264_nvenc."
+    )
+    parser.add_argument("--preset", default="fast", help="Encoder preset.")
+    parser.add_argument(
+        "--gop",
+        type=int,
+        default=None,
+        help="Keyframe interval in frames. Defaults to roughly one second of video.",
+    )
+    parser.add_argument("--video-bitrate", help="Optional target bitrate, like 8M.")
+    parser.add_argument("--maxrate", help="Optional max bitrate, like 10M.")
+    parser.add_argument("--bufsize", help="Optional rate-control buffer, like 20M.")
+    parser.add_argument(
+        "--archive-format",
+        choices=("mkv", "mp4"),
+        default="mkv",
+        help="Archive container. mkv is safer if recording stops unexpectedly.",
+    )
+    parser.add_argument(
+        "--session-prefix",
+        default=DEFAULT_SESSION_PREFIX,
+        help="Prefix for timestamped session directories.",
+    )
+    parser.add_argument(
+        "--session-name",
+        help="Explicit session name. Overrides the generated timestamped name.",
+    )
+    parser.add_argument(
+        "--profile",
+        help="Saved profile to use for recording before any interactive edits.",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Print the ffmpeg command and exit."
+    )
+    parser.add_argument(
+        "--interactive",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Prompt for video, audio, and storage choices before recording.",
+    )
+    if include_player_options:
+        parser.add_argument(
+            "--player",
+            help="Preferred player for go mode. Defaults to vlc, then mpv, ffplay, cvlc.",
+        )
+        parser.add_argument(
+            "--file-caching-ms",
+            type=int,
+            default=300,
+            help="Player file cache in milliseconds for the auto-launched watch window.",
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1715,133 +1902,15 @@ def build_parser() -> argparse.ArgumentParser:
     setup.set_defaults(func=command_setup)
 
     record = subparsers.add_parser("record", help="Start a new capture session.")
-    record.add_argument("--device", default="/dev/video2", help="Video device path.")
-    record.add_argument(
-        "--video-input-format",
-        default=DEFAULT_VIDEO_INPUT_FORMAT,
-        help="Preferred V4L2 input format, such as mjpeg or yuyv422.",
-    )
-    record.add_argument(
-        "--audio",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Capture audio from the USB capture device.",
-    )
-    record.add_argument(
-        "--audio-device",
-        default="hw:Capture,0",
-        help="ALSA capture device. Default matches the MACROSILICON USB audio card.",
-    )
-    record.add_argument(
-        "--audio-input-rate",
-        type=int,
-        default=48000,
-        help="Audio input sample rate from ALSA.",
-    )
-    record.add_argument(
-        "--audio-input-channels",
-        type=int,
-        default=2,
-        help="Audio input channel count from ALSA.",
-    )
-    record.add_argument(
-        "--audio-thread-queue-size",
-        type=int,
-        default=1024,
-        help="Audio input queue size.",
-    )
-    record.add_argument(
-        "--audio-gain-db",
-        type=float,
-        default=18.0,
-        help="Audio gain boost in dB. Default helps very quiet capture-card audio.",
-    )
-    record.add_argument(
-        "--audio-encoder",
-        default="aac",
-        help="Audio encoder for the DVR stream.",
-    )
-    record.add_argument(
-        "--audio-bitrate",
-        default="32k",
-        help="Output audio bitrate. Default is intentionally lightweight.",
-    )
-    record.add_argument(
-        "--audio-sample-rate",
-        type=int,
-        default=32000,
-        help="Output audio sample rate for the DVR stream.",
-    )
-    record.add_argument(
-        "--audio-channels",
-        type=int,
-        default=1,
-        help="Output audio channels. Default is mono for lighter files.",
-    )
-    record.add_argument(
-        "--timestamp-source",
-        choices=("generated", "device"),
-        default="generated",
-        help="Use generated timestamps by default to sidestep broken capture-card timing.",
-    )
-    record.add_argument(
-        "--timestamps",
-        choices=("default", "abs", "mono2abs"),
-        default="abs",
-        help="V4L2 timestamp mode when --timestamp-source=device.",
-    )
-    record.add_argument(
-        "--thread-queue-size",
-        type=int,
-        default=512,
-        help="Input queue size to absorb short capture hiccups.",
-    )
-    record.add_argument("--framerate", type=int, default=30, help="Capture framerate.")
-    record.add_argument(
-        "--video-size", default="1920x1080", help="Input resolution, like 1920x1080."
-    )
-    record.add_argument(
-        "--encoder", default=DEFAULT_ENCODER, help="Video encoder, like h264_nvenc."
-    )
-    record.add_argument("--preset", default="fast", help="Encoder preset.")
-    record.add_argument(
-        "--gop",
-        type=int,
-        default=None,
-        help="Keyframe interval in frames. Defaults to roughly one second of video.",
-    )
-    record.add_argument("--video-bitrate", help="Optional target bitrate, like 8M.")
-    record.add_argument("--maxrate", help="Optional max bitrate, like 10M.")
-    record.add_argument("--bufsize", help="Optional rate-control buffer, like 20M.")
-    record.add_argument(
-        "--archive-format",
-        choices=("mkv", "mp4"),
-        default="mkv",
-        help="Archive container. mkv is safer if recording stops unexpectedly.",
-    )
-    record.add_argument(
-        "--session-prefix",
-        default=DEFAULT_SESSION_PREFIX,
-        help="Prefix for timestamped session directories.",
-    )
-    record.add_argument(
-        "--session-name",
-        help="Explicit session name. Overrides the generated timestamped name.",
-    )
-    record.add_argument(
-        "--profile",
-        help="Saved profile to use for recording before any interactive edits.",
-    )
-    record.add_argument(
-        "--dry-run", action="store_true", help="Print the ffmpeg command and exit."
-    )
-    record.add_argument(
-        "--interactive",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Prompt for video, audio, and storage choices before recording.",
-    )
+    add_record_arguments(record)
     record.set_defaults(func=command_record)
+
+    go = subparsers.add_parser(
+        "go",
+        help="Start recording in the foreground and launch the player in the background.",
+    )
+    add_record_arguments(go, include_player_options=True)
+    go.set_defaults(func=command_go)
 
     watch = subparsers.add_parser(
         "watch", help="Open a growing DVR file in a player."
