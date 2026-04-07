@@ -43,6 +43,8 @@ Notes for Linux on a Chromebook:
 - Hardware encoding may differ from your workstation, so `field-replay` should be allowed to fall back from `h264_nvenc` to another encoder like `libx264`.
 - USB device forwarding into the Linux environment can matter just as much as package installation.
 - Storage may be tighter, so using an external drive or a larger mounted path is often the right move for long events.
+- In our testing with Crostini, a USB HDMI capture dongle did not appear in the Linux USB-sharing UI and did not create any `/dev/video*` device nodes. As of April 7, 2026, Google documents that cameras are not yet supported for Linux on Chromebook, so a capture dongle may simply be unavailable there.
+- Practical takeaway: a Chromebook running Crostini is not a reliable target for USB capture-card recording right now. It may still be useful as a viewer, notes/logging machine, or remote terminal into a separate Linux recorder.
 
 ## Quick start
 
@@ -98,6 +100,16 @@ In another terminal, open a DVR feed:
 If you do not pass a target, `watch` offers an interactive picker of recent sessions across known recordings directories. It defaults to VLC because VLC has been the most reliable player so far for this growing DVR file. `mpv` is still available with `--player mpv`, but the tool now forces software decode there because hardware decode was not behaving well on this workstation.
 
 The watch picker now labels each session with the target type it will open, such as `DVR timeshift` or `archive.mkv`, so it is clearer which entry is the still-growing live review file.
+
+When you want a share-friendly copy after the event:
+
+```bash
+./field-replay export
+```
+
+`export` offers an interactive picker of recent sessions across known recordings directories, then lets you choose a simple MP4 share preset with an estimated file size before it runs.
+
+When possible, `export` now prefers a hardware H.264 encoder that matches the original session and writes a small sidecar JSON file next to the MP4 so you can tell later how the share copy was produced.
 
 ## Player behavior
 
@@ -187,6 +199,9 @@ The default capture settings are:
 ./field-replay watch --player vlc
 ./field-replay watch --player ffplay
 ./field-replay watch --file-caching-ms 100
+./field-replay export
+./field-replay export --preset share-small
+./field-replay export --dry-run
 ./field-replay record --dry-run
 ./field-replay --config-file /tmp/field-replay-config.json record
 ```
