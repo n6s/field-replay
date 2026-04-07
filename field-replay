@@ -3,11 +3,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
 import shlex
 import shutil
 import signal
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -15,12 +18,37 @@ from typing import Sequence
 
 
 DEFAULT_RECORDINGS_DIR = Path("~/recordings").expanduser()
+DEFAULT_CONFIG_PATH = Path("~/.config/field-replay/config.json").expanduser()
 DEFAULT_SESSION_PREFIX = "run"
 DEFAULT_PLAYLIST_NAME = "live.m3u8"
 DEFAULT_TIMESHIFT_NAME = "timeshift.ts"
 DEFAULT_ARCHIVE_STEM = "archive"
 DEFAULT_SEGMENT_PATTERN = "segment-%06d.ts"
 DEFAULT_CONCAT_NAME = "segments.ffconcat"
+DEFAULT_ENCODER = "h264_nvenc"
+DEFAULT_VIDEO_INPUT_FORMAT = "auto"
+COMMON_VIDEO_SIZES = ("1920x1080", "1280x720", "1024x576", "640x480")
+COMMON_FRAME_RATES = (30, 25, 15, 10, 5)
+COMMON_VIDEO_INPUT_FORMATS = ("auto", "mjpeg", "yuyv422", "uyvy422", "nv12")
+COMMON_AUDIO_INPUTS = ((48000, 2), (48000, 1), (44100, 2), (44100, 1), (32000, 1))
+
+
+def effective_gop(args: argparse.Namespace) -> int:
+    if args.gop is not None:
+        return max(1, args.gop)
+    return max(1, args.framerate)
+
+
+@dataclass
+class VideoDevice:
+    path: str
+    label: str
+
+
+@dataclass
+class AudioDevice:
+    device: str
+    label: str
 
 
 @dataclass
@@ -64,7 +92,165 @@ def make_session_paths(
     )
 
 
+def interactive_mode_enabled(args: argparse.Namespace) -> bool:
+    return (
+        getattr(args, "interactive", True)
+        and sys.stdin.isatty()
+        and sys.stdout.isatty()
+    )
+
+
+def ensure_directory(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def load_config(config_path: Path) -> dict:
+    if not config_path.exists():
+        return {"profiles": {}}
+
+    try:
+        payload = json.loads(config_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {"profiles": {}}
+
+    if not isinstance(payload, dict):
+        return {"profiles": {}}
+    payload.setdefault("profiles", {})
+    return payload
+
+
+def save_config(config_path: Path, payload: dict) -> bool:
+    try:
+        ensure_directory(config_path.parent)
+        config_path.write_text(json.dumps(payload, indent=2) + "\n")
+    except OSError as exc:
+        print(f"warning: could not save config: {exc}", file=sys.stderr)
+        return False
+    return True
+
+
+def slugify(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-") or "item"
+
+
+def prompt_menu(
+    title: str,
+    options: Sequence[tuple[str, str]],
+    default_value: str | None = None,
+) -> str:
+    print(title)
+    default_index = None
+    for index, (value, label) in enumerate(options, start=1):
+        marker = ""
+        if value == default_value:
+            default_index = index
+            marker = " [default]"
+        print(f"  {index}. {label}{marker}")
+
+    while True:
+        prompt = "Select an option"
+        if default_index is not None:
+            prompt += f" [{default_index}]"
+        prompt += ": "
+        raw = input(prompt).strip()
+        if not raw and default_index is not None:
+            return options[default_index - 1][0]
+        if raw.isdigit():
+            selected = int(raw)
+            if 1 <= selected <= len(options):
+                return options[selected - 1][0]
+        print("Please enter one of the numbered options.")
+
+
+def prompt_text(prompt: str, default: str | None = None) -> str:
+    suffix = f" [{default}]" if default else ""
+    raw = input(f"{prompt}{suffix}: ").strip()
+    if raw:
+        return raw
+    if default is not None:
+        return default
+    return ""
+
+
+def prompt_yes_no(prompt: str, default: bool = True) -> bool:
+    suffix = " [Y/n]: " if default else " [y/N]: "
+    raw = input(prompt + suffix).strip().lower()
+    if not raw:
+        return default
+    return raw in {"y", "yes"}
+
+
+def prompt_choice(
+    prompt: str, choices: dict[str, str], default: str
+) -> str:
+    choice_list = "/".join(choices)
+    while True:
+        raw = input(f"{prompt} [{choice_list}] ").strip().lower()
+        if not raw:
+            return default
+        if raw in choices:
+            return raw
+        print(f"Please choose one of: {', '.join(choices.values())}.")
+
+
+def format_bytes(value: int) -> str:
+    size = float(value)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if size < 1024 or unit == "TiB":
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{value} B"
+
+
+def storage_summary(path: Path) -> str:
+    candidate = path.expanduser()
+    target = candidate if candidate.exists() else candidate.parent
+    try:
+        usage = shutil.disk_usage(target)
+    except FileNotFoundError:
+        return f"{candidate} (path does not exist yet)"
+    return f"{candidate} ({format_bytes(usage.free)} free)"
+
+
+def v4l_id_aliases() -> dict[str, str]:
+    by_id_dir = Path("/dev/v4l/by-id")
+    aliases: dict[str, str] = {}
+    if not by_id_dir.exists():
+        return aliases
+
+    for item in sorted(by_id_dir.iterdir()):
+        try:
+            resolved = item.resolve()
+        except OSError:
+            continue
+        aliases[str(resolved)] = item.name
+    return aliases
+
+
+def list_video_devices() -> list[VideoDevice]:
+    devices: list[VideoDevice] = []
+    aliases = v4l_id_aliases()
+    sysfs_root = Path("/sys/class/video4linux")
+    if not sysfs_root.exists():
+        return devices
+
+    for entry in sorted(sysfs_root.iterdir()):
+        device_path = Path("/dev") / entry.name
+        if not device_path.exists():
+            continue
+        name_path = entry / "name"
+        label = entry.name
+        if name_path.exists():
+            label = name_path.read_text().strip() or label
+        alias = aliases.get(str(device_path.resolve()))
+        full_label = f"{device_path} - {label}"
+        if alias:
+            full_label += f" ({alias})"
+        devices.append(VideoDevice(path=str(device_path), label=full_label))
+    return devices
+
 def build_ffmpeg_command(paths: SessionPaths, args: argparse.Namespace) -> list[str]:
+    gop = effective_gop(args)
     command = [
         args.ffmpeg_bin,
         "-hide_banner",
@@ -80,6 +266,9 @@ def build_ffmpeg_command(paths: SessionPaths, args: argparse.Namespace) -> list[
         "-video_size",
         args.video_size,
     ]
+
+    if args.video_input_format != DEFAULT_VIDEO_INPUT_FORMAT:
+        command.extend(["-input_format", args.video_input_format])
 
     if args.timestamp_source == "device":
         command.extend(["-timestamps", args.timestamps])
@@ -132,9 +321,9 @@ def build_ffmpeg_command(paths: SessionPaths, args: argparse.Namespace) -> list[
             "-pix_fmt",
             "yuv420p",
             "-g",
-            str(args.gop),
+            str(gop),
             "-keyint_min",
-            str(args.gop),
+            str(gop),
         ]
     )
 
@@ -179,7 +368,10 @@ def build_ffmpeg_command(paths: SessionPaths, args: argparse.Namespace) -> list[
 
 def choose_player(preferred: str | None) -> str | None:
     if preferred:
-        return shutil.which(preferred) or preferred
+        preferred_path = Path(preferred).expanduser()
+        if preferred_path.is_file():
+            return str(preferred_path)
+        return shutil.which(preferred)
     for name in ("vlc", "mpv", "ffplay", "cvlc"):
         resolved = shutil.which(name)
         if resolved:
@@ -187,35 +379,847 @@ def choose_player(preferred: str | None) -> str | None:
     return None
 
 
-def list_alsa_cards() -> list[tuple[str, str]]:
+def list_alsa_cards() -> list[tuple[str, str, str]]:
     cards_path = Path("/proc/asound/cards")
     if not cards_path.exists():
         return []
 
-    cards: list[tuple[str, str]] = []
+    cards: list[tuple[str, str, str]] = []
     lines = cards_path.read_text().splitlines()
-    for line in lines:
+    for index, line in enumerate(lines):
         stripped = line.strip()
         if not stripped or "[" not in stripped or "]" not in stripped:
             continue
         parts = stripped.split()
-        index = parts[0]
+        card_index = parts[0]
         card_id = stripped.split("[", 1)[1].split("]", 1)[0].strip()
-        cards.append((index, card_id))
+        description = ""
+        if index + 1 < len(lines):
+            description = lines[index + 1].strip()
+        cards.append((card_index, card_id, description))
     return cards
 
 
+def parse_hw_device(device_name: str) -> tuple[str, str] | None:
+    if not device_name.startswith("hw:") or "," not in device_name:
+        return None
+    card_token, pcm_device = device_name[3:].split(",", 1)
+    return card_token, pcm_device
+
+
+def list_alsa_capture_devices() -> list[AudioDevice]:
+    cards = {index: (card_id, desc) for index, card_id, desc in list_alsa_cards()}
+    pcm_path = Path("/proc/asound/pcm")
+    if not pcm_path.exists():
+        return []
+
+    devices: list[AudioDevice] = []
+    for line in pcm_path.read_text().splitlines():
+        stripped = line.strip()
+        if not stripped or ": capture" not in stripped:
+            continue
+        card_and_pcm = stripped.split(":", 1)[0]
+        if "-" not in card_and_pcm:
+            continue
+        card_index_raw, pcm_device_raw = card_and_pcm.split("-", 1)
+        card_index = str(int(card_index_raw))
+        pcm_device = str(int(pcm_device_raw))
+        card_id, description = cards.get(card_index, (card_index, ""))
+        label = f"hw:{card_id},{pcm_device}"
+        if description:
+            label += f" - {description}"
+        devices.append(AudioDevice(device=f"hw:{card_id},{pcm_device}", label=label))
+    return devices
+
+
 def alsa_device_exists(device_name: str) -> bool:
-    if not device_name.startswith("hw:"):
+    parsed = parse_hw_device(device_name)
+    if not parsed:
         return False
 
-    card_token = device_name[3:].split(",", 1)[0]
+    requested_card, requested_pcm = parsed
     cards = list_alsa_cards()
-    return any(card_token in pair for pair in cards)
+    valid_card_tokens = {
+        card_token
+        for index, card_token, _ in cards
+        if requested_card in {index, card_token}
+    }
+    if not valid_card_tokens:
+        return False
+
+    for device in list_alsa_capture_devices():
+        device_card, device_pcm = parse_hw_device(device.device) or ("", "")
+        if device_pcm == requested_pcm and device_card in valid_card_tokens:
+            return True
+    return False
 
 
-def ensure_parent_dir(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True)
+def detect_supported_encoders(ffmpeg_bin: str) -> tuple[str | None, set[str]]:
+    ffmpeg_path = shutil.which(ffmpeg_bin)
+    if not ffmpeg_path:
+        return None, set()
+
+    result = subprocess.run(
+        [ffmpeg_path, "-hide_banner", "-encoders"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    encoders: set[str] = set()
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0][0] in {"V", "A", "S"}:
+            encoders.add(parts[1])
+    return ffmpeg_path, encoders
+
+
+def resolve_encoder(
+    ffmpeg_path: str | None, supported_encoders: set[str], requested: str
+) -> str | None:
+    if not ffmpeg_path:
+        return None
+    if requested in supported_encoders:
+        return requested
+    for candidate in ("h264_nvenc", "libx264", "h264_v4l2m2m", "h264_vaapi", "mpeg4"):
+        if candidate in supported_encoders:
+            return candidate
+    return None
+
+
+def run_ffmpeg_probe(command: Sequence[str], timeout_seconds: float = 8.0) -> tuple[bool, str]:
+    try:
+        result = subprocess.run(
+            list(command),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout_seconds,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, str(exc)
+
+    output = "\n".join(part for part in (result.stdout, result.stderr) if part).strip()
+    return result.returncode == 0, output
+
+
+def extract_probe_video_details(output: str) -> tuple[str | None, float | None]:
+    video_size = None
+    fps = None
+    size_match = re.search(r"Video:\s.*?,\s(\d+x\d+)", output)
+    if size_match:
+        video_size = size_match.group(1)
+
+    fps_match = re.search(r",\s([0-9]+(?:\.[0-9]+)?)\sfps,", output)
+    if fps_match:
+        fps = float(fps_match.group(1))
+    else:
+        changed_match = re.search(
+            r"time per frame from 1/([0-9]+) to 1/([0-9]+)", output
+        )
+        if changed_match:
+            numerator = float(changed_match.group(2))
+            if numerator:
+                fps = numerator
+    return video_size, fps
+
+
+def extract_probe_video_codec(output: str) -> str | None:
+    codec_match = re.search(r"Video:\s([a-zA-Z0-9_]+)", output)
+    if codec_match:
+        return codec_match.group(1).lower()
+    return None
+
+
+def summarize_probe_failure(output: str) -> str | None:
+    for line in reversed(output.splitlines()):
+        stripped = line.strip()
+        if stripped and "frame=" not in stripped:
+            return stripped
+    return None
+
+
+def probe_video_mode(
+    ffmpeg_bin: str,
+    device: str,
+    video_size: str,
+    framerate: int,
+    input_format: str,
+) -> dict:
+    command = [
+        ffmpeg_bin,
+        "-hide_banner",
+        "-loglevel",
+        "info",
+        "-f",
+        "v4l2",
+    ]
+    if input_format != DEFAULT_VIDEO_INPUT_FORMAT:
+        command.extend(["-input_format", input_format])
+    command.extend(
+        [
+            "-framerate",
+            str(framerate),
+            "-video_size",
+            video_size,
+            "-i",
+            device,
+            "-frames:v",
+            "1",
+            "-f",
+            "null",
+            "-",
+        ]
+    )
+    ok, output = run_ffmpeg_probe(command)
+    actual_size, actual_fps = extract_probe_video_details(output)
+    actual_codec = extract_probe_video_codec(output)
+    exact = ok and actual_size == video_size and (
+        actual_fps is None or abs(actual_fps - framerate) < 0.5
+    )
+    return {
+        "ok": ok,
+        "input_format": input_format,
+        "requested_size": video_size,
+        "requested_fps": framerate,
+        "actual_size": actual_size or video_size,
+        "actual_fps": actual_fps or float(framerate),
+        "actual_codec": actual_codec or input_format,
+        "exact": exact,
+        "output": output,
+    }
+
+
+def video_probe_candidates(
+    video_size: str, framerate: int, input_format: str
+) -> list[tuple[str, int, str]]:
+    sizes = [video_size, *[size for size in COMMON_VIDEO_SIZES if size != video_size]]
+    fps_values = [framerate, *[fps for fps in COMMON_FRAME_RATES if fps != framerate]]
+    formats = [
+        input_format,
+        *[fmt for fmt in COMMON_VIDEO_INPUT_FORMATS if fmt != input_format],
+    ]
+    candidates: list[tuple[str, int, str]] = []
+    for fmt in formats:
+        for size in sizes:
+            for fps in fps_values:
+                triple = (size, fps, fmt)
+                if triple not in candidates:
+                    candidates.append(triple)
+    return candidates
+
+
+def choose_video_profile_settings(
+    ffmpeg_bin: str,
+    device: str,
+    current_size: str,
+    current_fps: int,
+    current_input_format: str,
+) -> tuple[str, int, str, list[dict], str | None]:
+    successful: list[dict] = []
+    seen_actual: set[tuple[str, int, str]] = set()
+    failure_reason = None
+    for size, fps, input_format in video_probe_candidates(
+        current_size, current_fps, current_input_format
+    ):
+        result = probe_video_mode(ffmpeg_bin, device, size, fps, input_format)
+        if not result["ok"]:
+            failure_reason = summarize_probe_failure(result["output"]) or failure_reason
+            continue
+        actual_key = (
+            result["actual_size"],
+            int(round(result["actual_fps"])),
+            result["input_format"],
+        )
+        if actual_key in seen_actual:
+            continue
+        successful.append(result)
+        seen_actual.add(actual_key)
+        if result["exact"]:
+            return size, fps, input_format, successful, failure_reason
+        if len(successful) >= 4:
+            break
+
+    if not successful:
+        return current_size, current_fps, current_input_format, [], failure_reason
+
+    def video_score(item: dict) -> tuple[float, int]:
+        requested_pixels = int(current_size.split("x")[0]) * int(current_size.split("x")[1])
+        actual_width, actual_height = [int(part) for part in item["actual_size"].split("x")]
+        actual_pixels = actual_width * actual_height
+        fps_score = min(item["actual_fps"], current_fps)
+        pixel_score = min(actual_pixels, requested_pixels) / max(requested_pixels, 1)
+        return (fps_score + pixel_score, actual_pixels)
+
+    best = max(successful, key=video_score)
+    return (
+        best["actual_size"],
+        int(round(best["actual_fps"])),
+        best["input_format"],
+        successful,
+        failure_reason,
+    )
+
+
+def probe_audio_input(
+    ffmpeg_bin: str, device: str, sample_rate: int, channels: int
+) -> dict:
+    command = [
+        ffmpeg_bin,
+        "-hide_banner",
+        "-loglevel",
+        "info",
+        "-f",
+        "alsa",
+        "-sample_rate",
+        str(sample_rate),
+        "-channels",
+        str(channels),
+        "-i",
+        device,
+        "-t",
+        "0.2",
+        "-f",
+        "null",
+        "-",
+    ]
+    ok, output = run_ffmpeg_probe(command)
+    return {
+        "ok": ok,
+        "sample_rate": sample_rate,
+        "channels": channels,
+        "output": output,
+    }
+
+
+def choose_audio_profile_settings(
+    ffmpeg_bin: str, device: str, current_rate: int, current_channels: int
+) -> tuple[int, int, list[dict], str | None]:
+    candidates = [
+        (current_rate, current_channels),
+        *[
+            pair
+            for pair in COMMON_AUDIO_INPUTS
+            if pair != (current_rate, current_channels)
+        ],
+    ]
+    successes: list[dict] = []
+    failure_reason = None
+    for sample_rate, channels in candidates:
+        result = probe_audio_input(ffmpeg_bin, device, sample_rate, channels)
+        if result["ok"]:
+            successes.append(result)
+            if sample_rate == current_rate and channels == current_channels:
+                return sample_rate, channels, successes, failure_reason
+            if len(successes) >= 3:
+                break
+        else:
+            failure_reason = summarize_probe_failure(result["output"]) or failure_reason
+
+    if not successes:
+        return current_rate, current_channels, [], failure_reason
+
+    best = max(successes, key=lambda item: (item["channels"], item["sample_rate"]))
+    return best["sample_rate"], best["channels"], successes, failure_reason
+
+
+def print_video_probe_results(results: Sequence[dict]) -> None:
+    if not results:
+        print("No working video mode was detected with the built-in probe.")
+        return
+    print("Detected video modes")
+    for index, item in enumerate(results, start=1):
+        actual_fps = int(round(item["actual_fps"]))
+        note = ""
+        if not item["exact"]:
+            note = f" (requested {item['requested_size']} @ {item['requested_fps']} fps)"
+        fmt = item["input_format"]
+        fmt_label = "auto" if fmt == DEFAULT_VIDEO_INPUT_FORMAT else fmt
+        print(f"  {index}. {item['actual_size']} @ {actual_fps} fps via {fmt_label}{note}")
+
+
+def print_audio_probe_results(results: Sequence[dict]) -> None:
+    if not results:
+        print("No working audio input mode was detected with the built-in probe.")
+        return
+    print("Detected audio input modes")
+    for index, item in enumerate(results, start=1):
+        print(f"  {index}. {item['sample_rate']} Hz, {item['channels']} channel(s)")
+
+
+def choose_saved_profile(
+    config: dict, default_manual: bool = False, preferred_profile: str | None = None
+) -> str | None:
+    profiles = config.get("profiles", {})
+    if not profiles:
+        return None
+    options = []
+    for name, profile in sorted(profiles.items()):
+        details = [profile.get("device", "unknown device")]
+        if profile.get("video_size") and profile.get("framerate"):
+            details.append(f"{profile['video_size']} @ {profile['framerate']} fps")
+        recordings_dir = profile.get("recordings_dir")
+        if recordings_dir:
+            details.append(str(Path(recordings_dir).expanduser()))
+        options.append((name, f"{name} ({'; '.join(details)})"))
+    if default_manual:
+        options.append(("__manual__", "Manual / one-time setup"))
+        default_value = "__manual__"
+    else:
+        default_value = preferred_profile or config.get("last_profile")
+        if default_value not in profiles:
+            default_value = options[0][0]
+        options.append(("__manual__", "Manual / one-time setup"))
+    choice = prompt_menu("Choose a setup", options, default_value=default_value)
+    if choice == "__manual__":
+        return None
+    return choice
+
+
+def candidate_storage_paths(current: Path) -> list[Path]:
+    user = os.environ.get("USER", "")
+    candidates = [current.expanduser()]
+    extras = [
+        Path("/mnt/storage") / "field-replay",
+        Path("/mnt/storage"),
+        Path(f"/media/{user}") if user else None,
+        Path(f"/run/media/{user}") if user else None,
+    ]
+    for extra in extras:
+        if extra is None or not extra.exists():
+            continue
+        if extra.is_dir() and extra.name == "field-replay":
+            candidates.append(extra)
+            continue
+        if extra.is_dir() and extra.parent.name in {"media", "run"}:
+            for child in sorted(extra.iterdir()):
+                if child.is_dir():
+                    candidates.append(child / "field-replay")
+        elif extra.is_dir():
+            candidates.append(extra / "field-replay")
+
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key not in seen:
+            seen.add(key)
+            unique.append(candidate)
+    return unique
+
+
+def select_video_device(current_device: str) -> str:
+    devices = list_video_devices()
+    options = [(device.path, device.label) for device in devices]
+    if not options:
+        custom = prompt_text("No video devices discovered. Enter a video device path", current_device)
+        return custom
+
+    if current_device not in {value for value, _ in options}:
+        options.append((current_device, f"{current_device} (current/custom)"))
+    options.append(("__custom__", "Enter a custom video device path"))
+    choice = prompt_menu("Video source", options, default_value=current_device)
+    if choice == "__custom__":
+        return prompt_text("Video device path", current_device)
+    return choice
+
+
+def select_audio_source(audio_enabled: bool, current_device: str) -> tuple[bool, str]:
+    devices = list_alsa_capture_devices()
+    options: list[tuple[str, str]] = [("__none__", "No audio")]
+    options.extend((device.device, device.label) for device in devices)
+    if audio_enabled and current_device not in {value for value, _ in options}:
+        options.append((current_device, f"{current_device} (current/custom)"))
+    options.append(("__custom__", "Enter a custom ALSA device"))
+    default_value = current_device if audio_enabled else "__none__"
+    choice = prompt_menu("Audio source", options, default_value=default_value)
+    if choice == "__none__":
+        return False, current_device
+    if choice == "__custom__":
+        return True, prompt_text("ALSA capture device", current_device)
+    return True, choice
+
+
+def select_storage_path(current_dir: Path) -> Path:
+    candidates = candidate_storage_paths(current_dir)
+    options = [(str(path), storage_summary(path)) for path in candidates]
+    options.append(("__custom__", "Enter a custom recordings directory"))
+    choice = prompt_menu(
+        "Storage destination",
+        options,
+        default_value=str(current_dir.expanduser()),
+    )
+    if choice == "__custom__":
+        return Path(prompt_text("Recordings directory", str(current_dir.expanduser()))).expanduser()
+    return Path(choice).expanduser()
+
+
+def known_recordings_roots(args: argparse.Namespace, config: dict) -> list[Path]:
+    candidates = [args.recordings_dir.expanduser()]
+    last_root = config.get("last_recordings_dir")
+    if last_root:
+        candidates.append(Path(last_root).expanduser())
+    for profile in config.get("profiles", {}).values():
+        recordings_dir = profile.get("recordings_dir")
+        if recordings_dir:
+            candidates.append(Path(recordings_dir).expanduser())
+
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for path in candidates:
+        key = str(path)
+        if key not in seen:
+            seen.add(key)
+            unique.append(path)
+    return unique
+
+
+def profile_from_args(args: argparse.Namespace) -> dict:
+    return {
+        "device": args.device,
+        "video_input_format": args.video_input_format,
+        "audio": args.audio,
+        "audio_device": args.audio_device,
+        "audio_input_rate": args.audio_input_rate,
+        "audio_input_channels": args.audio_input_channels,
+        "framerate": args.framerate,
+        "video_size": args.video_size,
+        "encoder": args.encoder,
+        "recordings_dir": str(args.recordings_dir.expanduser()),
+    }
+
+
+def profile_summary_lines(profile_name: str, profile: dict) -> list[str]:
+    recordings_dir = Path(
+        profile.get("recordings_dir", str(DEFAULT_RECORDINGS_DIR))
+    ).expanduser()
+    return [
+        f"Quick start: {profile_name}",
+        f"  Video:   {profile.get('device', 'unknown')}",
+        f"  Format:  {profile.get('video_input_format', DEFAULT_VIDEO_INPUT_FORMAT)}",
+        (
+            "  Mode:    "
+            f"{profile.get('video_size', 'unknown')} @ {profile.get('framerate', '?')} fps"
+        ),
+        (
+            "  Audio:   "
+            f"{profile.get('audio_device', 'disabled') if profile.get('audio', True) else 'disabled'}"
+        ),
+        f"  Storage: {storage_summary(recordings_dir)}",
+    ]
+
+
+def apply_profile(args: argparse.Namespace, profile: dict) -> None:
+    args.device = profile.get("device", args.device)
+    args.video_input_format = profile.get(
+        "video_input_format", args.video_input_format
+    )
+    args.audio = profile.get("audio", args.audio)
+    args.audio_device = profile.get("audio_device", args.audio_device)
+    args.audio_input_rate = profile.get("audio_input_rate", args.audio_input_rate)
+    args.audio_input_channels = profile.get(
+        "audio_input_channels", args.audio_input_channels
+    )
+    args.framerate = profile.get("framerate", args.framerate)
+    args.video_size = profile.get("video_size", args.video_size)
+    args.encoder = profile.get("encoder", args.encoder)
+    recordings_dir = profile.get("recordings_dir")
+    if recordings_dir:
+        args.recordings_dir = Path(recordings_dir).expanduser()
+
+
+def prompt_record_quick_start(profile_name: str, profile: dict) -> str:
+    for line in profile_summary_lines(profile_name, profile):
+        print(line)
+    return prompt_choice(
+        "Press Enter to start now, type 'e' to edit, or 'q' to cancel",
+        {"e": "edit", "q": "cancel"},
+        default="start",
+    )
+
+
+def configure_record_interactively(
+    args: argparse.Namespace,
+    config: dict,
+    *,
+    choose_profile: bool = True,
+    selected_profile_name: str | None = None,
+) -> None:
+    profiles = config.get("profiles", {})
+
+    if choose_profile and profiles:
+        selected_profile_name = choose_saved_profile(
+            config, preferred_profile=args.profile
+        )
+        if selected_profile_name:
+            apply_profile(args, profiles[selected_profile_name])
+            config["last_profile"] = selected_profile_name
+    elif selected_profile_name and selected_profile_name in profiles:
+        config["last_profile"] = selected_profile_name
+
+    print()
+    args.device = select_video_device(args.device)
+    print()
+    args.audio, args.audio_device = select_audio_source(args.audio, args.audio_device)
+    print()
+    args.recordings_dir = select_storage_path(args.recordings_dir.expanduser())
+
+    print()
+    print("Recording summary")
+    print(f"  Video:   {args.device}")
+    print(
+        f"  Format:  {args.video_input_format if args.video_input_format != DEFAULT_VIDEO_INPUT_FORMAT else 'auto'}"
+    )
+    print(f"  Audio:   {args.audio_device if args.audio else 'disabled'}")
+    print(f"  Storage: {storage_summary(args.recordings_dir)}")
+
+    if selected_profile_name:
+        if prompt_yes_no(f"Update saved profile '{selected_profile_name}' with these settings?", default=False):
+            profiles[selected_profile_name] = profile_from_args(args)
+            config["last_profile"] = selected_profile_name
+    elif prompt_yes_no("Save this setup as a reusable profile?", default=False):
+        while True:
+            profile_name = prompt_text("Profile name")
+            if not profile_name:
+                print("Profile name cannot be blank.")
+                continue
+            profiles[profile_name] = profile_from_args(args)
+            config["last_profile"] = profile_name
+            break
+
+    config["profiles"] = profiles
+    config["last_recordings_dir"] = str(args.recordings_dir.expanduser())
+
+
+def ensure_profile_name(config: dict, existing_name: str | None = None) -> str:
+    if existing_name:
+        return existing_name
+    while True:
+        profile_name = prompt_text("Profile name")
+        if not profile_name:
+            print("Profile name cannot be blank.")
+            continue
+        return profile_name
+
+
+def command_setup(args: argparse.Namespace) -> int:
+    config_path = args.config_file.expanduser()
+    config = load_config(config_path)
+    profiles = config.get("profiles", {})
+
+    selected_profile_name = args.profile
+    if interactive_mode_enabled(args):
+        selected_profile_name = choose_saved_profile(
+            config,
+            default_manual=not bool(args.profile),
+            preferred_profile=args.profile,
+        )
+
+    if selected_profile_name and selected_profile_name in profiles:
+        apply_profile(args, profiles[selected_profile_name])
+    elif not interactive_mode_enabled(args) and not args.dry_run and not selected_profile_name:
+        print(
+            "setup --no-interactive requires --profile for the saved profile name",
+            file=sys.stderr,
+        )
+        return 1
+
+    if interactive_mode_enabled(args):
+        print()
+        args.device = select_video_device(args.device)
+        print()
+        args.audio, args.audio_device = select_audio_source(args.audio, args.audio_device)
+        print()
+        args.recordings_dir = select_storage_path(args.recordings_dir.expanduser())
+        print()
+
+    ffmpeg_path, supported_encoders = detect_supported_encoders(args.ffmpeg_bin)
+    resolved_encoder = resolve_encoder(ffmpeg_path, supported_encoders, args.encoder)
+    if resolved_encoder:
+        args.encoder = resolved_encoder
+
+    if args.probe:
+        if not ffmpeg_path:
+            print(f"ffmpeg binary not found: {args.ffmpeg_bin}", file=sys.stderr)
+            return 1
+
+        print(f"Probing video modes for {args.device}...")
+        selected_size, selected_fps, selected_format, video_results, video_failure = choose_video_profile_settings(
+            ffmpeg_path,
+            args.device,
+            args.video_size,
+            args.framerate,
+            args.video_input_format,
+        )
+        if video_results:
+            print_video_probe_results(video_results)
+            args.video_size = selected_size
+            args.framerate = selected_fps
+            args.video_input_format = selected_format
+        else:
+            print("Video probe did not find a better mode. Keeping current defaults.")
+            if video_failure:
+                print(f"  Probe detail: {video_failure}")
+
+        if args.audio:
+            print()
+            print(f"Probing audio input modes for {args.audio_device}...")
+            input_rate, input_channels, audio_results, audio_failure = choose_audio_profile_settings(
+                ffmpeg_path, args.audio_device, args.audio_input_rate, args.audio_input_channels
+            )
+            if audio_results:
+                print_audio_probe_results(audio_results)
+                args.audio_input_rate = input_rate
+                args.audio_input_channels = input_channels
+            else:
+                print("Audio probe did not find a working input mode. Audio will stay as configured.")
+                if audio_failure:
+                    print(f"  Probe detail: {audio_failure}")
+
+        print()
+
+    print("Setup summary")
+    print(f"  Video device:      {args.device}")
+    print(
+        f"  Video input fmt:   {args.video_input_format if args.video_input_format != DEFAULT_VIDEO_INPUT_FORMAT else 'auto'}"
+    )
+    print(f"  Video mode:        {args.video_size} @ {args.framerate} fps")
+    print(f"  Audio device:      {args.audio_device if args.audio else 'disabled'}")
+    if args.audio:
+        print(
+            f"  Audio input mode:  {args.audio_input_rate} Hz, {args.audio_input_channels} channel(s)"
+        )
+    print(f"  Storage:           {storage_summary(args.recordings_dir)}")
+    print(f"  Video encoder:     {args.encoder}")
+
+    if args.dry_run:
+        return 0
+
+    if interactive_mode_enabled(args):
+        print()
+        if not prompt_yes_no("Save this setup?", default=True):
+            return 0
+
+    profile_name = ensure_profile_name(config, existing_name=selected_profile_name)
+    profiles[profile_name] = profile_from_args(args)
+    config["profiles"] = profiles
+    config["last_profile"] = profile_name
+    config["last_recordings_dir"] = str(args.recordings_dir.expanduser())
+    save_config(config_path, config)
+    print(f"Saved profile: {profile_name}")
+    return 0
+
+
+def list_session_dirs(recordings_root: Path) -> list[Path]:
+    if not recordings_root.exists():
+        return []
+    sessions: list[Path] = []
+    for child in sorted(recordings_root.iterdir()):
+        if child.name == "latest":
+            continue
+        if not child.is_dir() or child.name.startswith("."):
+            continue
+        if (child / "session.json").exists() or (child / DEFAULT_TIMESHIFT_NAME).exists():
+            sessions.append(child)
+    return sessions
+
+
+def session_target_summary(session_dir: Path) -> str:
+    timeshift = session_dir / DEFAULT_TIMESHIFT_NAME
+    archive_mkv = session_dir / f"{DEFAULT_ARCHIVE_STEM}.mkv"
+    archive_mp4 = session_dir / f"{DEFAULT_ARCHIVE_STEM}.mp4"
+    playlist = session_dir / DEFAULT_PLAYLIST_NAME
+    if timeshift.exists():
+        return "DVR timeshift"
+    if archive_mkv.exists():
+        return "archive.mkv"
+    if archive_mp4.exists():
+        return "archive.mp4"
+    if playlist.exists():
+        return "live playlist"
+    return "session"
+
+
+def session_display_label(session_dir: Path) -> str:
+    metadata_path = session_dir / "session.json"
+    state = "unknown"
+    if metadata_path.exists():
+        try:
+            state = json.loads(metadata_path.read_text()).get("state", state)
+        except (OSError, json.JSONDecodeError):
+            state = "unknown"
+    root_label = str(session_dir.parent)
+    target_label = session_target_summary(session_dir)
+    return f"{session_dir.name} [{target_label}; {state}; {root_label}]"
+
+
+def select_watch_target(args: argparse.Namespace, config: dict) -> str | None:
+    sessions: list[Path] = []
+    for root in known_recordings_roots(args, config):
+        sessions.extend(list_session_dirs(root))
+
+    unique_sessions: list[Path] = []
+    seen: set[str] = set()
+    for session in sorted(sessions, key=lambda path: path.stat().st_mtime, reverse=True):
+        try:
+            canonical = str(session.resolve())
+        except OSError:
+            canonical = str(session)
+        if canonical in seen:
+            continue
+        seen.add(canonical)
+        unique_sessions.append(session)
+
+    if not unique_sessions:
+        return None
+    options = [(str(path), session_display_label(path)) for path in unique_sessions[:20]]
+    default_value = config.get("last_session_dir")
+    return prompt_menu("Choose a session to watch", options, default_value=default_value)
+
+
+def lock_name(prefix: str, device_name: str) -> str:
+    return f"{prefix}-{slugify(device_name)}.lock"
+
+
+def acquire_device_locks(recordings_dir: Path, args: argparse.Namespace, session_name: str) -> list[Path]:
+    lock_dir = recordings_dir / ".locks"
+    ensure_directory(lock_dir)
+    lock_specs = [(lock_name("video", args.device), args.device)]
+    if args.audio:
+        lock_specs.append((lock_name("audio", args.audio_device), args.audio_device))
+
+    acquired: list[Path] = []
+    try:
+        for filename, device_name in lock_specs:
+            lock_path = lock_dir / filename
+            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            with os.fdopen(fd, "w") as handle:
+                handle.write(f"pid={os.getpid()}\n")
+                handle.write(f"session={session_name}\n")
+                handle.write(f"device={device_name}\n")
+            acquired.append(lock_path)
+    except FileExistsError:
+        release_device_locks(acquired)
+        raise RuntimeError(f"device already in use: {device_name}")
+    return acquired
+
+
+def release_device_locks(lock_paths: Sequence[Path]) -> None:
+    for lock_path in lock_paths:
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
+            continue
+
+
+def wait_for_capture_output(paths: SessionPaths, process: subprocess.Popen[bytes], timeout_seconds: float = 5.0) -> bool:
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        if has_timeshift_session(paths) or paths.playlist_path.exists():
+            return True
+        if process.poll() is not None:
+            return False
+        time.sleep(0.2)
+    return has_timeshift_session(paths) or paths.playlist_path.exists()
 
 
 def update_latest_symlink(paths: SessionPaths) -> None:
@@ -347,7 +1351,15 @@ def resolve_watch_target(recordings_dir: Path, target: str | None) -> Path:
         if resolved.is_dir():
             timeshift = resolved / DEFAULT_TIMESHIFT_NAME
             playlist = resolved / DEFAULT_PLAYLIST_NAME
-            return timeshift if timeshift.exists() else playlist
+            archive_mkv = resolved / f"{DEFAULT_ARCHIVE_STEM}.mkv"
+            archive_mp4 = resolved / f"{DEFAULT_ARCHIVE_STEM}.mp4"
+            if timeshift.exists():
+                return timeshift
+            if archive_mkv.exists():
+                return archive_mkv
+            if archive_mp4.exists():
+                return archive_mp4
+            return playlist
         return resolved
 
     latest_link = recordings_dir / "latest"
@@ -358,7 +1370,15 @@ def resolve_watch_target(recordings_dir: Path, target: str | None) -> Path:
     resolved = latest_link.resolve()
     timeshift = resolved / DEFAULT_TIMESHIFT_NAME
     playlist = resolved / DEFAULT_PLAYLIST_NAME
-    return timeshift if timeshift.exists() else playlist
+    archive_mkv = resolved / f"{DEFAULT_ARCHIVE_STEM}.mkv"
+    archive_mp4 = resolved / f"{DEFAULT_ARCHIVE_STEM}.mp4"
+    if timeshift.exists():
+        return timeshift
+    if archive_mkv.exists():
+        return archive_mkv
+    if archive_mp4.exists():
+        return archive_mp4
+    return playlist
 
 
 def build_player_command(player: str, target_path: Path, file_caching_ms: int) -> list[str]:
@@ -379,7 +1399,12 @@ def build_player_command(player: str, target_path: Path, file_caching_ms: int) -
             "--hr-seek=no",
             str(target_path),
         ]
-    return [player, f"--file-caching={file_caching_ms}", str(target_path)]
+    return [
+        player,
+        "--avcodec-hw=none",
+        f"--file-caching={file_caching_ms}",
+        str(target_path),
+    ]
 
 
 def print_session_summary(paths: SessionPaths) -> None:
@@ -389,46 +1414,123 @@ def print_session_summary(paths: SessionPaths) -> None:
 
 
 def command_record(args: argparse.Namespace) -> int:
-    ffmpeg_path = shutil.which(args.ffmpeg_bin)
+    config_path = args.config_file.expanduser()
+    config = load_config(config_path)
+    profiles = config.get("profiles", {})
+    if args.profile:
+        profile = profiles.get(args.profile)
+        if not profile:
+            print(f"profile not found: {args.profile}", file=sys.stderr)
+            return 1
+        apply_profile(args, profile)
+        config["last_profile"] = args.profile
+
+    if interactive_mode_enabled(args):
+        quick_start_profile_name = args.profile or config.get("last_profile")
+        if not quick_start_profile_name and len(profiles) == 1:
+            quick_start_profile_name = next(iter(profiles))
+
+        if quick_start_profile_name and quick_start_profile_name in profiles:
+            quick_profile = profiles[quick_start_profile_name]
+            apply_profile(args, quick_profile)
+            config["last_profile"] = quick_start_profile_name
+            action = prompt_record_quick_start(quick_start_profile_name, quick_profile)
+            if action == "q":
+                return 0
+            if action == "e":
+                print()
+                configure_record_interactively(
+                    args,
+                    config,
+                    choose_profile=False,
+                    selected_profile_name=quick_start_profile_name,
+                )
+                print()
+                if not prompt_yes_no("Start recording now?", default=True):
+                    return 0
+                print()
+                save_config(config_path, config)
+            else:
+                save_config(config_path, config)
+        else:
+            configure_record_interactively(args, config)
+            print()
+            if not prompt_yes_no("Start recording now?", default=True):
+                return 0
+            print()
+            save_config(config_path, config)
+
+    ffmpeg_path, supported_encoders = detect_supported_encoders(args.ffmpeg_bin)
     if not ffmpeg_path:
         print(f"ffmpeg binary not found: {args.ffmpeg_bin}", file=sys.stderr)
         return 1
+
+    resolved_encoder = resolve_encoder(ffmpeg_path, supported_encoders, args.encoder)
+    if not resolved_encoder:
+        print("no supported video encoder found for this ffmpeg build", file=sys.stderr)
+        return 1
+    if resolved_encoder != args.encoder:
+        print(
+            f"warning: encoder '{args.encoder}' is unavailable; using '{resolved_encoder}' instead",
+            file=sys.stderr,
+        )
+        args.encoder = resolved_encoder
 
     recordings_dir = args.recordings_dir.expanduser()
     session_name = args.session_name or default_session_name(args.session_prefix)
     paths = make_session_paths(recordings_dir, session_name, args.archive_format)
     ffmpeg_command = build_ffmpeg_command(paths, args)
 
-    print_session_summary(paths)
-    print("FFmpeg:", shlex.join(ffmpeg_command))
-
     if args.dry_run:
+        print_session_summary(paths)
+        print("FFmpeg:", shlex.join(ffmpeg_command))
         return 0
 
     if paths.session_dir.exists():
         print(f"session directory already exists: {paths.session_dir}", file=sys.stderr)
         return 1
 
-    ensure_parent_dir(paths.session_dir)
-    update_latest_symlink(paths)
+    ensure_directory(paths.session_dir)
     write_metadata(paths, args, ffmpeg_command, state="starting")
 
+    try:
+        lock_paths = acquire_device_locks(recordings_dir, args, session_name)
+    except RuntimeError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+
+    print_session_summary(paths)
+    print("FFmpeg:", shlex.join(ffmpeg_command))
     process = subprocess.Popen(ffmpeg_command, cwd=paths.session_dir)
     interrupted = False
+    capture_started = False
     try:
+        capture_started = wait_for_capture_output(paths, process)
+        if capture_started:
+            update_latest_symlink(paths)
+            config["last_recordings_dir"] = str(recordings_dir)
+            config["last_session_dir"] = str(paths.session_dir)
+            save_config(config_path, config)
         exit_code = process.wait()
     except KeyboardInterrupt:
         interrupted = True
         print("\nStopping recording...")
         process.send_signal(signal.SIGINT)
         exit_code = process.wait()
+    finally:
+        release_device_locks(lock_paths)
 
     capture_ok = exit_code == 0 or (interrupted and exit_code == 255)
     archive_ok = False
     archive_status = None
+    captured_anything = has_timeshift_session(paths) or bool(segment_files(paths))
 
-    if capture_ok:
+    if captured_anything:
         archive_ok, archive_status = create_archive(paths, args)
+        if not capture_ok and archive_ok:
+            archive_status = (
+                f"{archive_status}; capture exited with code {exit_code}"
+            )
     else:
         archive_status = f"capture failed with exit code {exit_code}"
 
@@ -442,15 +1544,25 @@ def command_record(args: argparse.Namespace) -> int:
         archive_status=archive_status,
     )
 
-    if not capture_ok:
-        return exit_code
-    return 0 if archive_ok else 1
+    if capture_ok:
+        return 0 if archive_ok else 1
+    return 1 if archive_ok else exit_code
 
 
 def command_watch(args: argparse.Namespace) -> int:
+    config_path = args.config_file.expanduser()
+    config = load_config(config_path)
+    if not args.target and interactive_mode_enabled(args):
+        selected_target = select_watch_target(args, config)
+        if not selected_target:
+            print("no sessions found to watch", file=sys.stderr)
+            return 1
+        args.target = selected_target
+
     player = choose_player(args.player)
     if not player:
-        print("no player found; install VLC or use ffplay", file=sys.stderr)
+        requested = args.player or "vlc/mpv/ffplay"
+        print(f"player not found: {requested}", file=sys.stderr)
         return 1
 
     try:
@@ -468,31 +1580,27 @@ def command_watch(args: argparse.Namespace) -> int:
     if args.dry_run:
         return 0
 
+    config["last_session_dir"] = str(target_path.parent if target_path.is_file() else target_path)
+    save_config(config_path, config)
     return subprocess.call(command)
 
 
 def check_ffmpeg_support(ffmpeg_bin: str) -> tuple[str | None, bool]:
-    ffmpeg_path = shutil.which(ffmpeg_bin)
-    if not ffmpeg_path:
-        return None, False
-
-    result = subprocess.run(
-        [ffmpeg_path, "-hide_banner", "-encoders"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    return ffmpeg_path, "h264_nvenc" in result.stdout
+    ffmpeg_path, supported_encoders = detect_supported_encoders(ffmpeg_bin)
+    return ffmpeg_path, "h264_nvenc" in supported_encoders
 
 
 def command_doctor(args: argparse.Namespace) -> int:
-    ffmpeg_path, has_nvenc = check_ffmpeg_support(args.ffmpeg_bin)
+    ffmpeg_path, supported_encoders = detect_supported_encoders(args.ffmpeg_bin)
+    has_nvenc = "h264_nvenc" in supported_encoders
+    resolved_encoder = resolve_encoder(ffmpeg_path, supported_encoders, args.encoder)
     player = choose_player(args.player)
     device_exists = Path(args.device).exists()
     audio_ok = alsa_device_exists(args.audio_device) if args.audio else True
 
     print(f"ffmpeg:   {ffmpeg_path or 'missing'}")
     print(f"nvenc:    {'yes' if has_nvenc else 'no'}")
+    print(f"encoder:  {resolved_encoder or 'missing'}")
     print(f"player:   {player or 'missing'}")
     print(f"device:   {args.device} ({'ok' if device_exists else 'missing'})")
     print(
@@ -501,7 +1609,7 @@ def command_doctor(args: argparse.Namespace) -> int:
     )
     print(f"outputs:  {args.recordings_dir.expanduser()}")
 
-    if not ffmpeg_path or not device_exists or not audio_ok:
+    if not ffmpeg_path or not resolved_encoder or not device_exists or not audio_ok:
         return 1
     return 0
 
@@ -522,14 +1630,97 @@ def build_parser() -> argparse.ArgumentParser:
         help="FFmpeg binary to run. Default: %(default)s",
     )
     parser.add_argument(
+        "--config-file",
+        type=Path,
+        default=DEFAULT_CONFIG_PATH,
+        help="Config file for saved profiles and last-used selections.",
+    )
+    parser.add_argument(
         "--player",
         help="Preferred player for watch mode. Defaults to vlc, then mpv, ffplay, cvlc.",
     )
 
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    setup = subparsers.add_parser(
+        "setup",
+        help="Save or update a reusable recording profile with probed settings.",
+    )
+    setup.add_argument("--device", default="/dev/video2", help="Video device path.")
+    setup.add_argument(
+        "--video-input-format",
+        default=DEFAULT_VIDEO_INPUT_FORMAT,
+        help="Preferred V4L2 input format to probe, such as mjpeg or yuyv422.",
+    )
+    setup.add_argument(
+        "--audio",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Include audio in the saved setup.",
+    )
+    setup.add_argument(
+        "--audio-device",
+        default="hw:Capture,0",
+        help="ALSA capture device for the saved setup.",
+    )
+    setup.add_argument(
+        "--audio-input-rate",
+        type=int,
+        default=48000,
+        help="Preferred audio input sample rate to probe.",
+    )
+    setup.add_argument(
+        "--audio-input-channels",
+        type=int,
+        default=2,
+        help="Preferred audio input channel count to probe.",
+    )
+    setup.add_argument(
+        "--framerate",
+        type=int,
+        default=30,
+        help="Preferred capture framerate to probe.",
+    )
+    setup.add_argument(
+        "--video-size",
+        default="1920x1080",
+        help="Preferred input resolution to probe, like 1920x1080.",
+    )
+    setup.add_argument(
+        "--encoder",
+        default=DEFAULT_ENCODER,
+        help="Preferred video encoder for this machine.",
+    )
+    setup.add_argument(
+        "--profile",
+        help="Existing profile name to update, or the save target when using --no-interactive.",
+    )
+    setup.add_argument(
+        "--probe",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Probe the selected devices for a likely-good mode before saving.",
+    )
+    setup.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show the setup summary without saving the profile.",
+    )
+    setup.add_argument(
+        "--interactive",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Prompt for profile, device, and storage selections.",
+    )
+    setup.set_defaults(func=command_setup)
+
     record = subparsers.add_parser("record", help="Start a new capture session.")
     record.add_argument("--device", default="/dev/video2", help="Video device path.")
+    record.add_argument(
+        "--video-input-format",
+        default=DEFAULT_VIDEO_INPUT_FORMAT,
+        help="Preferred V4L2 input format, such as mjpeg or yuyv422.",
+    )
     record.add_argument(
         "--audio",
         action=argparse.BooleanOptionalAction,
@@ -610,14 +1801,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--video-size", default="1920x1080", help="Input resolution, like 1920x1080."
     )
     record.add_argument(
-        "--encoder", default="h264_nvenc", help="Video encoder, like h264_nvenc."
+        "--encoder", default=DEFAULT_ENCODER, help="Video encoder, like h264_nvenc."
     )
     record.add_argument("--preset", default="fast", help="Encoder preset.")
     record.add_argument(
         "--gop",
         type=int,
-        default=30,
-        help="Keyframe interval. Default writes one keyframe per second at 30 fps.",
+        default=None,
+        help="Keyframe interval in frames. Defaults to roughly one second of video.",
     )
     record.add_argument("--video-bitrate", help="Optional target bitrate, like 8M.")
     record.add_argument("--maxrate", help="Optional max bitrate, like 10M.")
@@ -638,12 +1829,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Explicit session name. Overrides the generated timestamped name.",
     )
     record.add_argument(
+        "--profile",
+        help="Saved profile to use for recording before any interactive edits.",
+    )
+    record.add_argument(
         "--dry-run", action="store_true", help="Print the ffmpeg command and exit."
+    )
+    record.add_argument(
+        "--interactive",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Prompt for video, audio, and storage choices before recording.",
     )
     record.set_defaults(func=command_record)
 
     watch = subparsers.add_parser(
-        "watch", help="Open the latest growing DVR file in VLC or ffplay."
+        "watch", help="Open a growing DVR file in a player."
     )
     watch.add_argument(
         "target",
@@ -662,6 +1863,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=300,
         help="VLC file cache in milliseconds for DVR playback.",
+    )
+    watch.add_argument(
+        "--interactive",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Prompt to choose a recent session when no target is given.",
     )
     watch.set_defaults(func=command_watch)
 
@@ -684,6 +1891,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--player",
         help="Preferred player to check. Defaults to vlc, then mpv, ffplay, cvlc.",
     )
+    doctor.add_argument(
+        "--encoder",
+        default=DEFAULT_ENCODER,
+        help="Preferred video encoder to validate, with automatic fallback.",
+    )
     doctor.set_defaults(func=command_doctor)
 
     return parser
@@ -696,4 +1908,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        print()
+        raise SystemExit(130)
