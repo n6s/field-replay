@@ -13,6 +13,37 @@ The current design is DVR-first:
 
 This trades some latency for a much more practical "rewind the tape" workflow.
 
+## Requirements
+
+On a Debian or Ubuntu style Linux system, including Linux on a Chromebook, plan on these packages:
+
+```bash
+sudo apt update
+sudo apt install ffmpeg vlc v4l-utils alsa-utils
+```
+
+Useful extras:
+
+```bash
+sudo apt install mpv vainfo usbutils
+```
+
+What they are for:
+
+- `ffmpeg`: recording, remuxing, probing
+- `vlc`: DVR-style playback
+- `v4l-utils`: inspecting video devices and formats
+- `alsa-utils`: inspecting audio devices
+- `mpv`: optional alternate player
+- `vainfo`: checking video acceleration support
+- `usbutils`: identifying USB capture hardware with `lsusb`
+
+Notes for Linux on a Chromebook:
+
+- Hardware encoding may differ from your workstation, so `field-replay` should be allowed to fall back from `h264_nvenc` to another encoder like `libx264`.
+- USB device forwarding into the Linux environment can matter just as much as package installation.
+- Storage may be tighter, so using an external drive or a larger mounted path is often the right move for long events.
+
 ## Quick start
 
 Run a dependency check:
