@@ -31,6 +31,7 @@ COMMON_VIDEO_SIZES = ("1920x1080", "1280x720", "1024x576", "640x480")
 COMMON_FRAME_RATES = (30, 25, 15, 10, 5)
 COMMON_VIDEO_INPUT_FORMATS = ("auto", "mjpeg", "yuyv422", "uyvy422", "nv12")
 COMMON_AUDIO_INPUTS = ((48000, 2), (48000, 1), (44100, 2), (44100, 1), (32000, 1))
+DEFAULT_VIDEO_TIMESTAMP_ENABLED = True
 EXPORT_PRESETS = {
     "share-high": {
         "label": "Share high",
@@ -370,7 +371,7 @@ def build_ffmpeg_command(paths: SessionPaths, args: argparse.Namespace) -> list[
     command.extend(
         [
             "-vf",
-            f"fps={args.framerate},settb=AVTB,setpts=N/({args.framerate}*TB)",
+            build_video_filter(args),
             "-fps_mode",
             "cfr",
             "-c:v",
@@ -423,6 +424,23 @@ def build_ffmpeg_command(paths: SessionPaths, args: argparse.Namespace) -> list[
         ]
     )
     return command
+
+
+def build_video_filter(args: argparse.Namespace) -> str:
+    filters = [
+        f"fps={args.framerate}",
+        "settb=AVTB",
+        f"setpts=N/({args.framerate}*TB)",
+    ]
+    if getattr(args, "video_timestamp", DEFAULT_VIDEO_TIMESTAMP_ENABLED):
+        filters.append(
+            "drawtext="
+            "text='%{localtime\\:%Y-%m-%d %X}':"
+            "x=20:y=h-th-20:"
+            "box=1:boxcolor=0x00000099:boxborderw=10:"
+            "fontcolor=white:fontsize=24:borderw=2"
+        )
+    return ",".join(filters)
 
 
 def choose_player(preferred: str | None) -> str | None:
@@ -530,6 +548,25 @@ def detect_supported_encoders(ffmpeg_bin: str) -> tuple[str | None, set[str]]:
         if len(parts) >= 2 and parts[0][0] in {"V", "A", "S"}:
             encoders.add(parts[1])
     return ffmpeg_path, encoders
+
+
+def detect_supported_filters(ffmpeg_bin: str) -> tuple[str | None, set[str]]:
+    ffmpeg_path = shutil.which(ffmpeg_bin)
+    if not ffmpeg_path:
+        return None, set()
+
+    result = subprocess.run(
+        [ffmpeg_path, "-hide_banner", "-filters"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    filters: set[str] = set()
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and "->" in parts[2]:
+            filters.add(parts[1])
+    return ffmpeg_path, filters
 
 
 def resolve_encoder(
@@ -943,6 +980,7 @@ def profile_from_args(args: argparse.Namespace) -> dict:
         "framerate": args.framerate,
         "video_size": args.video_size,
         "encoder": args.encoder,
+        "video_timestamp": args.video_timestamp,
         "recordings_dir": str(args.recordings_dir.expanduser()),
     }
 
@@ -991,6 +1029,7 @@ def apply_profile(args: argparse.Namespace, profile: dict) -> None:
     args.framerate = profile.get("framerate", args.framerate)
     args.video_size = profile.get("video_size", args.video_size)
     args.encoder = profile.get("encoder", args.encoder)
+    args.video_timestamp = profile.get("video_timestamp", args.video_timestamp)
     recordings_dir = profile.get("recordings_dir")
     if recordings_dir:
         args.recordings_dir = Path(recordings_dir).expanduser()
@@ -1047,6 +1086,10 @@ def configure_record_interactively(
     )
     print(f"  Audio:   {args.audio_device if args.audio else 'disabled'}")
     print(f"  Storage: {storage_summary(args.recordings_dir)}")
+    print(
+        "  Stamp:   "
+        f"{'wall-clock overlay' if args.video_timestamp else 'disabled'}"
+    )
 
     if selected_profile_name:
         if prompt_yes_no(f"Update saved profile '{selected_profile_name}' with these settings?", default=False):
@@ -1166,6 +1209,10 @@ def command_setup(args: argparse.Namespace) -> int:
         )
     print(f"  Storage:           {storage_summary(args.recordings_dir)}")
     print(f"  Video encoder:     {args.encoder}")
+    print(
+        "  Video timestamp:   "
+        f"{'wall-clock overlay' if args.video_timestamp else 'disabled'}"
+    )
 
     if args.dry_run:
         return 0
@@ -1455,6 +1502,7 @@ def write_metadata(
         "framerate": args.framerate,
         "video_size": args.video_size,
         "encoder": args.encoder,
+        "video_timestamp": args.video_timestamp,
         "preset": args.preset,
         "archive_format": args.archive_format,
         "ffmpeg_command": list(ffmpeg_command),
@@ -1804,6 +1852,14 @@ def run_record_command(args: argparse.Namespace, *, launch_player: bool = False)
             file=sys.stderr,
         )
         args.encoder = resolved_encoder
+
+    _, supported_filters = detect_supported_filters(args.ffmpeg_bin)
+    if args.video_timestamp and "drawtext" not in supported_filters:
+        print(
+            "warning: ffmpeg drawtext filter is unavailable; disabling video timestamp overlay",
+            file=sys.stderr,
+        )
+        args.video_timestamp = False
 
     player = None
     if launch_player:
@@ -2176,6 +2232,12 @@ def add_record_arguments(
         "--video-size", default="1920x1080", help="Input resolution, like 1920x1080."
     )
     parser.add_argument(
+        "--video-timestamp",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_VIDEO_TIMESTAMP_ENABLED,
+        help="Burn a wall-clock timestamp into the captured video.",
+    )
+    parser.add_argument(
         "--encoder", default=DEFAULT_ENCODER, help="Video encoder, like h264_nvenc."
     )
     parser.add_argument("--preset", default="fast", help="Encoder preset.")
@@ -2300,6 +2362,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--video-size",
         default="1920x1080",
         help="Preferred input resolution to probe, like 1920x1080.",
+    )
+    setup.add_argument(
+        "--video-timestamp",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_VIDEO_TIMESTAMP_ENABLED,
+        help="Save whether recordings should burn a wall-clock timestamp into the video.",
     )
     setup.add_argument(
         "--encoder",

@@ -166,6 +166,7 @@ The default capture settings are:
 - audio output: `32 kHz` mono AAC at `32k`
 - audio gain: `+18 dB`
 - timestamp source: `generated`
+- video timestamp overlay: wall-clock burned in by default
 - input queue: `512`
 - framerate: `30`
 - size: `1920x1080`
@@ -190,6 +191,7 @@ The default capture settings are:
 ./field-replay record --audio-gain-db 24
 ./field-replay record --audio-bitrate 48k --audio-channels 2 --audio-sample-rate 48000
 ./field-replay record --timestamp-source device --timestamps default
+./field-replay record --no-video-timestamp
 ./field-replay record --video-bitrate 8M --maxrate 10M --bufsize 20M
 ./field-replay record --session-name finish-line-a
 ./field-replay --recordings-dir /mnt/storage/field-replay record
@@ -209,3 +211,7 @@ The default capture settings are:
 ## Older sessions
 
 Older sessions that were recorded with the HLS workflow are still supported for archive remuxing, and `watch` will fall back to `live.m3u8` if a session does not have `timeshift.ts`.
+
+## Roadmap
+
+Future feature ideas and race-ops notes live in [ROADMAP.md](ROADMAP.md).
