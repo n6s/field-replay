@@ -2850,6 +2850,39 @@ def prompt_review_bib_value(current_bib: str | None = None) -> str | None:
         print("Enter a bib number, or q to quit.")
 
 
+def prompt_review_action_or_bib(
+    options: Sequence[tuple[str, str]],
+    default_value: str | None = None,
+) -> str | None:
+    print("Review action")
+    default_index = None
+    for index, (value, label) in enumerate(options, start=1):
+        marker = ""
+        if value == default_value:
+            default_index = index
+            marker = " [default]"
+        print(f"  {index}. {label}{marker}")
+    print("  q. Quit")
+
+    while True:
+        prompt = "Select an option"
+        if default_index is not None:
+            prompt += f" [{default_index}]"
+        prompt += ", or enter another bib: "
+        raw = input(prompt).strip()
+        if not raw and default_index is not None:
+            return options[default_index - 1][0]
+        if raw.lower() in {"q", "quit"}:
+            return None
+        if raw.isdigit():
+            selected = int(raw)
+            if 1 <= selected <= len(options):
+                return options[selected - 1][0]
+        if raw:
+            return f"bib:{raw}"
+        print("Enter a menu number, another bib, or q to quit.")
+
+
 def command_review_bib(args: argparse.Namespace) -> int:
     session_dir = resolve_evidence_session_from_args(args, "bib review")
     if session_dir is None:
@@ -2891,16 +2924,16 @@ def command_review_bib(args: argparse.Namespace) -> int:
                 ]
                 if sighting_span_seconds(matches) >= 60.0:
                     options.insert(0, ("video-first", "Open first sighting in video"))
-                chosen_mode = prompt_menu(
-                    "Review action",
+                chosen_mode = prompt_review_action_or_bib(
                     options,
                     default_value="video-last",
-                    allow_cancel=True,
-                    cancel_label="Quit",
                 )
                 if chosen_mode is None:
                     return 0
                 print()
+                if chosen_mode.startswith("bib:"):
+                    current_bib = chosen_mode[4:]
+                    break
                 if chosen_mode == "another":
                     current_bib = None
                     break
