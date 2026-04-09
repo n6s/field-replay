@@ -2895,10 +2895,15 @@ def command_review_bib(args: argparse.Namespace) -> int:
     mode = args.mode
     if mode == "interactive" and interactive_mode_enabled(args):
         current_bib = args.bib
+        skip_bib_prompt = False
         print(f"Review session: {session_dir}")
         print()
         while True:
-            selected_bib = prompt_review_bib_value(current_bib)
+            if skip_bib_prompt and current_bib:
+                selected_bib = current_bib
+                skip_bib_prompt = False
+            else:
+                selected_bib = prompt_review_bib_value(current_bib)
             if selected_bib is None:
                 return 0
             current_bib = selected_bib
@@ -2917,25 +2922,27 @@ def command_review_bib(args: argparse.Namespace) -> int:
             print()
             while True:
                 options = [
-                    ("video-last", "Open last sighting in video"),
                     ("frames", "Browse saved full frames"),
+                    ("video-last", "Open last sighting in video"),
                     ("summary", "Print recent evidence lines"),
                     ("another", "Look up another bib"),
                 ]
                 if sighting_span_seconds(matches) >= 60.0:
-                    options.insert(0, ("video-first", "Open first sighting in video"))
+                    options.insert(1, ("video-first", "Open first sighting in video"))
                 chosen_mode = prompt_review_action_or_bib(
                     options,
-                    default_value="video-last",
+                    default_value="frames",
                 )
                 if chosen_mode is None:
                     return 0
                 print()
                 if chosen_mode.startswith("bib:"):
                     current_bib = chosen_mode[4:]
+                    skip_bib_prompt = True
                     break
                 if chosen_mode == "another":
                     current_bib = None
+                    skip_bib_prompt = False
                     break
                 status = run_review_bib_action(
                     args=args,
