@@ -1,21 +1,71 @@
 # field_replay
 
-Small helper for capture-card or USB-camera recording with `ffmpeg`.
+`field_replay` is a practical race-ops DVR and review tool built around `ffmpeg`.
 
-The current design is DVR-first:
+Its current sweet spot is:
 
-- pick a video source, audio source, and storage destination interactively
-- remember useful setups as saved profiles without forcing you to type them
-- record into one growing `timeshift.ts` file while the event is live
-- include lightweight audio from the USB capture card when available
-- open that file in a player like VLC so you can pause and scrub backward
-- remux the finished recording into `archive.mkv` when you stop
+- record one growing near-live `timeshift.ts` file while the event is happening
+- watch that file in VLC a few seconds behind live so you can pause and rewind
+- burn a wall-clock timestamp into the video by default
+- run a local vision model against the session to log likely bib sightings
+- review saved evidence frames and jump back into video when something needs confirmation
 
-This trades some latency for a much more practical "rewind the tape" workflow.
+This is no longer just an experiment. The current workflow is stable and usable for real review work, especially when the goal is answering questions like "when did bib 241 arrive?" or "when was the last time we saw bib 573?"
 
-## Requirements
+## Current Reality
 
-On a Debian or Ubuntu style Linux system, plan on these packages:
+What is working well right now:
+
+- DVR-first recording with `timeshift.ts` and a finalized `archive.mkv`
+- interactive setup and saved profiles
+- timestamp overlay burned into the video
+- near-live VLC playback with practical rewind behavior
+- local Ollama vision support for bib detection
+- promoted evidence logs plus saved frame grabs
+- `find-bib` and `review-bib` for post-hoc lookup
+
+What to treat as current assumptions:
+
+- use a real Linux machine with direct access to `/dev/video*`
+- VLC has been the most reliable player for the growing DVR file
+- the vision workflow is useful as a second set of eyes, not as gospel
+- saved frame review in `eog` is now a first-class workflow, not just debugging
+
+## Suggested System Requirements
+
+These are practical guesses based on current use and local benchmarking, not hard enforcement rules.
+
+### DVR-Only
+
+Good target for recording and near-live review without AI vision:
+
+- 4 CPU cores
+- 8 GB RAM
+- SSD-backed storage
+- a working Linux video capture path
+- hardware H.264 encode if available, but software fallback is supported
+
+### DVR + Vision Review
+
+Good target for recording, VLC review, and live bib detection with the current default vision model:
+
+- 4+ CPU cores
+- 16 GB RAM
+- NVIDIA GPU with about 8 GB VRAM
+- SSD-backed storage
+- local Ollama server
+
+The current default vision model is `gemma4:e2b`. On this workstation it has been the best field-oriented balance of:
+
+- fit on GPU
+- latency
+- small-bib usefulness
+
+Larger or less efficient models can work, but they may spill onto CPU/RAM and become too slow for pleasant live use.
+
+## Packages
+
+On a Debian or Ubuntu style Linux system, start with:
 
 ```bash
 sudo apt update
@@ -25,157 +75,184 @@ sudo apt install ffmpeg vlc v4l-utils alsa-utils
 Useful extras:
 
 ```bash
-sudo apt install mpv vainfo usbutils
+sudo apt install eog mpv vainfo usbutils
 ```
 
 What they are for:
 
-- `ffmpeg`: recording, remuxing, probing
-- `vlc`: DVR-style playback
+- `ffmpeg`: recording, remuxing, probing, frame extraction, and frame annotation
+- `vlc`: DVR-style playback of the growing `timeshift.ts`
 - `v4l-utils`: inspecting video devices and formats
 - `alsa-utils`: inspecting audio devices
+- `eog`: quick review of saved evidence frames
 - `mpv`: optional alternate player
 - `vainfo`: checking video acceleration support
 - `usbutils`: identifying USB capture hardware with `lsusb`
 
-## Quick start
+If you want live vision features, also install and run Ollama separately.
 
-Run a dependency check:
+## Core Workflow
+
+### 1. Check the environment
 
 ```bash
 ./field-replay doctor
 ```
 
-Create or update a reusable setup:
+### 2. Save a reusable recording setup
 
 ```bash
 ./field-replay setup
 ```
 
-`setup` is the best place to save a profile for something portable like a USB capture dongle or webcam. It can probe the selected devices and remember a likely-good V4L2 input format like `mjpeg` or `yuyv422`, plus video mode, audio input mode, encoder, and storage destination.
+`setup` is the best place to save a profile for a USB capture dongle or webcam. It can probe devices and remember useful settings like:
 
-Start a recording:
+- video device
+- V4L2 input format such as `mjpeg` or `yuyv422`
+- video size and framerate
+- audio input mode
+- encoder choice
+- storage destination
+
+### 3. Record
+
+For a straight recording flow:
 
 ```bash
 ./field-replay record
 ```
 
-If you already have saved profiles, `record` now starts with a profile picker. In the common case, pressing `Enter` immediately starts the default profile, and `Manual / edit setup` drops you into the full editor if you need to change devices or storage.
-
-By default, `record` now opens a simple interactive flow so you can choose:
-
-- a saved profile, if you have one
-- the current video device
-- the current audio device or no audio
-- the storage destination for the session
-
-If you want a one-tab workflow, try:
+For the common one-tab workflow:
 
 ```bash
 ./field-replay go
 ```
 
-`go` uses the same setup/profile flow as `record`, keeps FFmpeg in the foreground so `Ctrl-C` still stops and archives cleanly, and launches the player in the background once the DVR file is live.
+`go` keeps FFmpeg in the foreground so `Ctrl-C` still stops and archives cleanly, then launches the player in the background once the DVR file is live.
 
-That creates a session folder like `~/recordings/run-20260406-154331/` with:
-
-- `timeshift.ts` while recording is in progress
-- `archive.mkv` after the recording stops
-- `session.json`
-
-In another terminal, open a DVR feed:
+### 4. Watch the near-live DVR
 
 ```bash
 ./field-replay watch
 ```
 
-If you do not pass a target, `watch` offers an interactive picker of recent sessions across known recordings directories. It defaults to VLC because VLC has been the most reliable player so far for this growing DVR file. `mpv` is still available with `--player mpv`, but the tool now forces software decode there because hardware decode was not behaving well on this workstation.
+If you do not pass a target, `watch` offers a recent-session picker. It defaults to VLC because VLC has been the most reliable player so far for this growing file.
 
-The watch picker now labels each session with the target type it will open, such as `DVR timeshift` or `archive.mkv`, so it is clearer which entry is the still-growing live review file.
+### 5. Run live or offline vision review
 
-When you want a share-friendly copy after the event:
+Offline scan:
+
+```bash
+./field-replay vision-scan ~/recordings/run-20260408-181629 --max-samples 3
+```
+
+Live follow:
+
+```bash
+./field-replay vision-live ~/recordings/run-20260408-181629
+```
+
+`vision-live` follows a growing session in a model-paced loop:
+
+- grab a frame a few seconds behind live
+- ask the local model for bib guesses
+- promote only useful sightings
+- print promoted sightings to stdout
+
+### 6. Look up and review a bib
+
+```bash
+./field-replay find-bib 241
+./field-replay review-bib 241
+```
+
+`review-bib` is designed for repeated use inside one chosen session:
+
+- browse saved full frames in `eog`
+- jump to first or last sightings in VLC when useful
+- print recent evidence lines
+- type another bib directly at the action prompt without restarting the command
+
+### 7. Export a share-friendly copy
 
 ```bash
 ./field-replay export
 ```
 
-`export` offers an interactive picker of recent sessions across known recordings directories, then lets you choose a simple MP4 share preset with an estimated file size before it runs.
+`export` offers a recent-session picker, then lets you choose a simple MP4 preset with an estimated size before encoding.
 
-When possible, `export` now prefers a hardware H.264 encoder that matches the original session and writes a small sidecar JSON file next to the MP4 so you can tell later how the share copy was produced.
+## Session Layout
 
-## Vision Bib Detection
+A typical session folder looks like:
 
-There is an experimental Ollama vision sidecar for bib detection. It runs independently against an existing or current session:
+- `timeshift.ts`: the growing DVR file while recording is live
+- `archive.mkv`: finalized recording after stop
+- `session.json`: session metadata
+- `vision-live/` or `vision-scan/`: vision evidence and diagnostics when used
 
-```bash
-./field-replay vision-scan ~/recordings/run-20260408-181629 --max-samples 3
-./field-replay vision-live ~/recordings/run-20260408-181629
-./field-replay find-bib 241
-./field-replay find-bib 241 ~/recordings/run-20260408-181629
-./field-replay review-bib 241
-```
+Vision output currently includes:
 
-`vision-live` follows a growing session in a model-paced loop: it grabs one frame from a few seconds behind live, waits for the local model response, then grabs the next available frame. Promoted sightings are also printed to stdout so the live terminal can be used like a bib tail. `vision-scan` samples a saved session or media file for offline testing.
+- `events.log`: human-readable promoted sightings, good for `tail -f`
+- `events.jsonl`: promoted event records
+- `vision-debug.jsonl`: raw model diagnostics, latency, promoted and suppressed bibs
+- `frames/`: promoted evidence frames only
 
-The vision commands default to the local Ollama model `gemma4:e2b`, ask for strict JSON bib guesses, and write these files under `vision-live/` or `vision-scan/`:
+Promoted frames are annotated with the detected bibs along the bottom beside the timestamp strip so they are easier to review in `eog`.
 
-- `events.log`: human-readable lines that are easy to `tail -f`
-- `events.jsonl`: promoted vision sightings with timestamps and saved frame paths
-- `vision-debug.jsonl`: diagnostics showing the raw model response, promoted vs. suppressed bibs, and `elapsed_ms` timing for each sampled frame
-- `frames/`: saved full-frame grabs for promoted sightings only, with detected bibs labeled along the bottom for easier `eog` review
+By default, the same bib is only promoted once every 60 seconds. Sampled frames still go through the model and appear in diagnostics, but only promoted sightings are kept in `frames/` and surfaced in the operator-facing event log.
 
-By default, the same bib is only promoted once every 60 seconds. Sampled frames still go through the model and appear in `vision-debug.jsonl`, but only promoted sightings are kept in `frames/` and surfaced in `events.log`.
+## Vision Notes
 
-`review-bib` gives you a simple menu to jump into video a couple seconds before the last or best sighting, browse the saved full-frame grabs in an image viewer, and keep looking up more bibs inside the same chosen session until you quit.
+Current vision behavior is intentionally conservative:
 
-## Player behavior
+- default model: `gemma4:e2b`
+- strict JSON bib prompt
+- model-paced live sampling
+- repeat cooldown for calmer logs
+- promoted frames only, not every sampled frame
 
-For the workflow you described, the important distinction is:
+This makes the live terminal and saved frame folder much more useful during stressful group movement.
+
+The vision commands are best treated as:
+
+- a live bib tail
+- a source of saved evidence frames
+- a fast way to jump back into video
+
+They are not a guarantee of correctness. Some bibs will still be missed, partially read, or never promoted.
+
+## Player Behavior
+
+For practical use, the distinction is:
 
 - `watch` is for DVR-style playback of the growing `timeshift.ts`
-- `archive.mkv` is the finalized recording after you stop
+- `archive.mkv` is the finalized recording after stop
 
 If you open the live DVR file in VLC, you can usually:
 
 - let playback sit near live
 - pause when a pack goes by
 - drag backward through already-recorded video
-- jump around the file while the recorder keeps appending to the same DVR file
+- jump around while the recorder keeps appending to the same file
 
-If you want to compare players, `./field-replay watch --player mpv` is still available.
+`mpv` is still available with `--player mpv`, but VLC has been the better fit for this workflow so far.
 
-## Profiles and storage
+## Profiles, Defaults, and Fallbacks
 
-Profiles are stored in `~/.config/field-replay/config.json` by default. Right now a profile remembers:
+Profiles are stored in `~/.config/field-replay/config.json` by default.
+
+A profile currently remembers:
 
 - video device
 - video input format
-- audio enabled/disabled
+- audio enabled or disabled
 - audio device
 - probed audio input rate and channel count
 - probed video size and framerate
-- preferred encoder for the current machine
+- preferred encoder
 - recordings directory
 
-The tool also remembers your last chosen storage path and last watched session to keep the common path simple.
-
-This makes it easier to use the same script on:
-
-- a workstation with a large `/mnt/storage` partition
-- a laptop or mini PC
-- a Linux laptop writing to external storage
-
-`record` also places a simple lock file under the recordings root so two recorder processes cannot grab the same video or audio device at the same time.
-
-If a machine does not have `h264_nvenc`, `setup`, `record`, and `doctor` now fall back to another available encoder such as `libx264`.
-
-For webcams and some USB capture devices, `setup` can also probe V4L2 input formats. That matters because the same device may behave very differently in raw `yuyv422` versus `mjpeg`.
-
-For VLC playback, `watch` now disables VLC hardware decoding by default for this DVR file. That should make seeking around a growing `timeshift.ts` a bit less fragile.
-
-## Defaults
-
-The default capture settings are:
+Useful current defaults:
 
 - device: `/dev/video2`
 - audio device: `hw:Capture,0`
@@ -183,47 +260,53 @@ The default capture settings are:
 - audio output: `32 kHz` mono AAC at `32k`
 - audio gain: `+18 dB`
 - timestamp source: `generated`
-- video timestamp overlay: wall-clock burned in by default
-- input queue: `512`
+- video timestamp overlay: enabled by default
 - framerate: `30`
 - size: `1920x1080`
 - encoder: `h264_nvenc`
 - preset: `fast`
-- GOP: about `1` second of video, based on the selected framerate
 - archive format after stop: `mkv`
 
-## Useful flags
+If `h264_nvenc` is unavailable, the tool falls back to another available encoder such as `libx264`.
+
+## Useful Commands
 
 ```bash
+./field-replay doctor
 ./field-replay setup
-./field-replay setup --video-input-format mjpeg
-./field-replay setup --profile portable-capture --no-interactive --no-probe
 ./field-replay go
-./field-replay go --player vlc
-./field-replay record --device /dev/video3
-./field-replay record --video-input-format mjpeg
-./field-replay record --no-audio
-./field-replay record --profile portable-capture --no-interactive
-./field-replay record --no-interactive
-./field-replay record --audio-gain-db 24
-./field-replay record --audio-bitrate 48k --audio-channels 2 --audio-sample-rate 48000
-./field-replay record --timestamp-source device --timestamps default
-./field-replay record --no-video-timestamp
-./field-replay record --video-bitrate 8M --maxrate 10M --bufsize 20M
-./field-replay record --session-name finish-line-a
-./field-replay --recordings-dir /mnt/storage/field-replay record
 ./field-replay watch
-./field-replay watch --no-interactive
-./field-replay watch --player mpv
-./field-replay watch --player vlc
-./field-replay watch --player ffplay
-./field-replay watch --file-caching-ms 100
+./field-replay vision-live
+./field-replay find-bib 241
+./field-replay review-bib 241
 ./field-replay export
-./field-replay export --preset share-small
-./field-replay export --dry-run
-./field-replay record --dry-run
-./field-replay --config-file /tmp/field-replay-config.json record
 ```
+
+A few common variations:
+
+```bash
+./field-replay go --player vlc
+./field-replay record --profile portable-capture --no-interactive
+./field-replay record --no-audio
+./field-replay record --no-video-timestamp
+./field-replay vision-live ~/recordings/run-20260408-181629
+./field-replay vision-scan ~/recordings/run-20260408-181629 --max-samples 20
+./field-replay watch --player mpv
+./field-replay export --preset share-small
+```
+
+## Resource Review
+
+If you want to estimate minimum hardware needs on your own system, useful tools are:
+
+```bash
+ollama ps
+nvidia-smi
+pidstat -rudh 1
+du -sh ~/recordings/run-*
+```
+
+`vision-debug.jsonl` is also useful because it records `elapsed_ms` for each sampled frame, which gives you a direct sense of whether live vision is keeping up comfortably or struggling.
 
 ## Roadmap
 
