@@ -2135,7 +2135,7 @@ def process_vision_frame(
     prompt: str,
     timeout_seconds: float,
     keepalive: str,
-) -> None:
+) -> list[dict]:
     now = datetime.now().astimezone()
     started_at = time.perf_counter()
     try:
@@ -2160,6 +2160,7 @@ def process_vision_frame(
                 "bibs": bibs,
             },
         )
+        promoted: list[dict] = []
         for bib in bibs:
             payload = {
                 "t": round(offset_seconds, 1),
@@ -2172,6 +2173,8 @@ def process_vision_frame(
             }
             append_jsonl(runtime_paths["events_jsonl"], payload)
             append_text_line(runtime_paths["events_log"], vision_event_log_line(payload))
+            promoted.append(payload)
+        return promoted
     except RuntimeError as exc:
         append_jsonl(
             runtime_paths["debug_log"],
@@ -2182,6 +2185,7 @@ def process_vision_frame(
                 "error": str(exc),
             },
         )
+    return []
 
 
 def print_session_summary(paths: SessionPaths) -> None:
@@ -2528,7 +2532,7 @@ def command_vision_live(args: argparse.Namespace) -> int:
                 offset_seconds,
                 frame_path,
             )
-            process_vision_frame(
+            promoted = process_vision_frame(
                 runtime_paths=runtime_paths,
                 session_dir=session_dir,
                 frame_path=frame_path,
@@ -2539,6 +2543,8 @@ def command_vision_live(args: argparse.Namespace) -> int:
                 timeout_seconds=args.timeout,
                 keepalive=args.keepalive,
             )
+            for payload in promoted:
+                print(vision_event_log_line(payload), flush=True)
             processed_offsets.add(rounded_offset)
             sample_count += 1
         except RuntimeError as exc:
