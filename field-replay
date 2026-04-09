@@ -30,7 +30,9 @@ COMMON_FRAME_RATES = (30, 25, 15, 10, 5)
 COMMON_VIDEO_INPUT_FORMATS = ("auto", "mjpeg", "yuyv422", "uyvy422", "nv12")
 COMMON_AUDIO_INPUTS = ((48000, 2), (48000, 1), (44100, 2), (44100, 1), (32000, 1))
 DEFAULT_VIDEO_TIMESTAMP_ENABLED = True
+DEFAULT_OCR_LIVE_ENABLED = True
 DEFAULT_OCR_SAMPLE_INTERVAL = 1.0
+DEFAULT_OCR_TAIL_OFFSET = 4.0
 DEFAULT_OCR_REPEAT_COOLDOWN = 60.0
 DEFAULT_OCR_MIN_CONFIDENCE = 45
 EXPORT_PRESETS = {
@@ -206,7 +208,10 @@ def prompt_menu(
     title: str,
     options: Sequence[tuple[str, str]],
     default_value: str | None = None,
-) -> str:
+    *,
+    allow_cancel: bool = False,
+    cancel_label: str = "Quit",
+) -> str | None:
     if title:
         print(title)
     default_index = None
@@ -216,6 +221,8 @@ def prompt_menu(
             default_index = index
             marker = " [default]"
         print(f"  {index}. {label}{marker}")
+    if allow_cancel:
+        print(f"  q. {cancel_label}")
 
     while True:
         prompt = "Select an option"
@@ -225,11 +232,16 @@ def prompt_menu(
         raw = input(prompt).strip()
         if not raw and default_index is not None:
             return options[default_index - 1][0]
+        if allow_cancel and raw.lower() in {"q", "quit"}:
+            return None
         if raw.isdigit():
             selected = int(raw)
             if 1 <= selected <= len(options):
                 return options[selected - 1][0]
-        print("Please enter one of the numbered options.")
+        if allow_cancel:
+            print("Please enter one of the numbered options, or q to quit.")
+        else:
+            print("Please enter one of the numbered options.")
 
 
 def prompt_text(prompt: str, default: str | None = None) -> str:
@@ -1058,6 +1070,7 @@ def profile_from_args(args: argparse.Namespace) -> dict:
         "video_timestamp": getattr(args, "video_timestamp", DEFAULT_VIDEO_TIMESTAMP_ENABLED),
         "ocr_live": getattr(args, "ocr_live", False),
         "ocr_sample_interval": getattr(args, "ocr_sample_interval", DEFAULT_OCR_SAMPLE_INTERVAL),
+        "ocr_tail_offset": getattr(args, "ocr_tail_offset", DEFAULT_OCR_TAIL_OFFSET),
         "ocr_repeat_cooldown": getattr(args, "ocr_repeat_cooldown", DEFAULT_OCR_REPEAT_COOLDOWN),
         "ocr_min_confidence": getattr(args, "ocr_min_confidence", DEFAULT_OCR_MIN_CONFIDENCE),
         "recordings_dir": str(args.recordings_dir.expanduser()),
@@ -1404,14 +1417,19 @@ def select_watch_target(args: argparse.Namespace, config: dict) -> str | None:
     return prompt_menu("Choose a session to watch", options, default_value=default_value)
 
 
-def select_ocr_target(args: argparse.Namespace, config: dict) -> str | None:
+def select_ocr_target(
+    args: argparse.Namespace,
+    config: dict,
+    *,
+    title: str = "Choose a session for live OCR",
+) -> str | None:
     unique_sessions = recent_sessions(args, config)
     if not unique_sessions:
         return None
     options = [(str(path), session_display_label(path)) for path in unique_sessions[:20]]
     options.append(("__manual__", "Enter a session path manually"))
     default_value = config.get("last_session_dir")
-    choice = prompt_menu("Choose a session for live OCR", options, default_value=default_value)
+    choice = prompt_menu(title, options, default_value=default_value)
     if choice == "__manual__":
         return prompt_text("Session directory")
     return choice
@@ -1436,6 +1454,38 @@ def ocr_event_sources_for_session(session_dir: Path) -> list[tuple[str, Path]]:
         ("scan", session_dir / "ocr-scan" / "events.jsonl"),
     ]
     return [(label, path) for label, path in sources if path.exists()]
+
+
+def load_ocr_matches_for_bib(session_dir: Path, bib: str) -> list[dict]:
+    matches: list[dict] = []
+    for source_label, source_path in ocr_event_sources_for_session(session_dir):
+        for record in load_jsonl_records(source_path):
+            if str(record.get("b") or "").upper() != bib:
+                continue
+            item = dict(record)
+            item["_source"] = source_label
+            item["_path"] = source_path
+            matches.append(item)
+    matches.sort(key=event_sort_key)
+    return matches
+
+
+def bib_match_summary_lines(session_dir: Path, bib: str, matches: Sequence[dict]) -> list[str]:
+    best_match = max(matches, key=lambda item: int(item.get("c") or 0))
+    first_match = matches[0]
+    last_match = matches[-1]
+    return [
+        f"Session:   {session_dir}",
+        f"Bib:       {bib}",
+        f"Matches:   {len(matches)}",
+        f"First:     {first_match.get('w', '?')} ({format_duration(first_match.get('t'))})",
+        f"Last:      {last_match.get('w', '?')} ({format_duration(last_match.get('t'))})",
+        (
+            "Best:      "
+            f"{best_match.get('c', 0)}% from {best_match.get('_source', '?')} "
+            f"frame={best_match.get('f', '-')}"
+        ),
+    ]
 
 
 def export_display_label(session_dir: Path) -> str | None:
@@ -1857,13 +1907,22 @@ def choose_export_preset(
     return prompt_menu("Export preset", options, default_value=chosen_default)
 
 
-def build_player_command(player: str, target_path: Path, file_caching_ms: int) -> list[str]:
+def build_player_command(
+    player: str,
+    target_path: Path,
+    file_caching_ms: int,
+    start_seconds: float | None = None,
+) -> list[str]:
     player_name = Path(player).name
     if player_name == "ffplay":
-        return [player, str(target_path)]
+        command = [player]
+        if start_seconds is not None and start_seconds > 0:
+            command.extend(["-ss", f"{start_seconds:.1f}"])
+        command.append(str(target_path))
+        return command
     if player_name == "mpv":
         cache_seconds = max(file_caching_ms / 1000.0, 0.1)
-        return [
+        command = [
             player,
             "--hwdec=no",
             "--cache=yes",
@@ -1873,14 +1932,38 @@ def build_player_command(player: str, target_path: Path, file_caching_ms: int) -
             "--keep-open=yes",
             "--force-seekable=yes",
             "--hr-seek=no",
-            str(target_path),
         ]
-    return [
+        if start_seconds is not None and start_seconds > 0:
+            command.append(f"--start={start_seconds:.1f}")
+        command.append(str(target_path))
+        return command
+    command = [
         player,
         "--avcodec-hw=none",
         f"--file-caching={file_caching_ms}",
-        str(target_path),
     ]
+    if start_seconds is not None and start_seconds > 0:
+        command.append(f"--start-time={start_seconds:.1f}")
+    command.append(str(target_path))
+    return command
+
+
+def choose_image_viewer(preferred: str | None) -> str | None:
+    if preferred:
+        preferred_path = Path(preferred).expanduser()
+        if preferred_path.is_file():
+            return str(preferred_path)
+        return shutil.which(preferred)
+    return shutil.which("eog")
+
+
+def build_image_viewer_command(viewer: str, image_paths: Sequence[Path]) -> list[str]:
+    viewer_name = Path(viewer).name
+    command = [viewer]
+    if viewer_name == "eog":
+        command.append("--single-window")
+    command.extend(str(path) for path in image_paths)
+    return command
 
 
 def build_ocr_sidecar_command(paths: SessionPaths, args: argparse.Namespace) -> list[str]:
@@ -1895,6 +1978,8 @@ def build_ocr_sidecar_command(paths: SessionPaths, args: argparse.Namespace) -> 
         args.tesseract_bin,
         "--sample-interval",
         str(args.ocr_sample_interval),
+        "--tail-offset",
+        str(args.ocr_tail_offset),
         "--repeat-cooldown",
         str(args.ocr_repeat_cooldown),
         "--min-confidence",
@@ -1982,6 +2067,15 @@ def relative_to_session(path: Path, session_dir: Path) -> str:
         return str(path.relative_to(session_dir))
     except ValueError:
         return str(path)
+
+
+def session_asset_path(session_dir: Path, relative_or_absolute: str | None) -> Path | None:
+    if not relative_or_absolute:
+        return None
+    candidate = Path(relative_or_absolute).expanduser()
+    if candidate.is_absolute():
+        return candidate
+    return session_dir / candidate
 
 
 def normalize_ocr_text(value: str) -> str | None:
@@ -2102,7 +2196,27 @@ def candidate_exits_exclusion_zone(
 
 
 def extract_recent_frame(ffmpeg_bin: str, timeshift_path: Path, output_path: Path) -> None:
+    extract_recent_frame_at_offset(
+        ffmpeg_bin,
+        timeshift_path,
+        output_path,
+        tail_offset_seconds=DEFAULT_OCR_TAIL_OFFSET,
+    )
+
+
+def extract_recent_frame_at_offset(
+    ffmpeg_bin: str,
+    timeshift_path: Path,
+    output_path: Path,
+    *,
+    tail_offset_seconds: float,
+) -> None:
     ensure_directory(output_path.parent)
+    duration_seconds = ffprobe_duration_seconds(timeshift_path)
+    if duration_seconds is None or duration_seconds <= 0:
+        offset_seconds = 0.0
+    else:
+        offset_seconds = max(duration_seconds - max(tail_offset_seconds, 0.0), 0.0)
     result = subprocess.run(
         [
             ffmpeg_bin,
@@ -2110,8 +2224,8 @@ def extract_recent_frame(ffmpeg_bin: str, timeshift_path: Path, output_path: Pat
             "-loglevel",
             "error",
             "-y",
-            "-sseof",
-            "-0.2",
+            "-ss",
+            f"{offset_seconds:.3f}",
             "-i",
             str(timeshift_path),
             "-frames:v",
@@ -2519,7 +2633,12 @@ def command_ocr_live(args: argparse.Namespace) -> int:
         last_size = current_size
 
         try:
-            extract_recent_frame(ffmpeg_path, timeshift_path, runtime_paths["scratch_frame"])
+            extract_recent_frame_at_offset(
+                ffmpeg_path,
+                timeshift_path,
+                runtime_paths["scratch_frame"],
+                tail_offset_seconds=args.tail_offset,
+            )
             candidates = read_tesseract_candidates(
                 runtime_paths["scratch_frame"],
                 tesseract_path,
@@ -2728,7 +2847,7 @@ def command_find_bib(args: argparse.Namespace) -> int:
     config_path = args.config_file.expanduser()
     config = load_config(config_path)
     if not args.target and interactive_mode_enabled(args):
-        selected_target = select_ocr_target(args, config)
+        selected_target = select_ocr_target(args, config, title="Choose a session for bib lookup")
         if not selected_target:
             print("no sessions found for bib lookup", file=sys.stderr)
             return 1
@@ -2751,44 +2870,17 @@ def command_find_bib(args: argparse.Namespace) -> int:
         print(f"not a bib-like lookup value: {args.bib}", file=sys.stderr)
         return 1
 
-    sources = ocr_event_sources_for_session(session_dir)
-    if not sources:
+    if not ocr_event_sources_for_session(session_dir):
         print(f"no OCR event logs found under {session_dir}", file=sys.stderr)
         return 1
 
-    matches: list[dict] = []
-    for source_label, source_path in sources:
-        for record in load_jsonl_records(source_path):
-            if str(record.get("b") or "").upper() != normalized_bib:
-                continue
-            item = dict(record)
-            item["_source"] = source_label
-            item["_path"] = source_path
-            matches.append(item)
-
+    matches = load_ocr_matches_for_bib(session_dir, normalized_bib)
     if not matches:
         print(f"no OCR events found for bib {normalized_bib} in {session_dir}", file=sys.stderr)
         return 1
 
-    matches.sort(key=event_sort_key)
-    best_match = max(matches, key=lambda item: int(item.get("c") or 0))
-    first_match = matches[0]
-    last_match = matches[-1]
-
-    print(f"Session:   {session_dir}")
-    print(f"Bib:       {normalized_bib}")
-    print(f"Matches:   {len(matches)}")
-    print(
-        f"First:     {first_match.get('w', '?')} ({format_duration(first_match.get('t'))})"
-    )
-    print(
-        f"Last:      {last_match.get('w', '?')} ({format_duration(last_match.get('t'))})"
-    )
-    print(
-        "Best:      "
-        f"{best_match.get('c', 0)}% from {best_match.get('_source', '?')} "
-        f"frame={best_match.get('f', '-')}"
-    )
+    for line in bib_match_summary_lines(session_dir, normalized_bib, matches):
+        print(line)
     print()
     print("Evidence")
     for match in matches[-args.limit :]:
@@ -2802,11 +2894,172 @@ def command_find_bib(args: argparse.Namespace) -> int:
     return 0
 
 
+def run_review_bib_action(
+    *,
+    args: argparse.Namespace,
+    session_dir: Path,
+    normalized_bib: str,
+    matches: Sequence[dict],
+    mode: str,
+) -> int:
+    if mode == "summary":
+        print("Evidence")
+        for match in matches[-args.limit :]:
+            print(
+                f"  {match.get('w', '?')}  "
+                f"t={format_duration(match.get('t'))}  "
+                f"conf={match.get('c', 0)}%  "
+                f"src={match.get('_source', '?')}  "
+                f"frame={match.get('f', '-')}"
+            )
+        return 0
+
+    if mode in {"video-last", "video-best"}:
+        chosen_match = (
+            matches[-1]
+            if mode == "video-last"
+            else max(matches, key=lambda item: int(item.get("c") or 0))
+        )
+        player = choose_player(args.player)
+        if not player:
+            requested = args.player or "vlc/mpv/ffplay"
+            print(f"player not found: {requested}", file=sys.stderr)
+            return 1
+        try:
+            target_path = resolve_watch_target(
+                args.recordings_dir.expanduser(), str(session_dir)
+            )
+        except FileNotFoundError as exc:
+            print(exc, file=sys.stderr)
+            return 1
+        start_seconds = max(float(chosen_match.get("t") or 0.0) - args.pre_roll, 0.0)
+        command = build_player_command(
+            player,
+            target_path,
+            args.file_caching_ms,
+            start_seconds=start_seconds,
+        )
+        action_label = "last sighting" if mode == "video-last" else "best sighting"
+        print(
+            f"Opening {action_label} for {normalized_bib} at "
+            f"{format_duration(start_seconds)}"
+        )
+        print("Player:", shlex.join(command))
+        if args.dry_run:
+            return 0
+        return subprocess.call(command)
+
+    if mode in {"frames", "crops"}:
+        image_paths: list[Path] = []
+        key = "f" if mode == "frames" else "p"
+        seen_paths: set[Path] = set()
+        for match in matches:
+            image_path = session_asset_path(session_dir, str(match.get(key) or ""))
+            if image_path is None or not image_path.exists() or image_path in seen_paths:
+                continue
+            seen_paths.add(image_path)
+            image_paths.append(image_path)
+        if not image_paths:
+            print(
+                f"no saved {'frames' if mode == 'frames' else 'crops'} found for {normalized_bib}",
+                file=sys.stderr,
+            )
+            return 1
+        viewer = choose_image_viewer(args.image_viewer)
+        if not viewer:
+            requested = args.image_viewer or "eog"
+            print(f"image viewer not found: {requested}", file=sys.stderr)
+            return 1
+        command = build_image_viewer_command(viewer, image_paths)
+        noun = "frame" if mode == "frames" else "crop"
+        print(
+            f"Opening {len(image_paths)} {noun}"
+            f"{'' if len(image_paths) == 1 else 's'} for {normalized_bib}"
+        )
+        print("Viewer:", shlex.join(command))
+        if args.dry_run:
+            return 0
+        return subprocess.call(command)
+
+    print(f"unknown review mode: {mode}", file=sys.stderr)
+    return 1
+
+
+def command_review_bib(args: argparse.Namespace) -> int:
+    session_dir = resolve_ocr_session_from_args(args, "OCR review")
+    if session_dir is None:
+        return 1
+
+    normalized_bib = normalize_ocr_text(args.bib)
+    if not normalized_bib:
+        print(f"not a bib-like lookup value: {args.bib}", file=sys.stderr)
+        return 1
+
+    if not ocr_event_sources_for_session(session_dir):
+        print(f"no OCR event logs found under {session_dir}", file=sys.stderr)
+        return 1
+
+    matches = load_ocr_matches_for_bib(session_dir, normalized_bib)
+    if not matches:
+        print(f"no OCR events found for bib {normalized_bib} in {session_dir}", file=sys.stderr)
+        return 1
+
+    for line in bib_match_summary_lines(session_dir, normalized_bib, matches):
+        print(line)
+    print()
+
+    mode = args.mode
+    if mode == "interactive" and interactive_mode_enabled(args):
+        while True:
+            options = [
+                ("video-last", "Open last sighting in video"),
+                ("video-best", "Open best-confidence sighting in video"),
+                ("frames", "Browse saved full frames"),
+                ("crops", "Browse saved bib crops"),
+                ("summary", "Print recent evidence lines"),
+            ]
+            chosen_mode = prompt_menu(
+                "Review action",
+                options,
+                default_value="video-last",
+                allow_cancel=True,
+                cancel_label="Quit",
+            )
+            if chosen_mode is None:
+                return 0
+            print()
+            status = run_review_bib_action(
+                args=args,
+                session_dir=session_dir,
+                normalized_bib=normalized_bib,
+                matches=matches,
+                mode=chosen_mode,
+            )
+            print()
+            if status != 0:
+                return status
+        return 0
+    if mode == "interactive":
+        mode = "video-last"
+
+    return run_review_bib_action(
+        args=args,
+        session_dir=session_dir,
+        normalized_bib=normalized_bib,
+        matches=matches,
+        mode=mode,
+    )
+
+
 def resolve_ocr_session_from_args(args: argparse.Namespace, purpose: str) -> Path | None:
     config_path = args.config_file.expanduser()
     config = load_config(config_path)
     if not getattr(args, "target", None) and interactive_mode_enabled(args):
-        selected_target = select_ocr_target(args, config)
+        selected_target = select_ocr_target(
+            args,
+            config,
+            title=f"Choose a session for {purpose}",
+        )
         if not selected_target:
             print(f"no sessions found for {purpose}", file=sys.stderr)
             return None
@@ -3161,7 +3414,7 @@ def add_record_arguments(
     parser.add_argument(
         "--ocr-live",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=DEFAULT_OCR_LIVE_ENABLED,
         help="Run a lightweight live OCR sidecar against the growing DVR file.",
     )
     parser.add_argument(
@@ -3169,6 +3422,12 @@ def add_record_arguments(
         type=float,
         default=DEFAULT_OCR_SAMPLE_INTERVAL,
         help="Seconds between live OCR samples.",
+    )
+    parser.add_argument(
+        "--ocr-tail-offset",
+        type=float,
+        default=DEFAULT_OCR_TAIL_OFFSET,
+        help="Seconds behind the live tail to sample for OCR.",
     )
     parser.add_argument(
         "--ocr-repeat-cooldown",
@@ -3445,6 +3704,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Seconds between OCR samples.",
     )
     ocr_live.add_argument(
+        "--tail-offset",
+        type=float,
+        default=DEFAULT_OCR_TAIL_OFFSET,
+        help="Seconds behind the live tail to sample for OCR.",
+    )
+    ocr_live.add_argument(
         "--repeat-cooldown",
         type=float,
         default=DEFAULT_OCR_REPEAT_COOLDOWN,
@@ -3564,6 +3829,62 @@ def build_parser() -> argparse.ArgumentParser:
         help="Prompt to choose a recent session when the target is omitted.",
     )
     find_bib.set_defaults(func=command_find_bib)
+
+    review_bib = subparsers.add_parser(
+        "review-bib",
+        help="Open OCR evidence for one bib in video or saved images.",
+    )
+    review_bib.add_argument("bib", help="Bib number or PACER token to review.")
+    review_bib.add_argument(
+        "target",
+        nargs="?",
+        type=Path,
+        help="Optional session directory or media file. Defaults to an interactive picker or the latest session.",
+    )
+    review_bib.add_argument(
+        "--mode",
+        choices=("interactive", "video-last", "video-best", "frames", "crops", "summary"),
+        default="interactive",
+        help="Review action. Defaults to an interactive menu.",
+    )
+    review_bib.add_argument(
+        "--player",
+        help="Preferred player for video review. Defaults to vlc, then mpv, ffplay, cvlc.",
+    )
+    review_bib.add_argument(
+        "--image-viewer",
+        help="Preferred image viewer for frame or crop browsing. Defaults to eog.",
+    )
+    review_bib.add_argument(
+        "--pre-roll",
+        type=float,
+        default=2.0,
+        help="Seconds to rewind before opening a video sighting.",
+    )
+    review_bib.add_argument(
+        "--limit",
+        type=int,
+        default=10,
+        help="Maximum number of evidence lines to print when using summary mode.",
+    )
+    review_bib.add_argument(
+        "--file-caching-ms",
+        type=int,
+        default=300,
+        help="Player file cache in milliseconds for video review.",
+    )
+    review_bib.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the player or image-viewer command without running it.",
+    )
+    review_bib.add_argument(
+        "--interactive",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Prompt to choose a recent session or review action when arguments are omitted.",
+    )
+    review_bib.set_defaults(func=command_review_bib)
 
     ocr_ignore = subparsers.add_parser(
         "ocr-ignore",

@@ -115,10 +115,10 @@ When possible, `export` now prefers a hardware H.264 encoder that matches the or
 
 There is now a first-pass live OCR sidecar for bib experiments.
 
-Enable it during recording with:
+It starts by default during `record` and `go`. If you want recording without OCR, use:
 
 ```bash
-./field-replay record --ocr-live
+./field-replay record --no-ocr-live
 ```
 
 Or run it independently against an existing or current session:
@@ -131,6 +131,7 @@ Or run it independently against an existing or current session:
 ./field-replay ocr-scan /path/to/test.ts
 ./field-replay find-bib 241
 ./field-replay find-bib 241 ~/recordings/run-20260408-181629
+./field-replay review-bib 241
 ./field-replay ocr-ignore list
 ./field-replay ocr-ignore add 123
 ./field-replay ocr-ignore remove 123
@@ -142,7 +143,11 @@ That sidecar samples the growing `timeshift.ts`, runs `tesseract`, and writes th
 - `ocr/events.jsonl`: promoted OCR sightings with timestamps, confidence, bbox, and saved frame paths
 - `ocr/ocr-debug.jsonl`: diagnostics showing what OCR saw and why repeats were suppressed
 
+`review-bib` gives you a simple menu to jump into video a couple seconds before the last or best sighting, or browse the saved full-frame grabs and bib crops in an image viewer.
+
 If a bib becomes noisy in the live view, add it to `ocr-ignore.txt` in the session directory. Ignored bibs stay in raw/debug data but stop appearing in promoted live OCR events.
+
+Live OCR now samples a few seconds behind the very end of `timeshift.ts` instead of grabbing the absolute tail, which makes frame extraction more stable on an actively growing recording. If you want to tune that, use `--ocr-tail-offset` or `ocr-live --tail-offset`.
 
 ## Player behavior
 
