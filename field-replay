@@ -20,11 +20,8 @@ from typing import Sequence
 DEFAULT_RECORDINGS_DIR = Path("~/recordings").expanduser()
 DEFAULT_CONFIG_PATH = Path("~/.config/field-replay/config.json").expanduser()
 DEFAULT_SESSION_PREFIX = "run"
-DEFAULT_PLAYLIST_NAME = "live.m3u8"
 DEFAULT_TIMESHIFT_NAME = "timeshift.ts"
 DEFAULT_ARCHIVE_STEM = "archive"
-DEFAULT_SEGMENT_PATTERN = "segment-%06d.ts"
-DEFAULT_CONCAT_NAME = "segments.ffconcat"
 DEFAULT_ENCODER = "h264_nvenc"
 DEFAULT_VIDEO_INPUT_FORMAT = "auto"
 COMMON_VIDEO_SIZES = ("1920x1080", "1280x720", "1024x576", "640x480")
@@ -84,11 +81,8 @@ class SessionPaths:
     session_dir: Path
     archive_path: Path
     timeshift_path: Path
-    playlist_path: Path
     metadata_path: Path
-    concat_path: Path
     latest_link: Path
-    segment_pattern: str
 
 
 @dataclass(frozen=True)
@@ -109,20 +103,15 @@ def make_session_paths(
     session_dir = recordings_dir / session_name
     archive_path = session_dir / f"{DEFAULT_ARCHIVE_STEM}.{archive_format}"
     timeshift_path = session_dir / DEFAULT_TIMESHIFT_NAME
-    playlist_path = session_dir / DEFAULT_PLAYLIST_NAME
     metadata_path = session_dir / "session.json"
-    concat_path = session_dir / DEFAULT_CONCAT_NAME
     latest_link = recordings_dir / "latest"
     return SessionPaths(
         recordings_dir=recordings_dir,
         session_dir=session_dir,
         archive_path=archive_path,
         timeshift_path=timeshift_path,
-        playlist_path=playlist_path,
         metadata_path=metadata_path,
-        concat_path=concat_path,
         latest_link=latest_link,
-        segment_pattern=DEFAULT_SEGMENT_PATTERN,
     )
 
 
@@ -1269,15 +1258,12 @@ def session_target_summary(session_dir: Path) -> str:
     timeshift = session_dir / DEFAULT_TIMESHIFT_NAME
     archive_mkv = session_dir / f"{DEFAULT_ARCHIVE_STEM}.mkv"
     archive_mp4 = session_dir / f"{DEFAULT_ARCHIVE_STEM}.mp4"
-    playlist = session_dir / DEFAULT_PLAYLIST_NAME
     if timeshift.exists():
         return "DVR timeshift"
     if archive_mkv.exists():
         return "archive.mkv"
     if archive_mp4.exists():
         return "archive.mp4"
-    if playlist.exists():
-        return "live playlist"
     return "session"
 
 
@@ -1380,12 +1366,12 @@ def release_device_locks(lock_paths: Sequence[Path]) -> None:
 def wait_for_capture_output(paths: SessionPaths, process: subprocess.Popen[bytes], timeout_seconds: float = 5.0) -> bool:
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
-        if has_timeshift_session(paths) or paths.playlist_path.exists():
+        if has_timeshift_session(paths):
             return True
         if process.poll() is not None:
             return False
         time.sleep(0.2)
-    return has_timeshift_session(paths) or paths.playlist_path.exists()
+    return has_timeshift_session(paths)
 
 
 def update_latest_symlink(paths: SessionPaths) -> None:
@@ -1397,43 +1383,8 @@ def update_latest_symlink(paths: SessionPaths) -> None:
         print(f"warning: could not update latest symlink: {exc}", file=sys.stderr)
 
 
-def segment_files(paths: SessionPaths) -> list[Path]:
-    return sorted(paths.session_dir.glob("segment-*.ts"))
-
-
 def has_timeshift_session(paths: SessionPaths) -> bool:
     return paths.timeshift_path.exists() and paths.timeshift_path.stat().st_size > 0
-
-
-def write_concat_file(paths: SessionPaths) -> list[Path]:
-    segments = segment_files(paths)
-    lines = ["ffconcat version 1.0"]
-    for segment in segments:
-        lines.append(f"file '{segment.name}'")
-    paths.concat_path.write_text("\n".join(lines) + "\n")
-    return segments
-
-
-def build_concat_archive_command(
-    paths: SessionPaths, ffmpeg_bin: str, archive_format: str
-) -> list[str]:
-    command = [
-        ffmpeg_bin,
-        "-hide_banner",
-        "-y",
-        "-f",
-        "concat",
-        "-safe",
-        "0",
-        "-i",
-        paths.concat_path.name,
-        "-c",
-        "copy",
-    ]
-    if archive_format == "mp4":
-        command.extend(["-movflags", "+faststart"])
-    command.append(paths.archive_path.name)
-    return command
 
 
 def build_timeshift_archive_command(
@@ -1455,19 +1406,13 @@ def build_timeshift_archive_command(
 
 
 def create_archive(paths: SessionPaths, args: argparse.Namespace) -> tuple[bool, str]:
-    if has_timeshift_session(paths):
-        archive_command = build_timeshift_archive_command(
-            paths, args.ffmpeg_bin, args.archive_format
-        )
-        source_label = paths.timeshift_path.name
-    else:
-        segments = write_concat_file(paths)
-        if not segments:
-            return False, "no recording data was captured"
-        archive_command = build_concat_archive_command(
-            paths, args.ffmpeg_bin, args.archive_format
-        )
-        source_label = f"{len(segments)} HLS segments"
+    if not has_timeshift_session(paths):
+        return False, "no recording data was captured"
+
+    archive_command = build_timeshift_archive_command(
+        paths, args.ffmpeg_bin, args.archive_format
+    )
+    source_label = paths.timeshift_path.name
 
     print("Archive:", shlex.join(archive_command))
     result = subprocess.run(archive_command, cwd=paths.session_dir, check=False)
@@ -1492,7 +1437,6 @@ def write_metadata(
         "session_dir": str(paths.session_dir),
         "archive_path": str(paths.archive_path),
         "timeshift_path": str(paths.timeshift_path),
-        "playlist_path": str(paths.playlist_path),
         "device": args.device,
         "audio_enabled": args.audio,
         "audio_device": args.audio_device,
@@ -1517,7 +1461,6 @@ def resolve_watch_target(recordings_dir: Path, target: str | None) -> Path:
         resolved = Path(target).expanduser()
         if resolved.is_dir():
             timeshift = resolved / DEFAULT_TIMESHIFT_NAME
-            playlist = resolved / DEFAULT_PLAYLIST_NAME
             archive_mkv = resolved / f"{DEFAULT_ARCHIVE_STEM}.mkv"
             archive_mp4 = resolved / f"{DEFAULT_ARCHIVE_STEM}.mp4"
             if timeshift.exists():
@@ -1526,7 +1469,7 @@ def resolve_watch_target(recordings_dir: Path, target: str | None) -> Path:
                 return archive_mkv
             if archive_mp4.exists():
                 return archive_mp4
-            return playlist
+            raise FileNotFoundError(f"no watchable media found under {resolved}")
         return resolved
 
     latest_link = recordings_dir / "latest"
@@ -1536,7 +1479,6 @@ def resolve_watch_target(recordings_dir: Path, target: str | None) -> Path:
         )
     resolved = latest_link.resolve()
     timeshift = resolved / DEFAULT_TIMESHIFT_NAME
-    playlist = resolved / DEFAULT_PLAYLIST_NAME
     archive_mkv = resolved / f"{DEFAULT_ARCHIVE_STEM}.mkv"
     archive_mp4 = resolved / f"{DEFAULT_ARCHIVE_STEM}.mp4"
     if timeshift.exists():
@@ -1545,7 +1487,7 @@ def resolve_watch_target(recordings_dir: Path, target: str | None) -> Path:
         return archive_mkv
     if archive_mp4.exists():
         return archive_mp4
-    return playlist
+    raise FileNotFoundError(f"no watchable media found under {resolved}")
 
 
 def resolve_export_source(recordings_dir: Path, target: str | None) -> ExportSource:
@@ -1558,10 +1500,6 @@ def resolve_export_source(recordings_dir: Path, target: str | None) -> ExportSou
             raise FileNotFoundError(f"no exportable media found under {resolved}")
         if not resolved.exists():
             raise FileNotFoundError(f"export source not found: {resolved}")
-        if resolved.name == DEFAULT_PLAYLIST_NAME:
-            raise FileNotFoundError(
-                "live playlist cannot be exported directly; use the session directory or archive file"
-            )
         return ExportSource(
             session_dir=resolved.parent,
             source_path=resolved,
@@ -1928,7 +1866,7 @@ def run_record_command(args: argparse.Namespace, *, launch_player: bool = False)
     capture_ok = exit_code == 0 or (interrupted and exit_code == 255)
     archive_ok = False
     archive_status = None
-    captured_anything = has_timeshift_session(paths) or bool(segment_files(paths))
+    captured_anything = has_timeshift_session(paths)
 
     if captured_anything:
         archive_ok, archive_status = create_archive(paths, args)

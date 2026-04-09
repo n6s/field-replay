@@ -123,7 +123,7 @@ If you open the live DVR file in VLC, you can usually:
 - let playback sit near live
 - pause when a pack goes by
 - drag backward through already-recorded video
-- jump around the file much more naturally than with a short HLS playlist
+- jump around the file while the recorder keeps appending to the same DVR file
 
 If you want to compare players, `./field-replay watch --player mpv` is still available.
 
@@ -207,10 +207,6 @@ The default capture settings are:
 ./field-replay record --dry-run
 ./field-replay --config-file /tmp/field-replay-config.json record
 ```
-
-## Older sessions
-
-Older sessions that were recorded with the HLS workflow are still supported for archive remuxing, and `watch` will fall back to `live.m3u8` if a session does not have `timeshift.ts`.
 
 ## Roadmap
 
