@@ -111,47 +111,28 @@ When you want a share-friendly copy after the event:
 
 When possible, `export` now prefers a hardware H.264 encoder that matches the original session and writes a small sidecar JSON file next to the MP4 so you can tell later how the share copy was produced.
 
-## Live OCR
+## Vision Bib Detection
 
-There is now a first-pass live OCR sidecar for bib experiments.
-
-It is experimental and off by default. Enable it during recording with:
+There is an experimental Ollama vision sidecar for bib detection. It runs independently against an existing or current session:
 
 ```bash
-./field-replay record --ocr-live
-```
-
-Or run it independently against an existing or current session:
-
-```bash
-./field-replay ocr-live
-./field-replay ocr-live ~/recordings/run-20260408-181629
-./field-replay ocr-scan
-./field-replay ocr-scan ~/recordings/run-20260408-181629
-./field-replay ocr-scan /path/to/test.ts
 ./field-replay vision-scan ~/recordings/run-20260408-181629 --max-samples 3
 ./field-replay vision-live ~/recordings/run-20260408-181629
 ./field-replay find-bib 241
 ./field-replay find-bib 241 ~/recordings/run-20260408-181629
 ./field-replay review-bib 241
-./field-replay ocr-ignore list
-./field-replay ocr-ignore add 123
-./field-replay ocr-ignore remove 123
 ```
 
-That sidecar samples the growing `timeshift.ts`, runs `tesseract`, and writes these files under the session directory:
+`vision-live` follows a growing session in a model-paced loop: it grabs one frame from a few seconds behind live, waits for the local model response, then grabs the next available frame. `vision-scan` samples a saved session or media file for offline testing.
 
-- `ocr/events.log`: human-readable lines that are easy to `tail -f`
-- `ocr/events.jsonl`: promoted OCR sightings with timestamps, confidence, bbox, and saved frame paths
-- `ocr/ocr-debug.jsonl`: diagnostics showing what OCR saw and why repeats were suppressed
+The vision commands ask a local Ollama model such as `gemma4:latest` for strict JSON bib guesses and write these files under `vision-live/` or `vision-scan/`:
 
-`review-bib` gives you a simple menu to jump into video a couple seconds before the last or best sighting, or browse the saved full-frame grabs and bib crops in an image viewer.
+- `events.log`: human-readable lines that are easy to `tail -f`
+- `events.jsonl`: promoted vision sightings with timestamps and saved frame paths
+- `vision-debug.jsonl`: diagnostics showing the raw model response for each sampled frame
+- `frames/`: saved full-frame grabs used as evidence
 
-If a bib becomes noisy in the live view, add it to `ocr-ignore.txt` in the session directory. Ignored bibs stay in raw/debug data but stop appearing in promoted live OCR events.
-
-Live OCR now samples a few seconds behind the very end of `timeshift.ts` instead of grabbing the absolute tail, which makes frame extraction more stable on an actively growing recording. If you want to tune that, use `--ocr-tail-offset` or `ocr-live --tail-offset`.
-
-`vision-scan` is a separate experiment for local Ollama vision models such as `gemma4:latest`. It samples saved frames, asks the model for strict JSON bib guesses, and writes output under `vision-scan/`. `vision-live` follows a growing session in a model-paced loop: it grabs one frame from a few seconds behind live, waits for the model response, then grabs the next available frame.
+`review-bib` gives you a simple menu to jump into video a couple seconds before the last or best sighting, or browse the saved full-frame grabs in an image viewer.
 
 ## Player behavior
 
@@ -232,7 +213,6 @@ The default capture settings are:
 ./field-replay record --no-interactive
 ./field-replay record --audio-gain-db 24
 ./field-replay record --audio-bitrate 48k --audio-channels 2 --audio-sample-rate 48000
-./field-replay record --ocr-live
 ./field-replay record --timestamp-source device --timestamps default
 ./field-replay record --no-video-timestamp
 ./field-replay record --video-bitrate 8M --maxrate 10M --bufsize 20M

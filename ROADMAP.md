@@ -8,9 +8,9 @@ These notes are not commitments. They are a backlog of ideas that seem useful in
 
 - Session event log: write timestamped `events.jsonl` data beside each session so bib sightings, spoken callouts, manual notes, and later RFID reads all share one timeline.
 - Manual marks and notes: fast operator shortcuts for `arrived`, `left aid`, `medical`, `unknown bib`, or free-text notes.
-- Frame grabs per event: save a full frame and optional bib crop for each logged detection so operators can verify without rewinding video.
+- Frame grabs per event: save a full frame for each logged detection so operators can verify without rewinding video.
 - Clock overlay: stamp wall-clock time and session-relative time into video and frame grabs so review stays easy under stress.
-- Bib lookup: support queries like `find-bib 241` that show all evidence for a runner, including first seen, last seen, source, and confidence.
+- Bib lookup: support queries like `find-bib 241` that show all evidence for a runner, including first seen, last seen, source, and confidence when available.
 
 ## Live review ideas
 
@@ -20,16 +20,15 @@ These notes are not commitments. They are a backlog of ideas that seem useful in
 - Bottom-bar labels: list detected bibs near the timestamp area and draw pointer lines back to their bounding boxes for easier multi-runner review.
 - Group clustering: treat nearby detections as one departure pack so volunteers can compare "what I wrote down" versus "what the system saw."
 - Verification states: mark detections as `unreviewed`, `confirmed`, `rejected`, or `manual-only`.
-- Contact-sheet style review: browse saved frame grabs or crops for one bib or one group without opening full video.
+- Contact-sheet style review: browse saved frame grabs for one bib or one group without opening full video.
 
 ## Detection and evidence sources
 
-- OCR for bib numbers: likely most practical when run on sparse frame samples or cropped regions instead of every full-resolution frame.
-- Local vision-model verification: use Ollama or another local multimodal model as a second-pass verifier on saved crops when Tesseract finds a plausible bib, rather than asking a large model to inspect every frame live.
-- AI vision sidecar: experiment with a model-paced Ollama loop that grabs one frame behind live, asks a local image-capable model like `gemma4:latest` to return bib guesses as strict JSON, then grabs the next frame only after the model responds.
+- AI vision sidecar: continue developing the model-paced Ollama loop that grabs one frame behind live, asks a local image-capable model like `gemma4:latest` to return bib guesses as strict JSON, then grabs the next frame only after the model responds.
+- Vision prompt and preprocessing experiments: tune prompts, frame scaling, contrast, and region-of-interest sampling to improve small or low-contrast bib reads.
 - Audio callouts: optional speech-to-text for bib numbers called out by volunteers or radio operators.
 - RFID ingest: if a reader and tag-to-bib lookup table exist, log RFID detections into the same event timeline.
-- Evidence correlation: merge nearby OCR, audio, RFID, and manual entries into stronger combined evidence for one bib.
+- Evidence correlation: merge nearby vision, audio, RFID, and manual entries into stronger combined evidence for one bib.
 - Pacer handling: treat `PACER` bibs and related tags as useful, distinct events rather than noise.
 
 ## Busy aid station realities
@@ -44,11 +43,11 @@ These notes are not commitments. They are a backlog of ideas that seem useful in
 - Cheap enough to try early:
   timestamp overlay, manual event log, event frame grabs, simple TUI views.
 - Probably fine with careful tuning:
-  motion-gated frame sampling, cropped OCR at low frame rates, post-session OCR passes.
+  motion-gated frame sampling and model-paced vision scans.
 - Potentially too heavy unless the machine is stronger:
-  full-frame real-time OCR, continuous speech-to-text, more advanced vision models.
+  continuous speech-to-text and more advanced vision models.
 
-The safest pattern on weak hardware is to keep recording reliable, then layer selective OCR and review helpers on top.
+The safest pattern on weak hardware is to keep recording reliable, then layer selective vision and review helpers on top.
 
 ## Possible command ideas
 
@@ -65,7 +64,7 @@ The safest pattern on weak hardware is to keep recording reliable, then layer se
 2. Add manual marks and notes.
 3. Add clock overlay and frame grabs.
 4. Add bib lookup and simple review tooling.
-5. Add sparse OCR on saved frames or cropped regions.
-6. Add annotated OCR review exports or playback overlays.
+5. Tune vision detection on saved frames and live samples.
+6. Add annotated vision review exports or playback overlays.
 7. Add live TUI review flows.
 8. Add optional audio and RFID correlation.

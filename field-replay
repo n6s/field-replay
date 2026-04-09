@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import base64
-import csv
 import json
 import os
 import re
@@ -33,13 +32,9 @@ COMMON_FRAME_RATES = (30, 25, 15, 10, 5)
 COMMON_VIDEO_INPUT_FORMATS = ("auto", "mjpeg", "yuyv422", "uyvy422", "nv12")
 COMMON_AUDIO_INPUTS = ((48000, 2), (48000, 1), (44100, 2), (44100, 1), (32000, 1))
 DEFAULT_VIDEO_TIMESTAMP_ENABLED = True
-DEFAULT_OCR_LIVE_ENABLED = False
-DEFAULT_OCR_SAMPLE_INTERVAL = 1.0
-DEFAULT_OCR_TAIL_OFFSET = 4.0
-DEFAULT_OCR_REPEAT_COOLDOWN = 60.0
-DEFAULT_OCR_MIN_CONFIDENCE = 45
 DEFAULT_VISION_MODEL = "gemma4:latest"
 DEFAULT_VISION_SAMPLE_INTERVAL = 10.0
+DEFAULT_VISION_TAIL_OFFSET = 4.0
 DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
 EXPORT_PRESETS = {
     "share-high": {
@@ -102,17 +97,6 @@ class ExportSource:
     session_dir: Path
     source_path: Path
     source_label: str
-
-
-@dataclass(frozen=True)
-class OCRCandidate:
-    text: str
-    raw_text: str
-    confidence: int
-    left: int
-    top: int
-    width: int
-    height: int
 
 
 def default_session_name(prefix: str) -> str:
@@ -1074,11 +1058,6 @@ def profile_from_args(args: argparse.Namespace) -> dict:
         "video_size": args.video_size,
         "encoder": args.encoder,
         "video_timestamp": getattr(args, "video_timestamp", DEFAULT_VIDEO_TIMESTAMP_ENABLED),
-        "ocr_live": getattr(args, "ocr_live", False),
-        "ocr_sample_interval": getattr(args, "ocr_sample_interval", DEFAULT_OCR_SAMPLE_INTERVAL),
-        "ocr_tail_offset": getattr(args, "ocr_tail_offset", DEFAULT_OCR_TAIL_OFFSET),
-        "ocr_repeat_cooldown": getattr(args, "ocr_repeat_cooldown", DEFAULT_OCR_REPEAT_COOLDOWN),
-        "ocr_min_confidence": getattr(args, "ocr_min_confidence", DEFAULT_OCR_MIN_CONFIDENCE),
         "recordings_dir": str(args.recordings_dir.expanduser()),
     }
 
@@ -1129,20 +1108,6 @@ def apply_profile(args: argparse.Namespace, profile: dict) -> None:
     args.encoder = profile.get("encoder", args.encoder)
     if hasattr(args, "video_timestamp"):
         args.video_timestamp = profile.get("video_timestamp", args.video_timestamp)
-    if hasattr(args, "ocr_live"):
-        args.ocr_live = profile.get("ocr_live", args.ocr_live)
-    if hasattr(args, "ocr_sample_interval"):
-        args.ocr_sample_interval = profile.get(
-            "ocr_sample_interval", args.ocr_sample_interval
-        )
-    if hasattr(args, "ocr_repeat_cooldown"):
-        args.ocr_repeat_cooldown = profile.get(
-            "ocr_repeat_cooldown", args.ocr_repeat_cooldown
-        )
-    if hasattr(args, "ocr_min_confidence"):
-        args.ocr_min_confidence = profile.get(
-            "ocr_min_confidence", args.ocr_min_confidence
-        )
     recordings_dir = profile.get("recordings_dir")
     if recordings_dir:
         args.recordings_dir = Path(recordings_dir).expanduser()
@@ -1203,11 +1168,6 @@ def configure_record_interactively(
         "  Stamp:   "
         f"{'wall-clock overlay' if args.video_timestamp else 'disabled'}"
     )
-    if getattr(args, "ocr_live", False):
-        print(
-            "  OCR:     "
-            f"live every {args.ocr_sample_interval:.1f}s, cooldown {args.ocr_repeat_cooldown:.0f}s"
-        )
 
     if selected_profile_name:
         if prompt_yes_no(f"Update saved profile '{selected_profile_name}' with these settings?", default=False):
@@ -1331,11 +1291,6 @@ def command_setup(args: argparse.Namespace) -> int:
         "  Video timestamp:   "
         f"{'wall-clock overlay' if args.video_timestamp else 'disabled'}"
     )
-    if getattr(args, "ocr_live", False):
-        print(
-            "  Live OCR:          "
-            f"enabled ({args.ocr_sample_interval:.1f}s interval, {args.ocr_repeat_cooldown:.0f}s cooldown)"
-        )
 
     if args.dry_run:
         return 0
@@ -1423,11 +1378,11 @@ def select_watch_target(args: argparse.Namespace, config: dict) -> str | None:
     return prompt_menu("Choose a session to watch", options, default_value=default_value)
 
 
-def select_ocr_target(
+def select_session_target(
     args: argparse.Namespace,
     config: dict,
     *,
-    title: str = "Choose a session for live OCR",
+    title: str = "Choose a session",
 ) -> str | None:
     unique_sessions = recent_sessions(args, config)
     if not unique_sessions:
@@ -1454,19 +1409,17 @@ def export_source_for_session(session_dir: Path) -> ExportSource | None:
     return None
 
 
-def ocr_event_sources_for_session(session_dir: Path) -> list[tuple[str, Path]]:
+def evidence_event_sources_for_session(session_dir: Path) -> list[tuple[str, Path]]:
     sources = [
-        ("live", session_dir / "ocr" / "events.jsonl"),
-        ("scan", session_dir / "ocr-scan" / "events.jsonl"),
-        ("vision", session_dir / "vision-scan" / "events.jsonl"),
+        ("vision-scan", session_dir / "vision-scan" / "events.jsonl"),
         ("vision-live", session_dir / "vision-live" / "events.jsonl"),
     ]
     return [(label, path) for label, path in sources if path.exists()]
 
 
-def load_ocr_matches_for_bib(session_dir: Path, bib: str) -> list[dict]:
+def load_evidence_matches_for_bib(session_dir: Path, bib: str) -> list[dict]:
     matches: list[dict] = []
-    for source_label, source_path in ocr_event_sources_for_session(session_dir):
+    for source_label, source_path in evidence_event_sources_for_session(session_dir):
         for record in load_jsonl_records(source_path):
             if str(record.get("b") or "").upper() != bib:
                 continue
@@ -1653,10 +1606,6 @@ def write_metadata(
         "video_size": args.video_size,
         "encoder": args.encoder,
         "video_timestamp": args.video_timestamp,
-        "ocr_live": getattr(args, "ocr_live", False),
-        "ocr_sample_interval": getattr(args, "ocr_sample_interval", DEFAULT_OCR_SAMPLE_INTERVAL),
-        "ocr_repeat_cooldown": getattr(args, "ocr_repeat_cooldown", DEFAULT_OCR_REPEAT_COOLDOWN),
-        "ocr_min_confidence": getattr(args, "ocr_min_confidence", DEFAULT_OCR_MIN_CONFIDENCE),
         "preset": args.preset,
         "archive_format": args.archive_format,
         "ffmpeg_command": list(ffmpeg_command),
@@ -1986,107 +1935,10 @@ def build_image_viewer_command(viewer: str, image_paths: Sequence[Path]) -> list
     return command
 
 
-def build_ocr_sidecar_command(paths: SessionPaths, args: argparse.Namespace) -> list[str]:
-    command = [
-        sys.executable,
-        str(Path(__file__).resolve()),
-        "ocr-live",
-        str(paths.session_dir),
-        "--ffmpeg-bin",
-        args.ffmpeg_bin,
-        "--tesseract-bin",
-        args.tesseract_bin,
-        "--sample-interval",
-        str(args.ocr_sample_interval),
-        "--tail-offset",
-        str(args.ocr_tail_offset),
-        "--repeat-cooldown",
-        str(args.ocr_repeat_cooldown),
-        "--min-confidence",
-        str(args.ocr_min_confidence),
-        "--video-size",
-        args.video_size,
-    ]
-    if args.video_timestamp:
-        command.append("--timestamp-mask")
-    else:
-        command.append("--no-timestamp-mask")
-    return command
-
-
-def launch_background_ocr(
-    paths: SessionPaths, args: argparse.Namespace
-) -> subprocess.Popen[bytes]:
-    command = build_ocr_sidecar_command(paths, args)
-    print("OCR:", shlex.join(command))
-    return subprocess.Popen(
-        command,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-
-
-def stop_background_process(
-    process: subprocess.Popen[bytes] | None, label: str
-) -> None:
-    if process is None or process.poll() is not None:
-        return
-    try:
-        process.terminate()
-        process.wait(timeout=2)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait(timeout=2)
-    except OSError as exc:
-        print(f"warning: could not stop {label}: {exc}", file=sys.stderr)
-
-
-def load_session_metadata(session_dir: Path) -> dict:
-    return load_json_file(session_dir / "session.json")
-
-
-def load_ocr_ignore_list(session_dir: Path) -> set[str]:
-    ignore_path = session_dir / "ocr-ignore.txt"
-    ignored: set[str] = set()
-    if not ignore_path.exists():
-        return ignored
-    for line in ignore_path.read_text().splitlines():
-        stripped = line.strip().upper()
-        if not stripped or stripped.startswith("#"):
-            continue
-        ignored.add(stripped)
-    return ignored
-
-
-def save_ocr_ignore_list(session_dir: Path, ignored_bibs: set[str]) -> None:
-    ignore_path = session_dir / "ocr-ignore.txt"
-    ensure_directory(ignore_path.parent)
-    lines = [value for value in sorted(ignored_bibs) if value]
-    ignore_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
-
-
-def ocr_output_paths(ocr_root: Path) -> dict[str, Path]:
-    return {
-        "root": ocr_root,
-        "frames_dir": ocr_root / "frames",
-        "crops_dir": ocr_root / "crops",
-        "scratch_frame": ocr_root / "scratch-latest.jpg",
-        "debug_log": ocr_root / "ocr-debug.jsonl",
-        "events_jsonl": ocr_root / "events.jsonl",
-        "events_log": ocr_root / "events.log",
-    }
-
-
-def ocr_runtime_paths(session_dir: Path) -> dict[str, Path]:
-    return ocr_output_paths(session_dir / "ocr")
-
-
 def vision_output_paths(vision_root: Path) -> dict[str, Path]:
     return {
         "root": vision_root,
         "frames_dir": vision_root / "frames",
-        "scratch_frame": vision_root / "scratch-latest.jpg",
         "debug_log": vision_root / "vision-debug.jsonl",
         "events_jsonl": vision_root / "events.jsonl",
         "events_log": vision_root / "events.log",
@@ -2109,7 +1961,7 @@ def session_asset_path(session_dir: Path, relative_or_absolute: str | None) -> P
     return session_dir / candidate
 
 
-def normalize_ocr_text(value: str) -> str | None:
+def normalize_bib_text(value: str) -> str | None:
     normalized = re.sub(r"[^A-Za-z0-9]+", "", value.upper())
     if not normalized:
         return None
@@ -2119,158 +1971,6 @@ def normalize_ocr_text(value: str) -> str | None:
     if re.fullmatch(r"\d{2,4}", normalized):
         return normalized
     return None
-
-
-def in_timestamp_mask(
-    candidate: OCRCandidate, frame_width: int | None, frame_height: int | None
-) -> bool:
-    if frame_width is None or frame_height is None:
-        return False
-    bottom_limit = frame_height - max(120, int(frame_height * 0.18))
-    right_limit = max(420, int(frame_width * 0.33))
-    return (
-        candidate.left < right_limit
-        and (candidate.top + candidate.height) > bottom_limit
-    )
-
-
-def read_tesseract_candidates(
-    image_path: Path, tesseract_bin: str, min_confidence: int
-) -> list[OCRCandidate]:
-    result = subprocess.run(
-        [
-            tesseract_bin,
-            str(image_path),
-            "stdout",
-            "--psm",
-            "11",
-            "-c",
-            "tessedit_char_whitelist=0123456789PACER",
-            "tsv",
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip() or "tesseract failed")
-
-    rows = csv.DictReader(result.stdout.splitlines(), delimiter="\t")
-    candidates: list[OCRCandidate] = []
-    for row in rows:
-        if row.get("level") != "5":
-            continue
-        raw_text = (row.get("text") or "").strip()
-        if not raw_text:
-            continue
-        try:
-            confidence_value = float(row.get("conf") or "-1")
-        except ValueError:
-            continue
-        if confidence_value < min_confidence:
-            continue
-        normalized = normalize_ocr_text(raw_text)
-        if not normalized:
-            continue
-        try:
-            left = int(row.get("left") or "0")
-            top = int(row.get("top") or "0")
-            width = int(row.get("width") or "0")
-            height = int(row.get("height") or "0")
-        except ValueError:
-            continue
-        if width <= 0 or height <= 0:
-            continue
-        candidates.append(
-            OCRCandidate(
-                text=normalized,
-                raw_text=raw_text,
-                confidence=max(0, min(100, int(round(confidence_value)))),
-                left=left,
-                top=top,
-                width=width,
-                height=height,
-            )
-        )
-    return candidates
-
-
-def best_candidates_by_text(candidates: list[OCRCandidate]) -> list[OCRCandidate]:
-    best: dict[str, OCRCandidate] = {}
-    for candidate in candidates:
-        current = best.get(candidate.text)
-        if current is None:
-            best[candidate.text] = candidate
-            continue
-        current_area = current.width * current.height
-        candidate_area = candidate.width * candidate.height
-        if (candidate.confidence, candidate_area) > (current.confidence, current_area):
-            best[candidate.text] = candidate
-    return sorted(best.values(), key=lambda item: (-item.confidence, item.text))
-
-
-def candidate_exits_exclusion_zone(
-    previous_bbox: list[int], candidate: OCRCandidate
-) -> bool:
-    previous_x, previous_y, previous_w, previous_h = previous_bbox
-    expanded_left = previous_x - (2 * previous_w)
-    expanded_right = previous_x + previous_w + (2 * previous_w)
-    expanded_top = previous_y - previous_h
-    expanded_bottom = previous_y + previous_h + previous_h
-    current_left = candidate.left
-    current_top = candidate.top
-    current_right = candidate.left + candidate.width
-    current_bottom = candidate.top + candidate.height
-    overlap_x = not (current_right < expanded_left or current_left > expanded_right)
-    overlap_y = not (current_bottom < expanded_top or current_top > expanded_bottom)
-    return not (overlap_x and overlap_y)
-
-
-def extract_recent_frame(ffmpeg_bin: str, timeshift_path: Path, output_path: Path) -> None:
-    extract_recent_frame_at_offset(
-        ffmpeg_bin,
-        timeshift_path,
-        output_path,
-        tail_offset_seconds=DEFAULT_OCR_TAIL_OFFSET,
-    )
-
-
-def extract_recent_frame_at_offset(
-    ffmpeg_bin: str,
-    timeshift_path: Path,
-    output_path: Path,
-    *,
-    tail_offset_seconds: float,
-) -> None:
-    ensure_directory(output_path.parent)
-    duration_seconds = ffprobe_duration_seconds(timeshift_path)
-    if duration_seconds is None or duration_seconds <= 0:
-        offset_seconds = 0.0
-    else:
-        offset_seconds = max(duration_seconds - max(tail_offset_seconds, 0.0), 0.0)
-    result = subprocess.run(
-        [
-            ffmpeg_bin,
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-ss",
-            f"{offset_seconds:.3f}",
-            "-i",
-            str(timeshift_path),
-            "-frames:v",
-            "1",
-            "-q:v",
-            "2",
-            str(output_path),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip() or "ffmpeg frame extraction failed")
 
 
 def extract_frame_at_time(
@@ -2314,45 +2014,8 @@ def media_sample_points(duration_seconds: float, sample_interval: float) -> list
     return sample_points
 
 
-def save_crop_image(
-    ffmpeg_bin: str, source_image: Path, output_path: Path, candidate: OCRCandidate
-) -> None:
-    ensure_directory(output_path.parent)
-    crop_filter = (
-        f"crop={candidate.width}:{candidate.height}:{candidate.left}:{candidate.top}"
-    )
-    result = subprocess.run(
-        [
-            ffmpeg_bin,
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-i",
-            str(source_image),
-            "-vf",
-            crop_filter,
-            "-frames:v",
-            "1",
-            str(output_path),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip() or "ffmpeg crop failed")
-
-
 def event_wall_time(now: datetime) -> str:
     return now.astimezone().isoformat(timespec="seconds")
-
-
-def event_log_line(payload: dict) -> str:
-    return (
-        f"{payload['w']} bib {payload['b']} ocr {payload['c']}% "
-        f"t={format_duration(payload.get('t'))} frame={payload.get('f', '-')}"
-    )
 
 
 def vision_event_log_line(payload: dict) -> str:
@@ -2369,79 +2032,6 @@ def event_sort_key(event: dict) -> tuple[float, str]:
         rel_time = 0.0
     wall_time = str(event.get("w") or "")
     return rel_time, wall_time
-
-
-def promote_ocr_candidates(
-    *,
-    session_dir: Path,
-    runtime_paths: dict[str, Path],
-    source_image: Path,
-    ffmpeg_bin: str,
-    now: datetime,
-    event_seconds: float,
-    candidates: list[OCRCandidate],
-    ignored_bibs: set[str],
-    last_logged_by_bib: dict[str, dict],
-    repeat_cooldown: float,
-) -> tuple[list[dict], list[dict]]:
-    promoted: list[dict] = []
-    suppressed: list[dict] = []
-    for candidate in candidates:
-        if candidate.text in ignored_bibs:
-            suppressed.append({"bib": candidate.text, "reason": "ignored"})
-            continue
-
-        previous = last_logged_by_bib.get(candidate.text)
-        if previous is not None:
-            elapsed = time.time() - previous["logged_at_epoch"]
-            moved = candidate_exits_exclusion_zone(previous["bbox"], candidate)
-            if elapsed < repeat_cooldown:
-                suppressed.append(
-                    {
-                        "bib": candidate.text,
-                        "reason": "cooldown",
-                        "seconds": round(elapsed, 1),
-                    }
-                )
-                continue
-            if not moved:
-                suppressed.append({"bib": candidate.text, "reason": "stationary"})
-                continue
-
-        stamp = now.strftime("%Y%m%d-%H%M%S")
-        base_name = f"{stamp}-{candidate.text}"
-        frame_path = runtime_paths["frames_dir"] / f"{base_name}.jpg"
-        crop_path = runtime_paths["crops_dir"] / f"{base_name}.jpg"
-        shutil.copy2(source_image, frame_path)
-        try:
-            save_crop_image(ffmpeg_bin, source_image, crop_path, candidate)
-        except RuntimeError:
-            crop_path = frame_path
-
-        payload = {
-            "t": round(event_seconds, 1),
-            "w": event_wall_time(now),
-            "k": "bib",
-            "b": candidate.text,
-            "s": "ocr",
-            "c": candidate.confidence,
-            "x": candidate.left,
-            "y": candidate.top,
-            "W": candidate.width,
-            "H": candidate.height,
-            "f": relative_to_session(frame_path, session_dir),
-            "p": relative_to_session(crop_path, session_dir),
-            "r": candidate.raw_text,
-        }
-        append_jsonl(runtime_paths["events_jsonl"], payload)
-        append_text_line(runtime_paths["events_log"], event_log_line(payload))
-        promoted.append(payload)
-        last_logged_by_bib[candidate.text] = {
-            "logged_at_epoch": time.time(),
-            "bbox": [candidate.left, candidate.top, candidate.width, candidate.height],
-        }
-
-    return promoted, suppressed
 
 
 def default_vision_prompt() -> str:
@@ -2476,7 +2066,7 @@ def normalize_vision_bibs(payload: dict) -> list[str]:
         return []
     bibs: list[str] = []
     for raw_value in raw_bibs:
-        normalized = normalize_ocr_text(str(raw_value))
+        normalized = normalize_bib_text(str(raw_value))
         if normalized and normalized not in bibs:
             bibs.append(normalized)
     return bibs
@@ -2658,10 +2248,6 @@ def run_record_command(args: argparse.Namespace, *, launch_player: bool = False)
             file=sys.stderr,
         )
         args.video_timestamp = False
-    if args.ocr_live and not shutil.which(args.tesseract_bin):
-        print(f"tesseract binary not found: {args.tesseract_bin}", file=sys.stderr)
-        return 1
-
     player = None
     if launch_player:
         player = choose_player(args.player)
@@ -2678,8 +2264,6 @@ def run_record_command(args: argparse.Namespace, *, launch_player: bool = False)
     if args.dry_run:
         print_session_summary(paths)
         print("FFmpeg:", shlex.join(ffmpeg_command))
-        if args.ocr_live:
-            print("OCR:", shlex.join(build_ocr_sidecar_command(paths, args)))
         if launch_player and player:
             print(
                 "Player:",
@@ -2708,7 +2292,6 @@ def run_record_command(args: argparse.Namespace, *, launch_player: bool = False)
     interrupted = False
     capture_started = False
     player_process = None
-    ocr_process = None
     try:
         capture_started = wait_for_capture_output(paths, process)
         if capture_started:
@@ -2716,8 +2299,6 @@ def run_record_command(args: argparse.Namespace, *, launch_player: bool = False)
             config["last_recordings_dir"] = str(recordings_dir)
             config["last_session_dir"] = str(paths.session_dir)
             save_config(config_path, config)
-            if args.ocr_live:
-                ocr_process = launch_background_ocr(paths, args)
             if launch_player and player:
                 player_process = launch_background_player(
                     player, paths.timeshift_path, args.file_caching_ms
@@ -2730,7 +2311,6 @@ def run_record_command(args: argparse.Namespace, *, launch_player: bool = False)
         exit_code = process.wait()
     finally:
         release_device_locks(lock_paths)
-        stop_background_process(ocr_process, "ocr sidecar")
 
     capture_ok = exit_code == 0 or (interrupted and exit_code == 255)
     archive_ok = False
@@ -2759,273 +2339,6 @@ def run_record_command(args: argparse.Namespace, *, launch_player: bool = False)
     if capture_ok:
         return 0 if archive_ok else 1
     return 1 if archive_ok else exit_code
-
-
-def command_ocr_live(args: argparse.Namespace) -> int:
-    config_path = args.config_file.expanduser()
-    config = load_config(config_path)
-    if not args.session_dir and interactive_mode_enabled(args):
-        selected_target = select_ocr_target(args, config)
-        if not selected_target:
-            print("no sessions found for OCR", file=sys.stderr)
-            return 1
-        args.session_dir = Path(selected_target)
-
-    try:
-        session_dir = resolve_session_dir(args.recordings_dir.expanduser(), str(args.session_dir) if args.session_dir else None)
-    except FileNotFoundError as exc:
-        print(exc, file=sys.stderr)
-        return 1
-
-    ffmpeg_path = shutil.which(args.ffmpeg_bin)
-    if not ffmpeg_path:
-        print(f"ffmpeg binary not found: {args.ffmpeg_bin}", file=sys.stderr)
-        return 1
-    tesseract_path = shutil.which(args.tesseract_bin)
-    if not tesseract_path:
-        print(f"tesseract binary not found: {args.tesseract_bin}", file=sys.stderr)
-        return 1
-
-    runtime_paths = ocr_runtime_paths(session_dir)
-    for key in ("root", "frames_dir", "crops_dir"):
-        ensure_directory(runtime_paths[key])
-    config["last_session_dir"] = str(session_dir)
-    save_config(config_path, config)
-
-    metadata = load_session_metadata(session_dir)
-    video_size = args.video_size or str(metadata.get("video_size") or "1920x1080")
-    frame_width, frame_height = parse_video_size(video_size)
-
-    timeshift_path = session_dir / DEFAULT_TIMESHIFT_NAME
-    last_logged_by_bib: dict[str, dict] = {}
-    last_size = -1
-    stable_after_finish = 0
-
-    while True:
-        now = datetime.now().astimezone()
-        metadata = load_session_metadata(session_dir)
-        ignored_bibs = load_ocr_ignore_list(session_dir)
-
-        if not timeshift_path.exists() or timeshift_path.stat().st_size == 0:
-            if args.once:
-                return 0
-            time.sleep(args.sample_interval)
-            continue
-
-        current_size = timeshift_path.stat().st_size
-        if current_size == last_size and metadata.get("state") in {"finished", "partial"}:
-            stable_after_finish += 1
-            if stable_after_finish >= 2:
-                return 0
-        else:
-            stable_after_finish = 0
-        last_size = current_size
-
-        try:
-            extract_recent_frame_at_offset(
-                ffmpeg_path,
-                timeshift_path,
-                runtime_paths["scratch_frame"],
-                tail_offset_seconds=args.tail_offset,
-            )
-            candidates = read_tesseract_candidates(
-                runtime_paths["scratch_frame"],
-                tesseract_path,
-                args.min_confidence,
-            )
-            filtered_candidates = [
-                candidate
-                for candidate in best_candidates_by_text(candidates)
-                if not (
-                    args.timestamp_mask
-                    and in_timestamp_mask(candidate, frame_width, frame_height)
-                )
-            ]
-            duration_seconds = ffprobe_duration_seconds(timeshift_path)
-            promoted, suppressed = promote_ocr_candidates(
-                session_dir=session_dir,
-                runtime_paths=runtime_paths,
-                source_image=runtime_paths["scratch_frame"],
-                ffmpeg_bin=ffmpeg_path,
-                now=now,
-                event_seconds=duration_seconds or 0.0,
-                candidates=filtered_candidates,
-                ignored_bibs=ignored_bibs,
-                last_logged_by_bib=last_logged_by_bib,
-                repeat_cooldown=args.repeat_cooldown,
-            )
-
-            append_jsonl(
-                runtime_paths["debug_log"],
-                {
-                    "w": event_wall_time(now),
-                    "t": round(duration_seconds or 0.0, 1),
-                    "frame_bytes": current_size,
-                    "ignored": sorted(ignored_bibs),
-                    "seen": [
-                        {
-                            "bib": candidate.text,
-                            "raw": candidate.raw_text,
-                            "c": candidate.confidence,
-                            "x": candidate.left,
-                            "y": candidate.top,
-                            "W": candidate.width,
-                            "H": candidate.height,
-                        }
-                        for candidate in filtered_candidates
-                    ],
-                    "promoted": [
-                        {"bib": entry["b"], "c": entry["c"], "f": entry["f"]}
-                        for entry in promoted
-                    ],
-                    "suppressed": suppressed,
-                },
-            )
-        except RuntimeError as exc:
-            append_jsonl(
-                runtime_paths["debug_log"],
-                {
-                    "w": event_wall_time(now),
-                    "error": str(exc),
-                },
-            )
-
-        if args.once:
-            return 0
-        time.sleep(args.sample_interval)
-
-
-def command_ocr_scan(args: argparse.Namespace) -> int:
-    config_path = args.config_file.expanduser()
-    config = load_config(config_path)
-    if not args.target and interactive_mode_enabled(args):
-        selected_target = select_export_target(
-            args,
-            config,
-            title="Choose a session for OCR scan",
-        )
-        if not selected_target:
-            print("no sessions found for OCR scan", file=sys.stderr)
-            return 1
-        args.target = selected_target
-
-    try:
-        source = resolve_export_source(
-            args.recordings_dir.expanduser(),
-            str(args.target) if args.target else None,
-        )
-    except FileNotFoundError as exc:
-        print(exc, file=sys.stderr)
-        return 1
-
-    ffmpeg_path = shutil.which(args.ffmpeg_bin)
-    if not ffmpeg_path:
-        print(f"ffmpeg binary not found: {args.ffmpeg_bin}", file=sys.stderr)
-        return 1
-    tesseract_path = shutil.which(args.tesseract_bin)
-    if not tesseract_path:
-        print(f"tesseract binary not found: {args.tesseract_bin}", file=sys.stderr)
-        return 1
-
-    output_root = (
-        args.output_dir.expanduser()
-        if args.output_dir
-        else source.session_dir / "ocr-scan"
-    )
-    runtime_paths = ocr_output_paths(output_root)
-    for key in ("root", "frames_dir", "crops_dir"):
-        ensure_directory(runtime_paths[key])
-    for key in ("events_jsonl", "events_log", "debug_log"):
-        try:
-            runtime_paths[key].unlink()
-        except FileNotFoundError:
-            pass
-
-    config["last_session_dir"] = str(source.session_dir)
-    save_config(config_path, config)
-
-    session_metadata = load_session_metadata(source.session_dir)
-    video_size = args.video_size or str(session_metadata.get("video_size") or "1920x1080")
-    frame_width, frame_height = parse_video_size(video_size)
-    ignored_bibs = load_ocr_ignore_list(source.session_dir)
-    duration_seconds = probe_media_duration(args.ffmpeg_bin, source.source_path) or 0.0
-    sample_points = media_sample_points(duration_seconds, args.sample_interval)
-
-    last_logged_by_bib: dict[str, dict] = {}
-    for offset_seconds in sample_points:
-        now = datetime.now().astimezone()
-        try:
-            extract_frame_at_time(
-                ffmpeg_path,
-                source.source_path,
-                offset_seconds,
-                runtime_paths["scratch_frame"],
-            )
-            candidates = read_tesseract_candidates(
-                runtime_paths["scratch_frame"],
-                tesseract_path,
-                args.min_confidence,
-            )
-            filtered_candidates = [
-                candidate
-                for candidate in best_candidates_by_text(candidates)
-                if not (
-                    args.timestamp_mask
-                    and in_timestamp_mask(candidate, frame_width, frame_height)
-                )
-            ]
-            promoted, suppressed = promote_ocr_candidates(
-                session_dir=output_root,
-                runtime_paths=runtime_paths,
-                source_image=runtime_paths["scratch_frame"],
-                ffmpeg_bin=ffmpeg_path,
-                now=now,
-                event_seconds=offset_seconds,
-                candidates=filtered_candidates,
-                ignored_bibs=ignored_bibs,
-                last_logged_by_bib=last_logged_by_bib,
-                repeat_cooldown=args.repeat_cooldown,
-            )
-            append_jsonl(
-                runtime_paths["debug_log"],
-                {
-                    "w": event_wall_time(now),
-                    "t": round(offset_seconds, 1),
-                    "source": source.source_label,
-                    "ignored": sorted(ignored_bibs),
-                    "seen": [
-                        {
-                            "bib": candidate.text,
-                            "raw": candidate.raw_text,
-                            "c": candidate.confidence,
-                            "x": candidate.left,
-                            "y": candidate.top,
-                            "W": candidate.width,
-                            "H": candidate.height,
-                        }
-                        for candidate in filtered_candidates
-                    ],
-                    "promoted": [
-                        {"bib": entry["b"], "c": entry["c"], "f": entry["f"]}
-                        for entry in promoted
-                    ],
-                    "suppressed": suppressed,
-                },
-            )
-        except RuntimeError as exc:
-            append_jsonl(
-                runtime_paths["debug_log"],
-                {
-                    "w": event_wall_time(now),
-                    "t": round(offset_seconds, 1),
-                    "error": str(exc),
-                },
-            )
-
-    print(f"OCR scan source: {source.source_path}")
-    print(f"OCR output dir: {output_root}")
-    print(f"OCR events:     {runtime_paths['events_log']}")
-    return 0
 
 
 def command_vision_scan(args: argparse.Namespace) -> int:
@@ -3128,7 +2441,7 @@ def command_vision_live(args: argparse.Namespace) -> int:
     config_path = args.config_file.expanduser()
     config = load_config(config_path)
     if not args.session_dir and interactive_mode_enabled(args):
-        selected_target = select_ocr_target(
+        selected_target = select_session_target(
             args,
             config,
             title="Choose a session for live vision",
@@ -3234,7 +2547,7 @@ def command_find_bib(args: argparse.Namespace) -> int:
     config_path = args.config_file.expanduser()
     config = load_config(config_path)
     if not args.target and interactive_mode_enabled(args):
-        selected_target = select_ocr_target(args, config, title="Choose a session for bib lookup")
+        selected_target = select_session_target(args, config, title="Choose a session for bib lookup")
         if not selected_target:
             print("no sessions found for bib lookup", file=sys.stderr)
             return 1
@@ -3252,16 +2565,16 @@ def command_find_bib(args: argparse.Namespace) -> int:
     config["last_session_dir"] = str(session_dir)
     save_config(config_path, config)
 
-    normalized_bib = normalize_ocr_text(args.bib)
+    normalized_bib = normalize_bib_text(args.bib)
     if not normalized_bib:
         print(f"not a bib-like lookup value: {args.bib}", file=sys.stderr)
         return 1
 
-    if not ocr_event_sources_for_session(session_dir):
+    if not evidence_event_sources_for_session(session_dir):
         print(f"no evidence event logs found under {session_dir}", file=sys.stderr)
         return 1
 
-    matches = load_ocr_matches_for_bib(session_dir, normalized_bib)
+    matches = load_evidence_matches_for_bib(session_dir, normalized_bib)
     if not matches:
         print(f"no evidence events found for bib {normalized_bib} in {session_dir}", file=sys.stderr)
         return 1
@@ -3336,19 +2649,18 @@ def run_review_bib_action(
             return 0
         return subprocess.call(command)
 
-    if mode in {"frames", "crops"}:
+    if mode == "frames":
         image_paths: list[Path] = []
-        key = "f" if mode == "frames" else "p"
         seen_paths: set[Path] = set()
         for match in matches:
-            image_path = session_asset_path(session_dir, str(match.get(key) or ""))
+            image_path = session_asset_path(session_dir, str(match.get("f") or ""))
             if image_path is None or not image_path.exists() or image_path in seen_paths:
                 continue
             seen_paths.add(image_path)
             image_paths.append(image_path)
         if not image_paths:
             print(
-                f"no saved {'frames' if mode == 'frames' else 'crops'} found for {normalized_bib}",
+                f"no saved frames found for {normalized_bib}",
                 file=sys.stderr,
             )
             return 0
@@ -3358,9 +2670,8 @@ def run_review_bib_action(
             print(f"image viewer not found: {requested}", file=sys.stderr)
             return 1
         command = build_image_viewer_command(viewer, image_paths)
-        noun = "frame" if mode == "frames" else "crop"
         print(
-            f"Opening {len(image_paths)} {noun}"
+            f"Opening {len(image_paths)} frame"
             f"{'' if len(image_paths) == 1 else 's'} for {normalized_bib}"
         )
         print("Viewer:", shlex.join(command))
@@ -3373,20 +2684,20 @@ def run_review_bib_action(
 
 
 def command_review_bib(args: argparse.Namespace) -> int:
-    session_dir = resolve_ocr_session_from_args(args, "bib review")
+    session_dir = resolve_evidence_session_from_args(args, "bib review")
     if session_dir is None:
         return 1
 
-    normalized_bib = normalize_ocr_text(args.bib)
+    normalized_bib = normalize_bib_text(args.bib)
     if not normalized_bib:
         print(f"not a bib-like lookup value: {args.bib}", file=sys.stderr)
         return 1
 
-    if not ocr_event_sources_for_session(session_dir):
+    if not evidence_event_sources_for_session(session_dir):
         print(f"no evidence event logs found under {session_dir}", file=sys.stderr)
         return 1
 
-    matches = load_ocr_matches_for_bib(session_dir, normalized_bib)
+    matches = load_evidence_matches_for_bib(session_dir, normalized_bib)
     if not matches:
         print(f"no evidence events found for bib {normalized_bib} in {session_dir}", file=sys.stderr)
         return 1
@@ -3402,7 +2713,6 @@ def command_review_bib(args: argparse.Namespace) -> int:
                 ("video-last", "Open last sighting in video"),
                 ("video-best", "Open best evidence sighting"),
                 ("frames", "Browse saved full frames"),
-                ("crops", "Browse saved bib crops"),
                 ("summary", "Print recent evidence lines"),
             ]
             chosen_mode = prompt_menu(
@@ -3438,11 +2748,11 @@ def command_review_bib(args: argparse.Namespace) -> int:
     )
 
 
-def resolve_ocr_session_from_args(args: argparse.Namespace, purpose: str) -> Path | None:
+def resolve_evidence_session_from_args(args: argparse.Namespace, purpose: str) -> Path | None:
     config_path = args.config_file.expanduser()
     config = load_config(config_path)
     if not getattr(args, "target", None) and interactive_mode_enabled(args):
-        selected_target = select_ocr_target(
+        selected_target = select_session_target(
             args,
             config,
             title=f"Choose a session for {purpose}",
@@ -3464,55 +2774,6 @@ def resolve_ocr_session_from_args(args: argparse.Namespace, purpose: str) -> Pat
     config["last_session_dir"] = str(session_dir)
     save_config(config_path, config)
     return session_dir
-
-
-def command_ocr_ignore_list(args: argparse.Namespace) -> int:
-    session_dir = resolve_ocr_session_from_args(args, "OCR ignore list")
-    if session_dir is None:
-        return 1
-    ignored = load_ocr_ignore_list(session_dir)
-    print(f"Session: {session_dir}")
-    print(f"Ignore file: {session_dir / 'ocr-ignore.txt'}")
-    if not ignored:
-        print("Ignored bibs: none")
-        return 0
-    print("Ignored bibs:")
-    for value in sorted(ignored):
-        print(f"  {value}")
-    return 0
-
-
-def command_ocr_ignore_add(args: argparse.Namespace) -> int:
-    session_dir = resolve_ocr_session_from_args(args, "OCR ignore list")
-    if session_dir is None:
-        return 1
-    normalized = normalize_ocr_text(args.bib)
-    if not normalized:
-        print(f"not a bib-like ignore value: {args.bib}", file=sys.stderr)
-        return 1
-    ignored = load_ocr_ignore_list(session_dir)
-    ignored.add(normalized)
-    save_ocr_ignore_list(session_dir, ignored)
-    print(f"Ignoring {normalized} in {session_dir}")
-    return 0
-
-
-def command_ocr_ignore_remove(args: argparse.Namespace) -> int:
-    session_dir = resolve_ocr_session_from_args(args, "OCR ignore list")
-    if session_dir is None:
-        return 1
-    normalized = normalize_ocr_text(args.bib)
-    if not normalized:
-        print(f"not a bib-like ignore value: {args.bib}", file=sys.stderr)
-        return 1
-    ignored = load_ocr_ignore_list(session_dir)
-    if normalized not in ignored:
-        print(f"{normalized} is not ignored in {session_dir}", file=sys.stderr)
-        return 1
-    ignored.remove(normalized)
-    save_ocr_ignore_list(session_dir, ignored)
-    print(f"Removed {normalized} from ignore list in {session_dir}")
-    return 0
 
 
 def command_record(args: argparse.Namespace) -> int:
@@ -3799,41 +3060,6 @@ def add_record_arguments(
         help="Burn a wall-clock timestamp into the captured video.",
     )
     parser.add_argument(
-        "--ocr-live",
-        action=argparse.BooleanOptionalAction,
-        default=DEFAULT_OCR_LIVE_ENABLED,
-        help="Run a lightweight live OCR sidecar against the growing DVR file.",
-    )
-    parser.add_argument(
-        "--ocr-sample-interval",
-        type=float,
-        default=DEFAULT_OCR_SAMPLE_INTERVAL,
-        help="Seconds between live OCR samples.",
-    )
-    parser.add_argument(
-        "--ocr-tail-offset",
-        type=float,
-        default=DEFAULT_OCR_TAIL_OFFSET,
-        help="Seconds behind the live tail to sample for OCR.",
-    )
-    parser.add_argument(
-        "--ocr-repeat-cooldown",
-        type=float,
-        default=DEFAULT_OCR_REPEAT_COOLDOWN,
-        help="Seconds before the same bib may be promoted again.",
-    )
-    parser.add_argument(
-        "--ocr-min-confidence",
-        type=int,
-        default=DEFAULT_OCR_MIN_CONFIDENCE,
-        help="Minimum Tesseract confidence for OCR candidates.",
-    )
-    parser.add_argument(
-        "--tesseract-bin",
-        default="tesseract",
-        help="Tesseract binary for live OCR.",
-    )
-    parser.add_argument(
         "--encoder", default=DEFAULT_ENCODER, help="Video encoder, like h264_nvenc."
     )
     parser.add_argument("--preset", default="fast", help="Encoder preset.")
@@ -4064,134 +3290,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     export.set_defaults(func=command_export)
 
-    ocr_live = subparsers.add_parser(
-        "ocr-live",
-        help="Run a lightweight OCR loop against a live session directory.",
-    )
-    ocr_live.add_argument(
-        "session_dir",
-        nargs="?",
-        type=Path,
-        help="Session directory that contains the growing timeshift.ts file. Defaults to an interactive picker or the latest session.",
-    )
-    ocr_live.add_argument(
-        "--ffmpeg-bin",
-        default="ffmpeg",
-        help="FFmpeg binary to use for frame extraction.",
-    )
-    ocr_live.add_argument(
-        "--tesseract-bin",
-        default="tesseract",
-        help="Tesseract binary to use for OCR.",
-    )
-    ocr_live.add_argument(
-        "--sample-interval",
-        type=float,
-        default=DEFAULT_OCR_SAMPLE_INTERVAL,
-        help="Seconds between OCR samples.",
-    )
-    ocr_live.add_argument(
-        "--tail-offset",
-        type=float,
-        default=DEFAULT_OCR_TAIL_OFFSET,
-        help="Seconds behind the live tail to sample for OCR.",
-    )
-    ocr_live.add_argument(
-        "--repeat-cooldown",
-        type=float,
-        default=DEFAULT_OCR_REPEAT_COOLDOWN,
-        help="Seconds before the same bib may be promoted again.",
-    )
-    ocr_live.add_argument(
-        "--min-confidence",
-        type=int,
-        default=DEFAULT_OCR_MIN_CONFIDENCE,
-        help="Minimum Tesseract confidence for OCR candidates.",
-    )
-    ocr_live.add_argument(
-        "--video-size",
-        help="Frame size used to mask the burned-in timestamp overlay.",
-    )
-    ocr_live.add_argument(
-        "--timestamp-mask",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Ignore the bottom-left timestamp overlay region during OCR filtering.",
-    )
-    ocr_live.add_argument(
-        "--once",
-        action="store_true",
-        help="Run one OCR sample and exit.",
-    )
-    ocr_live.add_argument(
-        "--interactive",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Prompt to choose a recent session when the target is omitted.",
-    )
-    ocr_live.set_defaults(func=command_ocr_live)
-
-    ocr_scan = subparsers.add_parser(
-        "ocr-scan",
-        help="Run OCR against an existing session or media file for testing and review.",
-    )
-    ocr_scan.add_argument(
-        "target",
-        nargs="?",
-        type=Path,
-        help="Optional session directory or media file. Defaults to an interactive picker or the latest session.",
-    )
-    ocr_scan.add_argument(
-        "--ffmpeg-bin",
-        default="ffmpeg",
-        help="FFmpeg binary to use for frame extraction.",
-    )
-    ocr_scan.add_argument(
-        "--tesseract-bin",
-        default="tesseract",
-        help="Tesseract binary to use for OCR.",
-    )
-    ocr_scan.add_argument(
-        "--sample-interval",
-        type=float,
-        default=DEFAULT_OCR_SAMPLE_INTERVAL,
-        help="Seconds between scan samples.",
-    )
-    ocr_scan.add_argument(
-        "--repeat-cooldown",
-        type=float,
-        default=DEFAULT_OCR_REPEAT_COOLDOWN,
-        help="Seconds before the same bib may be promoted again.",
-    )
-    ocr_scan.add_argument(
-        "--min-confidence",
-        type=int,
-        default=DEFAULT_OCR_MIN_CONFIDENCE,
-        help="Minimum Tesseract confidence for OCR candidates.",
-    )
-    ocr_scan.add_argument(
-        "--video-size",
-        help="Frame size used to mask the burned-in timestamp overlay.",
-    )
-    ocr_scan.add_argument(
-        "--timestamp-mask",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Ignore the bottom-left timestamp overlay region during OCR filtering.",
-    )
-    ocr_scan.add_argument(
-        "--output-dir",
-        type=Path,
-        help="Directory for OCR scan output. Defaults to ocr-scan under the session directory.",
-    )
-    ocr_scan.add_argument(
-        "--interactive",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Prompt to choose a recent session when the target is omitted.",
-    )
-    ocr_scan.set_defaults(func=command_ocr_scan)
-
     vision_scan = subparsers.add_parser(
         "vision-scan",
         help="Experimentally ask a local Ollama vision model to read sampled frames.",
@@ -4289,7 +3387,7 @@ def build_parser() -> argparse.ArgumentParser:
     vision_live.add_argument(
         "--tail-offset",
         type=float,
-        default=DEFAULT_OCR_TAIL_OFFSET,
+        default=DEFAULT_VISION_TAIL_OFFSET,
         help="Seconds behind the live tail to sample.",
     )
     vision_live.add_argument(
@@ -4333,14 +3431,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     find_bib = subparsers.add_parser(
         "find-bib",
-        help="Show OCR evidence for one bib in a session.",
+        help="Show vision evidence for one bib in a session.",
     )
     find_bib.add_argument("bib", help="Bib number or PACER token to search for.")
     find_bib.add_argument(
         "target",
         nargs="?",
         type=Path,
-        help="Optional session directory or media file. Defaults to an interactive picker or the latest session.",
+        help="Optional session directory. Defaults to an interactive picker or the latest session.",
     )
     find_bib.add_argument(
         "--limit",
@@ -4358,18 +3456,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     review_bib = subparsers.add_parser(
         "review-bib",
-        help="Open OCR evidence for one bib in video or saved images.",
+        help="Open vision evidence for one bib in video or saved images.",
     )
     review_bib.add_argument("bib", help="Bib number or PACER token to review.")
     review_bib.add_argument(
         "target",
         nargs="?",
         type=Path,
-        help="Optional session directory or media file. Defaults to an interactive picker or the latest session.",
+        help="Optional session directory. Defaults to an interactive picker or the latest session.",
     )
     review_bib.add_argument(
         "--mode",
-        choices=("interactive", "video-last", "video-best", "frames", "crops", "summary"),
+        choices=("interactive", "video-last", "video-best", "frames", "summary"),
         default="interactive",
         help="Review action. Defaults to an interactive menu.",
     )
@@ -4379,7 +3477,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     review_bib.add_argument(
         "--image-viewer",
-        help="Preferred image viewer for frame or crop browsing. Defaults to eog.",
+        help="Preferred image viewer for frame browsing. Defaults to eog.",
     )
     review_bib.add_argument(
         "--pre-roll",
@@ -4411,70 +3509,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Prompt to choose a recent session or review action when arguments are omitted.",
     )
     review_bib.set_defaults(func=command_review_bib)
-
-    ocr_ignore = subparsers.add_parser(
-        "ocr-ignore",
-        help="Manage the per-session OCR ignore list.",
-    )
-    ocr_ignore_subparsers = ocr_ignore.add_subparsers(dest="ocr_ignore_command", required=True)
-
-    ocr_ignore_list = ocr_ignore_subparsers.add_parser(
-        "list",
-        help="Show ignored bibs for a session.",
-    )
-    ocr_ignore_list.add_argument(
-        "target",
-        nargs="?",
-        type=Path,
-        help="Optional session directory or media file. Defaults to an interactive picker or the latest session.",
-    )
-    ocr_ignore_list.add_argument(
-        "--interactive",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Prompt to choose a recent session when the target is omitted.",
-    )
-    ocr_ignore_list.set_defaults(func=command_ocr_ignore_list)
-
-    ocr_ignore_add = ocr_ignore_subparsers.add_parser(
-        "add",
-        help="Add a bib to the per-session OCR ignore list.",
-    )
-    ocr_ignore_add.add_argument("bib", help="Bib number or PACER token to ignore.")
-    ocr_ignore_add.add_argument(
-        "target",
-        nargs="?",
-        type=Path,
-        help="Optional session directory or media file. Defaults to an interactive picker or the latest session.",
-    )
-    ocr_ignore_add.add_argument(
-        "--interactive",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Prompt to choose a recent session when the target is omitted.",
-    )
-    ocr_ignore_add.set_defaults(func=command_ocr_ignore_add)
-
-    ocr_ignore_remove = ocr_ignore_subparsers.add_parser(
-        "remove",
-        help="Remove a bib from the per-session OCR ignore list.",
-    )
-    ocr_ignore_remove.add_argument(
-        "bib", help="Bib number or PACER token to stop ignoring."
-    )
-    ocr_ignore_remove.add_argument(
-        "target",
-        nargs="?",
-        type=Path,
-        help="Optional session directory or media file. Defaults to an interactive picker or the latest session.",
-    )
-    ocr_ignore_remove.add_argument(
-        "--interactive",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Prompt to choose a recent session when the target is omitted.",
-    )
-    ocr_ignore_remove.set_defaults(func=command_ocr_ignore_remove)
 
     doctor = subparsers.add_parser(
         "doctor", help="Check the main dependencies and device path."
