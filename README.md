@@ -129,6 +129,8 @@ Or run it independently against an existing or current session:
 ./field-replay ocr-scan
 ./field-replay ocr-scan ~/recordings/run-20260408-181629
 ./field-replay ocr-scan /path/to/test.ts
+./field-replay find-bib 241
+./field-replay find-bib 241 ~/recordings/run-20260408-181629
 ```
 
 That sidecar samples the growing `timeshift.ts`, runs `tesseract`, and writes these files under the session directory:

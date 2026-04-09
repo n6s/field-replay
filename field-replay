@@ -167,6 +167,27 @@ def load_json_file(path: Path) -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
+def load_jsonl_records(path: Path) -> list[dict]:
+    if not path.exists():
+        return []
+    records: list[dict] = []
+    try:
+        with path.open(encoding="utf-8") as handle:
+            for line in handle:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    payload = json.loads(stripped)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(payload, dict):
+                    records.append(payload)
+    except OSError:
+        return []
+    return records
+
+
 def save_config(config_path: Path, payload: dict) -> bool:
     try:
         ensure_directory(config_path.parent)
@@ -1409,6 +1430,14 @@ def export_source_for_session(session_dir: Path) -> ExportSource | None:
     return None
 
 
+def ocr_event_sources_for_session(session_dir: Path) -> list[tuple[str, Path]]:
+    sources = [
+        ("live", session_dir / "ocr" / "events.jsonl"),
+        ("scan", session_dir / "ocr-scan" / "events.jsonl"),
+    ]
+    return [(label, path) for label, path in sources if path.exists()]
+
+
 def export_display_label(session_dir: Path) -> str | None:
     source = export_source_for_session(session_dir)
     if not source:
@@ -2162,6 +2191,15 @@ def event_log_line(payload: dict) -> str:
     )
 
 
+def event_sort_key(event: dict) -> tuple[float, str]:
+    try:
+        rel_time = float(event.get("t") or 0.0)
+    except (TypeError, ValueError):
+        rel_time = 0.0
+    wall_time = str(event.get("w") or "")
+    return rel_time, wall_time
+
+
 def promote_ocr_candidates(
     *,
     session_dir: Path,
@@ -2676,6 +2714,84 @@ def command_ocr_scan(args: argparse.Namespace) -> int:
     print(f"OCR scan source: {source.source_path}")
     print(f"OCR output dir: {output_root}")
     print(f"OCR events:     {runtime_paths['events_log']}")
+    return 0
+
+
+def command_find_bib(args: argparse.Namespace) -> int:
+    config_path = args.config_file.expanduser()
+    config = load_config(config_path)
+    if not args.target and interactive_mode_enabled(args):
+        selected_target = select_ocr_target(args, config)
+        if not selected_target:
+            print("no sessions found for bib lookup", file=sys.stderr)
+            return 1
+        args.target = Path(selected_target)
+
+    try:
+        session_dir = resolve_session_dir(
+            args.recordings_dir.expanduser(),
+            str(args.target) if args.target else None,
+        )
+    except FileNotFoundError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+
+    config["last_session_dir"] = str(session_dir)
+    save_config(config_path, config)
+
+    normalized_bib = normalize_ocr_text(args.bib)
+    if not normalized_bib:
+        print(f"not a bib-like lookup value: {args.bib}", file=sys.stderr)
+        return 1
+
+    sources = ocr_event_sources_for_session(session_dir)
+    if not sources:
+        print(f"no OCR event logs found under {session_dir}", file=sys.stderr)
+        return 1
+
+    matches: list[dict] = []
+    for source_label, source_path in sources:
+        for record in load_jsonl_records(source_path):
+            if str(record.get("b") or "").upper() != normalized_bib:
+                continue
+            item = dict(record)
+            item["_source"] = source_label
+            item["_path"] = source_path
+            matches.append(item)
+
+    if not matches:
+        print(f"no OCR events found for bib {normalized_bib} in {session_dir}", file=sys.stderr)
+        return 1
+
+    matches.sort(key=event_sort_key)
+    best_match = max(matches, key=lambda item: int(item.get("c") or 0))
+    first_match = matches[0]
+    last_match = matches[-1]
+
+    print(f"Session:   {session_dir}")
+    print(f"Bib:       {normalized_bib}")
+    print(f"Matches:   {len(matches)}")
+    print(
+        f"First:     {first_match.get('w', '?')} ({format_duration(first_match.get('t'))})"
+    )
+    print(
+        f"Last:      {last_match.get('w', '?')} ({format_duration(last_match.get('t'))})"
+    )
+    print(
+        "Best:      "
+        f"{best_match.get('c', 0)}% from {best_match.get('_source', '?')} "
+        f"frame={best_match.get('f', '-')}"
+    )
+    print()
+    print("Evidence")
+    for match in matches[-args.limit :]:
+        print(
+            f"  {match.get('w', '?')}  "
+            f"t={format_duration(match.get('t'))}  "
+            f"conf={match.get('c', 0)}%  "
+            f"src={match.get('_source', '?')}  "
+            f"frame={match.get('f', '-')}"
+        )
     return 0
 
 
@@ -3343,6 +3459,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="Prompt to choose a recent session when the target is omitted.",
     )
     ocr_scan.set_defaults(func=command_ocr_scan)
+
+    find_bib = subparsers.add_parser(
+        "find-bib",
+        help="Show OCR evidence for one bib in a session.",
+    )
+    find_bib.add_argument("bib", help="Bib number or PACER token to search for.")
+    find_bib.add_argument(
+        "target",
+        nargs="?",
+        type=Path,
+        help="Optional session directory or media file. Defaults to an interactive picker or the latest session.",
+    )
+    find_bib.add_argument(
+        "--limit",
+        type=int,
+        default=10,
+        help="Maximum number of matching evidence lines to print.",
+    )
+    find_bib.add_argument(
+        "--interactive",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Prompt to choose a recent session when the target is omitted.",
+    )
+    find_bib.set_defaults(func=command_find_bib)
 
     doctor = subparsers.add_parser(
         "doctor", help="Check the main dependencies and device path."
