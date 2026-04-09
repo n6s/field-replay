@@ -32,7 +32,7 @@ COMMON_FRAME_RATES = (30, 25, 15, 10, 5)
 COMMON_VIDEO_INPUT_FORMATS = ("auto", "mjpeg", "yuyv422", "uyvy422", "nv12")
 COMMON_AUDIO_INPUTS = ((48000, 2), (48000, 1), (44100, 2), (44100, 1), (32000, 1))
 DEFAULT_VIDEO_TIMESTAMP_ENABLED = True
-DEFAULT_VISION_MODEL = "gemma4:latest"
+DEFAULT_VISION_MODEL = "gemma4:e2b"
 DEFAULT_VISION_SAMPLE_INTERVAL = 10.0
 DEFAULT_VISION_TAIL_OFFSET = 4.0
 DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
@@ -1414,6 +1414,13 @@ def evidence_event_sources_for_session(session_dir: Path) -> list[tuple[str, Pat
         ("vision-scan", session_dir / "vision-scan" / "events.jsonl"),
         ("vision-live", session_dir / "vision-live" / "events.jsonl"),
     ]
+    seen_paths = {path for _, path in sources}
+    for scan_dir in sorted(session_dir.glob("vision-scan-*")):
+        events_path = scan_dir / "events.jsonl"
+        if events_path in seen_paths:
+            continue
+        sources.append((scan_dir.name, events_path))
+        seen_paths.add(events_path)
     return [(label, path) for label, path in sources if path.exists()]
 
 

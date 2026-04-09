@@ -125,7 +125,7 @@ There is an experimental Ollama vision sidecar for bib detection. It runs indepe
 
 `vision-live` follows a growing session in a model-paced loop: it grabs one frame from a few seconds behind live, waits for the local model response, then grabs the next available frame. `vision-scan` samples a saved session or media file for offline testing.
 
-The vision commands ask a local Ollama model such as `gemma4:latest` for strict JSON bib guesses and write these files under `vision-live/` or `vision-scan/`:
+The vision commands default to the local Ollama model `gemma4:e2b`, ask for strict JSON bib guesses, and write these files under `vision-live/` or `vision-scan/`:
 
 - `events.log`: human-readable lines that are easy to `tail -f`
 - `events.jsonl`: promoted vision sightings with timestamps and saved frame paths

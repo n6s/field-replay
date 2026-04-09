@@ -24,7 +24,7 @@ These notes are not commitments. They are a backlog of ideas that seem useful in
 
 ## Detection and evidence sources
 
-- AI vision sidecar: continue developing the model-paced Ollama loop that grabs one frame behind live, asks a local image-capable model like `gemma4:latest` to return bib guesses as strict JSON, then grabs the next frame only after the model responds.
+- AI vision sidecar: continue developing the model-paced Ollama loop that grabs one frame behind live, asks a local image-capable model like `gemma4:e2b` to return bib guesses as strict JSON, then grabs the next frame only after the model responds.
 - Vision prompt and preprocessing experiments: tune prompts, frame scaling, contrast, and region-of-interest sampling to improve small or low-contrast bib reads.
 - Audio callouts: optional speech-to-text for bib numbers called out by volunteers or radio operators.
 - RFID ingest: if a reader and tag-to-bib lookup table exist, log RFID detections into the same event timeline.
