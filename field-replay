@@ -1439,6 +1439,24 @@ def load_evidence_matches_for_bib(session_dir: Path, bib: str) -> list[dict]:
     return matches
 
 
+def load_all_evidence_matches(session_dir: Path) -> list[dict]:
+    matches: list[dict] = []
+    for source_label, source_path in evidence_event_sources_for_session(session_dir):
+        for record in load_jsonl_records(source_path):
+            item = dict(record)
+            item["_source"] = source_label
+            item["_path"] = source_path
+            matches.append(item)
+    matches.sort(key=event_sort_key)
+    return matches
+
+
+def is_all_review_selector(value: str | None) -> bool:
+    if value is None:
+        return False
+    return value.strip().lower() in {"all", "*"}
+
+
 def sighting_span_seconds(matches: Sequence[dict]) -> float:
     if len(matches) < 2:
         return 0.0
@@ -1456,6 +1474,22 @@ def bib_match_summary_lines(session_dir: Path, bib: str, matches: Sequence[dict]
     lines = [
         f"Session:   {session_dir}",
         f"Bib:       {bib}",
+        f"Matches:   {len(matches)}",
+        f"First:     {first_match.get('w', '?')} ({format_duration(first_match.get('t'))})",
+        f"Last:      {last_match.get('w', '?')} ({format_duration(last_match.get('t'))})",
+    ]
+    span_seconds = sighting_span_seconds(matches)
+    if span_seconds >= 60.0:
+        lines.append(f"Span:      {format_duration(span_seconds)}")
+    return lines
+
+
+def all_match_summary_lines(session_dir: Path, matches: Sequence[dict]) -> list[str]:
+    first_match = matches[0]
+    last_match = matches[-1]
+    lines = [
+        f"Session:   {session_dir}",
+        "Scope:     all promoted frames",
         f"Matches:   {len(matches)}",
         f"First:     {first_match.get('w', '?')} ({format_duration(first_match.get('t'))})",
         f"Last:      {last_match.get('w', '?')} ({format_duration(last_match.get('t'))})",
@@ -2836,7 +2870,7 @@ def run_review_bib_action(
 
 def prompt_review_bib_value(current_bib: str | None = None) -> str | None:
     while True:
-        prompt = "Bib number or PACER"
+        prompt = "Bib number, PACER, or all"
         if current_bib:
             prompt += f" [{current_bib}]"
         prompt += " (q to quit): "
@@ -2847,7 +2881,7 @@ def prompt_review_bib_value(current_bib: str | None = None) -> str | None:
             return None
         if raw:
             return raw
-        print("Enter a bib number, or q to quit.")
+        print("Enter a bib number, PACER, all, or q to quit.")
 
 
 def prompt_review_action_or_bib(
@@ -2880,7 +2914,7 @@ def prompt_review_action_or_bib(
                 return options[selected - 1][0]
         if raw:
             return f"bib:{raw}"
-        print("Enter a menu number, another bib, or q to quit.")
+        print("Enter a menu number, another bib, all, or q to quit.")
 
 
 def command_review_bib(args: argparse.Namespace) -> int:
@@ -2907,17 +2941,29 @@ def command_review_bib(args: argparse.Namespace) -> int:
             if selected_bib is None:
                 return 0
             current_bib = selected_bib
-            normalized_bib = normalize_bib_text(current_bib)
-            if not normalized_bib:
-                print(f"not a bib-like lookup value: {current_bib}", file=sys.stderr)
-                print()
-                continue
-            matches = load_evidence_matches_for_bib(session_dir, normalized_bib)
+            if is_all_review_selector(current_bib):
+                scope_label = "all"
+                matches = load_all_evidence_matches(session_dir)
+                summary_lines = all_match_summary_lines(session_dir, matches) if matches else []
+            else:
+                normalized_bib = normalize_bib_text(current_bib)
+                if not normalized_bib:
+                    print(f"not a bib-like lookup value: {current_bib}", file=sys.stderr)
+                    print()
+                    continue
+                scope_label = normalized_bib
+                matches = load_evidence_matches_for_bib(session_dir, normalized_bib)
+                summary_lines = (
+                    bib_match_summary_lines(session_dir, normalized_bib, matches) if matches else []
+                )
             if not matches:
-                print(f"no evidence events found for bib {normalized_bib} in {session_dir}", file=sys.stderr)
+                if scope_label == "all":
+                    print(f"no evidence events found in {session_dir}", file=sys.stderr)
+                else:
+                    print(f"no evidence events found for bib {scope_label} in {session_dir}", file=sys.stderr)
                 print()
                 continue
-            for line in bib_match_summary_lines(session_dir, normalized_bib, matches):
+            for line in summary_lines:
                 print(line)
             print()
             while True:
@@ -2947,7 +2993,7 @@ def command_review_bib(args: argparse.Namespace) -> int:
                 status = run_review_bib_action(
                     args=args,
                     session_dir=session_dir,
-                    normalized_bib=normalized_bib,
+                    normalized_bib=scope_label,
                     matches=matches,
                     mode=chosen_mode,
                 )
@@ -2962,17 +3008,25 @@ def command_review_bib(args: argparse.Namespace) -> int:
         print("review-bib requires a bib unless interactive prompts are enabled", file=sys.stderr)
         return 1
 
-    normalized_bib = normalize_bib_text(args.bib)
-    if not normalized_bib:
-        print(f"not a bib-like lookup value: {args.bib}", file=sys.stderr)
-        return 1
-
-    matches = load_evidence_matches_for_bib(session_dir, normalized_bib)
+    if is_all_review_selector(args.bib):
+        normalized_bib = "all"
+        matches = load_all_evidence_matches(session_dir)
+        summary_lines = all_match_summary_lines(session_dir, matches) if matches else []
+    else:
+        normalized_bib = normalize_bib_text(args.bib)
+        if not normalized_bib:
+            print(f"not a bib-like lookup value: {args.bib}", file=sys.stderr)
+            return 1
+        matches = load_evidence_matches_for_bib(session_dir, normalized_bib)
+        summary_lines = bib_match_summary_lines(session_dir, normalized_bib, matches) if matches else []
     if not matches:
-        print(f"no evidence events found for bib {normalized_bib} in {session_dir}", file=sys.stderr)
+        if normalized_bib == "all":
+            print(f"no evidence events found in {session_dir}", file=sys.stderr)
+        else:
+            print(f"no evidence events found for bib {normalized_bib} in {session_dir}", file=sys.stderr)
         return 1
 
-    for line in bib_match_summary_lines(session_dir, normalized_bib, matches):
+    for line in summary_lines:
         print(line)
     print()
 

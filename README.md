@@ -171,6 +171,7 @@ Live follow:
 - browse saved full frames in `eog`
 - jump to first or last sightings in VLC when useful
 - print recent evidence lines
+- use `review-bib all` to browse the whole promoted frame collection for a session
 - type another bib directly at the action prompt without restarting the command
 
 ### 7. Export a share-friendly copy
