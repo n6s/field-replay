@@ -1986,6 +1986,16 @@ def build_image_viewer_command(viewer: str, image_paths: Sequence[Path]) -> list
     return command
 
 
+def launch_background_viewer(command: Sequence[str]) -> subprocess.Popen[bytes]:
+    return subprocess.Popen(
+        list(command),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
 def vision_output_paths(vision_root: Path) -> dict[str, Path]:
     return {
         "root": vision_root,
@@ -2854,13 +2864,26 @@ def run_review_bib_action(
             requested = args.image_viewer or "eog"
             print(f"image viewer not found: {requested}", file=sys.stderr)
             return 1
-        command = build_image_viewer_command(viewer, image_paths)
-        print(
-            f"Opening {len(image_paths)} frame"
-            f"{'' if len(image_paths) == 1 else 's'} for {normalized_bib}"
-        )
+        viewer_image_paths = image_paths
+        launch_in_background = False
+        if normalized_bib == "all":
+            viewer_image_paths = image_paths[:1]
+            launch_in_background = True
+            print(
+                f"Opening the full promoted frame collection from the first frame "
+                f"for {normalized_bib}"
+            )
+        else:
+            print(
+                f"Opening {len(image_paths)} frame"
+                f"{'' if len(image_paths) == 1 else 's'} for {normalized_bib}"
+            )
+        command = build_image_viewer_command(viewer, viewer_image_paths)
         print("Viewer:", shlex.join(command))
         if args.dry_run:
+            return 0
+        if launch_in_background:
+            launch_background_viewer(command)
             return 0
         return subprocess.call(command)
 
@@ -2966,6 +2989,20 @@ def command_review_bib(args: argparse.Namespace) -> int:
             for line in summary_lines:
                 print(line)
             print()
+            if scope_label == "all":
+                status = run_review_bib_action(
+                    args=args,
+                    session_dir=session_dir,
+                    normalized_bib=scope_label,
+                    matches=matches,
+                    mode="frames",
+                )
+                print()
+                if status != 0:
+                    return status
+                current_bib = None
+                skip_bib_prompt = False
+                continue
             while True:
                 options = [
                     ("frames", "Browse saved full frames"),
