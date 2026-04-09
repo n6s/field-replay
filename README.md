@@ -129,6 +129,8 @@ Or run it independently against an existing or current session:
 ./field-replay ocr-scan
 ./field-replay ocr-scan ~/recordings/run-20260408-181629
 ./field-replay ocr-scan /path/to/test.ts
+./field-replay vision-scan ~/recordings/run-20260408-181629 --max-samples 3
+./field-replay vision-live ~/recordings/run-20260408-181629
 ./field-replay find-bib 241
 ./field-replay find-bib 241 ~/recordings/run-20260408-181629
 ./field-replay review-bib 241
@@ -148,6 +150,8 @@ That sidecar samples the growing `timeshift.ts`, runs `tesseract`, and writes th
 If a bib becomes noisy in the live view, add it to `ocr-ignore.txt` in the session directory. Ignored bibs stay in raw/debug data but stop appearing in promoted live OCR events.
 
 Live OCR now samples a few seconds behind the very end of `timeshift.ts` instead of grabbing the absolute tail, which makes frame extraction more stable on an actively growing recording. If you want to tune that, use `--ocr-tail-offset` or `ocr-live --tail-offset`.
+
+`vision-scan` is a separate experiment for local Ollama vision models such as `gemma4:latest`. It samples saved frames, asks the model for strict JSON bib guesses, and writes output under `vision-scan/`. `vision-live` follows a growing session in a model-paced loop: it grabs one frame from a few seconds behind live, waits for the model response, then grabs the next available frame.
 
 ## Player behavior
 

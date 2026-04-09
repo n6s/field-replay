@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
 import json
 import os
@@ -12,6 +13,8 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -35,6 +38,9 @@ DEFAULT_OCR_SAMPLE_INTERVAL = 1.0
 DEFAULT_OCR_TAIL_OFFSET = 4.0
 DEFAULT_OCR_REPEAT_COOLDOWN = 60.0
 DEFAULT_OCR_MIN_CONFIDENCE = 45
+DEFAULT_VISION_MODEL = "gemma4:latest"
+DEFAULT_VISION_SAMPLE_INTERVAL = 10.0
+DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
 EXPORT_PRESETS = {
     "share-high": {
         "label": "Share high",
@@ -1452,6 +1458,8 @@ def ocr_event_sources_for_session(session_dir: Path) -> list[tuple[str, Path]]:
     sources = [
         ("live", session_dir / "ocr" / "events.jsonl"),
         ("scan", session_dir / "ocr-scan" / "events.jsonl"),
+        ("vision", session_dir / "vision-scan" / "events.jsonl"),
+        ("vision-live", session_dir / "vision-live" / "events.jsonl"),
     ]
     return [(label, path) for label, path in sources if path.exists()]
 
@@ -1482,10 +1490,17 @@ def bib_match_summary_lines(session_dir: Path, bib: str, matches: Sequence[dict]
         f"Last:      {last_match.get('w', '?')} ({format_duration(last_match.get('t'))})",
         (
             "Best:      "
-            f"{best_match.get('c', 0)}% from {best_match.get('_source', '?')} "
+            f"{event_confidence_label(best_match)} from {best_match.get('_source', '?')} "
             f"frame={best_match.get('f', '-')}"
         ),
     ]
+
+
+def event_confidence_label(event: dict) -> str:
+    confidence = event.get("c")
+    if confidence is None or confidence == "":
+        return "n/a"
+    return f"{confidence}%"
 
 
 def export_display_label(session_dir: Path) -> str | None:
@@ -1497,7 +1512,12 @@ def export_display_label(session_dir: Path) -> str | None:
     return f"{session_dir.name} [{source.source_label}; {size}; {root_label}]"
 
 
-def select_export_target(args: argparse.Namespace, config: dict) -> str | None:
+def select_export_target(
+    args: argparse.Namespace,
+    config: dict,
+    *,
+    title: str = "Choose a session to export",
+) -> str | None:
     sessions = recent_sessions(args, config)
     options: list[tuple[str, str]] = []
     for session in sessions[:20]:
@@ -1508,7 +1528,7 @@ def select_export_target(args: argparse.Namespace, config: dict) -> str | None:
         return None
     options.append(("__manual__", "Enter a path manually"))
     default_value = config.get("last_session_dir")
-    choice = prompt_menu("Choose a session to export", options, default_value=default_value)
+    choice = prompt_menu(title, options, default_value=default_value)
     if choice == "__manual__":
         return prompt_text("Session directory or file path")
     return choice
@@ -2062,6 +2082,17 @@ def ocr_runtime_paths(session_dir: Path) -> dict[str, Path]:
     return ocr_output_paths(session_dir / "ocr")
 
 
+def vision_output_paths(vision_root: Path) -> dict[str, Path]:
+    return {
+        "root": vision_root,
+        "frames_dir": vision_root / "frames",
+        "scratch_frame": vision_root / "scratch-latest.jpg",
+        "debug_log": vision_root / "vision-debug.jsonl",
+        "events_jsonl": vision_root / "events.jsonl",
+        "events_log": vision_root / "events.log",
+    }
+
+
 def relative_to_session(path: Path, session_dir: Path) -> str:
     try:
         return str(path.relative_to(session_dir))
@@ -2271,6 +2302,18 @@ def extract_frame_at_time(
         raise RuntimeError(result.stderr.strip() or "ffmpeg timed frame extraction failed")
 
 
+def media_sample_points(duration_seconds: float, sample_interval: float) -> list[float]:
+    sample_interval = max(sample_interval, 0.1)
+    if duration_seconds <= 0:
+        return [0.0]
+    sample_points: list[float] = []
+    current = 0.0
+    while current <= duration_seconds + 0.001:
+        sample_points.append(round(current, 3))
+        current += sample_interval
+    return sample_points
+
+
 def save_crop_image(
     ffmpeg_bin: str, source_image: Path, output_path: Path, candidate: OCRCandidate
 ) -> None:
@@ -2308,6 +2351,13 @@ def event_wall_time(now: datetime) -> str:
 def event_log_line(payload: dict) -> str:
     return (
         f"{payload['w']} bib {payload['b']} ocr {payload['c']}% "
+        f"t={format_duration(payload.get('t'))} frame={payload.get('f', '-')}"
+    )
+
+
+def vision_event_log_line(payload: dict) -> str:
+    return (
+        f"{payload['w']} bib {payload['b']} vision "
         f"t={format_duration(payload.get('t'))} frame={payload.get('f', '-')}"
     )
 
@@ -2392,6 +2442,145 @@ def promote_ocr_candidates(
         }
 
     return promoted, suppressed
+
+
+def default_vision_prompt() -> str:
+    return (
+        "Find large visible digit sequences on runner bibs, paper bib signs, or "
+        "race number cards. Return only JSON in this exact shape: "
+        '{"bibs":["573"]}. If none are clearly visible, return {"bibs":[]}. '
+        "Ignore timestamps and room signs. Do not include explanations, markdown, "
+        "or guesses."
+    )
+
+
+def extract_json_object(text: str) -> dict:
+    stripped = text.strip()
+    try:
+        payload = json.loads(stripped)
+    except json.JSONDecodeError:
+        start = stripped.find("{")
+        end = stripped.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            return {}
+        try:
+            payload = json.loads(stripped[start : end + 1])
+        except json.JSONDecodeError:
+            return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def normalize_vision_bibs(payload: dict) -> list[str]:
+    raw_bibs = payload.get("bibs")
+    if not isinstance(raw_bibs, list):
+        return []
+    bibs: list[str] = []
+    for raw_value in raw_bibs:
+        normalized = normalize_ocr_text(str(raw_value))
+        if normalized and normalized not in bibs:
+            bibs.append(normalized)
+    return bibs
+
+
+def ask_ollama_for_bibs(
+    *,
+    image_path: Path,
+    model: str,
+    ollama_host: str,
+    prompt: str,
+    timeout_seconds: float,
+    keepalive: str,
+) -> tuple[list[str], str]:
+    image_b64 = base64.b64encode(image_path.read_bytes()).decode("ascii")
+    request_payload = {
+        "model": model,
+        "prompt": prompt,
+        "images": [image_b64],
+        "stream": False,
+        "format": "json",
+        "keep_alive": keepalive,
+        "options": {
+            "temperature": 0,
+            "top_p": 0.1,
+        },
+    }
+    request_data = json.dumps(request_payload).encode("utf-8")
+    endpoint = ollama_host.rstrip("/") + "/api/generate"
+    request = urllib.request.Request(
+        endpoint,
+        data=request_data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            response_payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"ollama request failed: {exc}") from exc
+    except TimeoutError as exc:
+        raise RuntimeError("ollama request timed out") from exc
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"ollama returned invalid JSON: {exc}") from exc
+
+    response_text = str(response_payload.get("response") or "")
+    bibs = normalize_vision_bibs(extract_json_object(response_text))
+    return bibs, response_text
+
+
+def process_vision_frame(
+    *,
+    runtime_paths: dict[str, Path],
+    session_dir: Path,
+    frame_path: Path,
+    offset_seconds: float,
+    model: str,
+    ollama_host: str,
+    prompt: str,
+    timeout_seconds: float,
+    keepalive: str,
+) -> None:
+    now = datetime.now().astimezone()
+    try:
+        bibs, response_text = ask_ollama_for_bibs(
+            image_path=frame_path,
+            model=model,
+            ollama_host=ollama_host,
+            prompt=prompt,
+            timeout_seconds=timeout_seconds,
+            keepalive=keepalive,
+        )
+        append_jsonl(
+            runtime_paths["debug_log"],
+            {
+                "w": event_wall_time(now),
+                "t": round(offset_seconds, 1),
+                "model": model,
+                "frame": relative_to_session(frame_path, session_dir),
+                "response": response_text,
+                "bibs": bibs,
+            },
+        )
+        for bib in bibs:
+            payload = {
+                "t": round(offset_seconds, 1),
+                "w": event_wall_time(now),
+                "k": "bib",
+                "b": bib,
+                "s": "vision",
+                "m": model,
+                "f": relative_to_session(frame_path, session_dir),
+            }
+            append_jsonl(runtime_paths["events_jsonl"], payload)
+            append_text_line(runtime_paths["events_log"], vision_event_log_line(payload))
+    except RuntimeError as exc:
+        append_jsonl(
+            runtime_paths["debug_log"],
+            {
+                "w": event_wall_time(now),
+                "t": round(offset_seconds, 1),
+                "error": str(exc),
+            },
+        )
 
 
 def print_session_summary(paths: SessionPaths) -> None:
@@ -2710,7 +2899,11 @@ def command_ocr_scan(args: argparse.Namespace) -> int:
     config_path = args.config_file.expanduser()
     config = load_config(config_path)
     if not args.target and interactive_mode_enabled(args):
-        selected_target = select_export_target(args, config)
+        selected_target = select_export_target(
+            args,
+            config,
+            title="Choose a session for OCR scan",
+        )
         if not selected_target:
             print("no sessions found for OCR scan", file=sys.stderr)
             return 1
@@ -2756,15 +2949,7 @@ def command_ocr_scan(args: argparse.Namespace) -> int:
     frame_width, frame_height = parse_video_size(video_size)
     ignored_bibs = load_ocr_ignore_list(source.session_dir)
     duration_seconds = probe_media_duration(args.ffmpeg_bin, source.source_path) or 0.0
-    sample_interval = max(args.sample_interval, 0.1)
-    sample_points: list[float] = []
-    if duration_seconds <= 0:
-        sample_points = [0.0]
-    else:
-        current = 0.0
-        while current <= duration_seconds + 0.001:
-            sample_points.append(round(current, 3))
-            current += sample_interval
+    sample_points = media_sample_points(duration_seconds, args.sample_interval)
 
     last_logged_by_bib: dict[str, dict] = {}
     for offset_seconds in sample_points:
@@ -2843,6 +3028,208 @@ def command_ocr_scan(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_vision_scan(args: argparse.Namespace) -> int:
+    config_path = args.config_file.expanduser()
+    config = load_config(config_path)
+    if not args.target and interactive_mode_enabled(args):
+        selected_target = select_export_target(
+            args,
+            config,
+            title="Choose a session for vision scan",
+        )
+        if not selected_target:
+            print("no sessions found for vision scan", file=sys.stderr)
+            return 1
+        args.target = selected_target
+
+    try:
+        source = resolve_export_source(
+            args.recordings_dir.expanduser(),
+            str(args.target) if args.target else None,
+        )
+    except FileNotFoundError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+
+    ffmpeg_path = shutil.which(args.ffmpeg_bin)
+    if not ffmpeg_path:
+        print(f"ffmpeg binary not found: {args.ffmpeg_bin}", file=sys.stderr)
+        return 1
+
+    output_root = (
+        args.output_dir.expanduser()
+        if args.output_dir
+        else source.session_dir / "vision-scan"
+    )
+    runtime_paths = vision_output_paths(output_root)
+    for key in ("root", "frames_dir"):
+        ensure_directory(runtime_paths[key])
+    for key in ("events_jsonl", "events_log", "debug_log"):
+        try:
+            runtime_paths[key].unlink()
+        except FileNotFoundError:
+            pass
+
+    config["last_session_dir"] = str(source.session_dir)
+    save_config(config_path, config)
+
+    duration_seconds = probe_media_duration(args.ffmpeg_bin, source.source_path) or 0.0
+    sample_points = media_sample_points(duration_seconds, args.sample_interval)
+    if args.max_samples is not None:
+        sample_points = sample_points[: max(args.max_samples, 0)]
+    prompt = args.prompt or default_vision_prompt()
+
+    print(f"Vision scan source: {source.source_path}")
+    print(f"Vision output dir:  {output_root}")
+    print(f"Vision model:       {args.model}")
+    print(f"Samples:            {len(sample_points)}")
+    if args.dry_run:
+        for offset_seconds in sample_points:
+            print(f"  sample {format_duration(offset_seconds)}")
+        return 0
+
+    for offset_seconds in sample_points:
+        stamp = f"{int(round(offset_seconds * 10)):010d}"
+        frame_path = runtime_paths["frames_dir"] / f"frame-{stamp}.jpg"
+        try:
+            extract_frame_at_time(
+                ffmpeg_path,
+                source.source_path,
+                offset_seconds,
+                frame_path,
+            )
+            process_vision_frame(
+                runtime_paths=runtime_paths,
+                session_dir=source.session_dir,
+                frame_path=frame_path,
+                offset_seconds=offset_seconds,
+                model=args.model,
+                ollama_host=args.ollama_host,
+                prompt=prompt,
+                timeout_seconds=args.timeout,
+                keepalive=args.keepalive,
+            )
+        except RuntimeError as exc:
+            append_jsonl(
+                runtime_paths["debug_log"],
+                {
+                    "w": event_wall_time(datetime.now().astimezone()),
+                    "t": round(offset_seconds, 1),
+                    "error": str(exc),
+                },
+            )
+
+    print(f"Vision events:      {runtime_paths['events_log']}")
+    print(f"Vision debug:       {runtime_paths['debug_log']}")
+    return 0
+
+
+def command_vision_live(args: argparse.Namespace) -> int:
+    config_path = args.config_file.expanduser()
+    config = load_config(config_path)
+    if not args.session_dir and interactive_mode_enabled(args):
+        selected_target = select_ocr_target(
+            args,
+            config,
+            title="Choose a session for live vision",
+        )
+        if not selected_target:
+            print("no sessions found for live vision", file=sys.stderr)
+            return 1
+        args.session_dir = Path(selected_target)
+
+    try:
+        session_dir = resolve_session_dir(
+            args.recordings_dir.expanduser(),
+            str(args.session_dir) if args.session_dir else None,
+        )
+    except FileNotFoundError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+
+    ffmpeg_path = shutil.which(args.ffmpeg_bin)
+    if not ffmpeg_path:
+        print(f"ffmpeg binary not found: {args.ffmpeg_bin}", file=sys.stderr)
+        return 1
+
+    output_root = session_dir / "vision-live"
+    runtime_paths = vision_output_paths(output_root)
+    for key in ("root", "frames_dir"):
+        ensure_directory(runtime_paths[key])
+
+    config["last_session_dir"] = str(session_dir)
+    save_config(config_path, config)
+
+    prompt = args.prompt or default_vision_prompt()
+    timeshift_path = session_dir / DEFAULT_TIMESHIFT_NAME
+    processed_offsets: set[float] = set()
+    sample_count = 0
+
+    print(f"Vision live session: {session_dir}")
+    print(f"Vision output dir:   {output_root}")
+    print(f"Vision model:        {args.model}")
+    print("Sampling is model-paced; press Ctrl+C to stop.")
+
+    while True:
+        if args.max_samples is not None and sample_count >= args.max_samples:
+            return 0
+        if not timeshift_path.exists() or timeshift_path.stat().st_size == 0:
+            if args.once:
+                return 0
+            time.sleep(args.idle_sleep)
+            continue
+
+        duration_seconds = ffprobe_duration_seconds(timeshift_path)
+        if duration_seconds is None or duration_seconds <= 0:
+            if args.once:
+                return 0
+            time.sleep(args.idle_sleep)
+            continue
+
+        offset_seconds = max(duration_seconds - max(args.tail_offset, 0.0), 0.0)
+        rounded_offset = round(offset_seconds, 1)
+        if rounded_offset in processed_offsets:
+            if args.once:
+                return 0
+            time.sleep(args.idle_sleep)
+            continue
+
+        frame_path = runtime_paths["frames_dir"] / (
+            f"frame-{int(round(offset_seconds * 10)):010d}.jpg"
+        )
+        try:
+            extract_frame_at_time(
+                ffmpeg_path,
+                timeshift_path,
+                offset_seconds,
+                frame_path,
+            )
+            process_vision_frame(
+                runtime_paths=runtime_paths,
+                session_dir=session_dir,
+                frame_path=frame_path,
+                offset_seconds=offset_seconds,
+                model=args.model,
+                ollama_host=args.ollama_host,
+                prompt=prompt,
+                timeout_seconds=args.timeout,
+                keepalive=args.keepalive,
+            )
+            processed_offsets.add(rounded_offset)
+            sample_count += 1
+        except RuntimeError as exc:
+            append_jsonl(
+                runtime_paths["debug_log"],
+                {
+                    "w": event_wall_time(datetime.now().astimezone()),
+                    "t": rounded_offset,
+                    "error": str(exc),
+                },
+            )
+            if args.once:
+                return 1
+
+
 def command_find_bib(args: argparse.Namespace) -> int:
     config_path = args.config_file.expanduser()
     config = load_config(config_path)
@@ -2871,12 +3258,12 @@ def command_find_bib(args: argparse.Namespace) -> int:
         return 1
 
     if not ocr_event_sources_for_session(session_dir):
-        print(f"no OCR event logs found under {session_dir}", file=sys.stderr)
+        print(f"no evidence event logs found under {session_dir}", file=sys.stderr)
         return 1
 
     matches = load_ocr_matches_for_bib(session_dir, normalized_bib)
     if not matches:
-        print(f"no OCR events found for bib {normalized_bib} in {session_dir}", file=sys.stderr)
+        print(f"no evidence events found for bib {normalized_bib} in {session_dir}", file=sys.stderr)
         return 1
 
     for line in bib_match_summary_lines(session_dir, normalized_bib, matches):
@@ -2887,7 +3274,7 @@ def command_find_bib(args: argparse.Namespace) -> int:
         print(
             f"  {match.get('w', '?')}  "
             f"t={format_duration(match.get('t'))}  "
-            f"conf={match.get('c', 0)}%  "
+            f"conf={event_confidence_label(match)}  "
             f"src={match.get('_source', '?')}  "
             f"frame={match.get('f', '-')}"
         )
@@ -2908,7 +3295,7 @@ def run_review_bib_action(
             print(
                 f"  {match.get('w', '?')}  "
                 f"t={format_duration(match.get('t'))}  "
-                f"conf={match.get('c', 0)}%  "
+                f"conf={event_confidence_label(match)}  "
                 f"src={match.get('_source', '?')}  "
                 f"frame={match.get('f', '-')}"
             )
@@ -2964,7 +3351,7 @@ def run_review_bib_action(
                 f"no saved {'frames' if mode == 'frames' else 'crops'} found for {normalized_bib}",
                 file=sys.stderr,
             )
-            return 1
+            return 0
         viewer = choose_image_viewer(args.image_viewer)
         if not viewer:
             requested = args.image_viewer or "eog"
@@ -2986,7 +3373,7 @@ def run_review_bib_action(
 
 
 def command_review_bib(args: argparse.Namespace) -> int:
-    session_dir = resolve_ocr_session_from_args(args, "OCR review")
+    session_dir = resolve_ocr_session_from_args(args, "bib review")
     if session_dir is None:
         return 1
 
@@ -2996,12 +3383,12 @@ def command_review_bib(args: argparse.Namespace) -> int:
         return 1
 
     if not ocr_event_sources_for_session(session_dir):
-        print(f"no OCR event logs found under {session_dir}", file=sys.stderr)
+        print(f"no evidence event logs found under {session_dir}", file=sys.stderr)
         return 1
 
     matches = load_ocr_matches_for_bib(session_dir, normalized_bib)
     if not matches:
-        print(f"no OCR events found for bib {normalized_bib} in {session_dir}", file=sys.stderr)
+        print(f"no evidence events found for bib {normalized_bib} in {session_dir}", file=sys.stderr)
         return 1
 
     for line in bib_match_summary_lines(session_dir, normalized_bib, matches):
@@ -3013,7 +3400,7 @@ def command_review_bib(args: argparse.Namespace) -> int:
         while True:
             options = [
                 ("video-last", "Open last sighting in video"),
-                ("video-best", "Open best-confidence sighting in video"),
+                ("video-best", "Open best evidence sighting"),
                 ("frames", "Browse saved full frames"),
                 ("crops", "Browse saved bib crops"),
                 ("summary", "Print recent evidence lines"),
@@ -3804,6 +4191,145 @@ def build_parser() -> argparse.ArgumentParser:
         help="Prompt to choose a recent session when the target is omitted.",
     )
     ocr_scan.set_defaults(func=command_ocr_scan)
+
+    vision_scan = subparsers.add_parser(
+        "vision-scan",
+        help="Experimentally ask a local Ollama vision model to read sampled frames.",
+    )
+    vision_scan.add_argument(
+        "target",
+        nargs="?",
+        type=Path,
+        help="Optional session directory or media file. Defaults to an interactive picker or the latest session.",
+    )
+    vision_scan.add_argument(
+        "--ffmpeg-bin",
+        default="ffmpeg",
+        help="FFmpeg binary to use for frame extraction.",
+    )
+    vision_scan.add_argument(
+        "--model",
+        default=DEFAULT_VISION_MODEL,
+        help="Ollama vision model to query.",
+    )
+    vision_scan.add_argument(
+        "--ollama-host",
+        default=DEFAULT_OLLAMA_HOST,
+        help="Base URL for the local Ollama server.",
+    )
+    vision_scan.add_argument(
+        "--sample-interval",
+        type=float,
+        default=DEFAULT_VISION_SAMPLE_INTERVAL,
+        help="Seconds between sampled frames.",
+    )
+    vision_scan.add_argument(
+        "--max-samples",
+        type=int,
+        help="Maximum number of frames to send to the vision model.",
+    )
+    vision_scan.add_argument(
+        "--timeout",
+        type=float,
+        default=120.0,
+        help="Seconds to wait for each Ollama response.",
+    )
+    vision_scan.add_argument(
+        "--keepalive",
+        default="5m",
+        help="How long Ollama should keep the model loaded between frames.",
+    )
+    vision_scan.add_argument(
+        "--prompt",
+        help="Override the default strict JSON bib-reading prompt.",
+    )
+    vision_scan.add_argument(
+        "--output-dir",
+        type=Path,
+        help="Directory for vision scan output. Defaults to vision-scan under the session directory.",
+    )
+    vision_scan.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print scan samples without calling Ollama.",
+    )
+    vision_scan.add_argument(
+        "--interactive",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Prompt to choose a recent session when the target is omitted.",
+    )
+    vision_scan.set_defaults(func=command_vision_scan)
+
+    vision_live = subparsers.add_parser(
+        "vision-live",
+        help="Experimentally follow a live session with a model-paced Ollama vision loop.",
+    )
+    vision_live.add_argument(
+        "session_dir",
+        nargs="?",
+        type=Path,
+        help="Session directory with a growing timeshift.ts file. Defaults to an interactive picker or the latest session.",
+    )
+    vision_live.add_argument(
+        "--ffmpeg-bin",
+        default="ffmpeg",
+        help="FFmpeg binary to use for frame extraction.",
+    )
+    vision_live.add_argument(
+        "--model",
+        default=DEFAULT_VISION_MODEL,
+        help="Ollama vision model to query.",
+    )
+    vision_live.add_argument(
+        "--ollama-host",
+        default=DEFAULT_OLLAMA_HOST,
+        help="Base URL for the local Ollama server.",
+    )
+    vision_live.add_argument(
+        "--tail-offset",
+        type=float,
+        default=DEFAULT_OCR_TAIL_OFFSET,
+        help="Seconds behind the live tail to sample.",
+    )
+    vision_live.add_argument(
+        "--timeout",
+        type=float,
+        default=120.0,
+        help="Seconds to wait for each Ollama response.",
+    )
+    vision_live.add_argument(
+        "--keepalive",
+        default="5m",
+        help="How long Ollama should keep the model loaded between frames.",
+    )
+    vision_live.add_argument(
+        "--idle-sleep",
+        type=float,
+        default=1.0,
+        help="Seconds to wait when no new sample point is available.",
+    )
+    vision_live.add_argument(
+        "--max-samples",
+        type=int,
+        help="Stop after this many model-paced samples.",
+    )
+    vision_live.add_argument(
+        "--prompt",
+        help="Override the default strict JSON bib-reading prompt.",
+    )
+    vision_live.add_argument(
+        "--once",
+        action="store_true",
+        help="Run one available sample and exit.",
+    )
+    vision_live.add_argument(
+        "--interactive",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Prompt to choose a recent session when the target is omitted.",
+    )
+    vision_live.set_defaults(func=command_vision_live)
 
     find_bib = subparsers.add_parser(
         "find-bib",
