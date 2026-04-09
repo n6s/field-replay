@@ -115,10 +115,10 @@ When possible, `export` now prefers a hardware H.264 encoder that matches the or
 
 There is now a first-pass live OCR sidecar for bib experiments.
 
-It starts by default during `record` and `go`. If you want recording without OCR, use:
+It is experimental and off by default. Enable it during recording with:
 
 ```bash
-./field-replay record --no-ocr-live
+./field-replay record --ocr-live
 ```
 
 Or run it independently against an existing or current session:
