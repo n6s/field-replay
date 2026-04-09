@@ -1954,6 +1954,13 @@ def load_ocr_ignore_list(session_dir: Path) -> set[str]:
     return ignored
 
 
+def save_ocr_ignore_list(session_dir: Path, ignored_bibs: set[str]) -> None:
+    ignore_path = session_dir / "ocr-ignore.txt"
+    ensure_directory(ignore_path.parent)
+    lines = [value for value in sorted(ignored_bibs) if value]
+    ignore_path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+
+
 def ocr_output_paths(ocr_root: Path) -> dict[str, Path]:
     return {
         "root": ocr_root,
@@ -2795,6 +2802,79 @@ def command_find_bib(args: argparse.Namespace) -> int:
     return 0
 
 
+def resolve_ocr_session_from_args(args: argparse.Namespace, purpose: str) -> Path | None:
+    config_path = args.config_file.expanduser()
+    config = load_config(config_path)
+    if not getattr(args, "target", None) and interactive_mode_enabled(args):
+        selected_target = select_ocr_target(args, config)
+        if not selected_target:
+            print(f"no sessions found for {purpose}", file=sys.stderr)
+            return None
+        args.target = Path(selected_target)
+
+    try:
+        session_dir = resolve_session_dir(
+            args.recordings_dir.expanduser(),
+            str(args.target) if getattr(args, "target", None) else None,
+        )
+    except FileNotFoundError as exc:
+        print(exc, file=sys.stderr)
+        return None
+
+    config["last_session_dir"] = str(session_dir)
+    save_config(config_path, config)
+    return session_dir
+
+
+def command_ocr_ignore_list(args: argparse.Namespace) -> int:
+    session_dir = resolve_ocr_session_from_args(args, "OCR ignore list")
+    if session_dir is None:
+        return 1
+    ignored = load_ocr_ignore_list(session_dir)
+    print(f"Session: {session_dir}")
+    print(f"Ignore file: {session_dir / 'ocr-ignore.txt'}")
+    if not ignored:
+        print("Ignored bibs: none")
+        return 0
+    print("Ignored bibs:")
+    for value in sorted(ignored):
+        print(f"  {value}")
+    return 0
+
+
+def command_ocr_ignore_add(args: argparse.Namespace) -> int:
+    session_dir = resolve_ocr_session_from_args(args, "OCR ignore list")
+    if session_dir is None:
+        return 1
+    normalized = normalize_ocr_text(args.bib)
+    if not normalized:
+        print(f"not a bib-like ignore value: {args.bib}", file=sys.stderr)
+        return 1
+    ignored = load_ocr_ignore_list(session_dir)
+    ignored.add(normalized)
+    save_ocr_ignore_list(session_dir, ignored)
+    print(f"Ignoring {normalized} in {session_dir}")
+    return 0
+
+
+def command_ocr_ignore_remove(args: argparse.Namespace) -> int:
+    session_dir = resolve_ocr_session_from_args(args, "OCR ignore list")
+    if session_dir is None:
+        return 1
+    normalized = normalize_ocr_text(args.bib)
+    if not normalized:
+        print(f"not a bib-like ignore value: {args.bib}", file=sys.stderr)
+        return 1
+    ignored = load_ocr_ignore_list(session_dir)
+    if normalized not in ignored:
+        print(f"{normalized} is not ignored in {session_dir}", file=sys.stderr)
+        return 1
+    ignored.remove(normalized)
+    save_ocr_ignore_list(session_dir, ignored)
+    print(f"Removed {normalized} from ignore list in {session_dir}")
+    return 0
+
+
 def command_record(args: argparse.Namespace) -> int:
     return run_record_command(args, launch_player=False)
 
@@ -3484,6 +3564,70 @@ def build_parser() -> argparse.ArgumentParser:
         help="Prompt to choose a recent session when the target is omitted.",
     )
     find_bib.set_defaults(func=command_find_bib)
+
+    ocr_ignore = subparsers.add_parser(
+        "ocr-ignore",
+        help="Manage the per-session OCR ignore list.",
+    )
+    ocr_ignore_subparsers = ocr_ignore.add_subparsers(dest="ocr_ignore_command", required=True)
+
+    ocr_ignore_list = ocr_ignore_subparsers.add_parser(
+        "list",
+        help="Show ignored bibs for a session.",
+    )
+    ocr_ignore_list.add_argument(
+        "target",
+        nargs="?",
+        type=Path,
+        help="Optional session directory or media file. Defaults to an interactive picker or the latest session.",
+    )
+    ocr_ignore_list.add_argument(
+        "--interactive",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Prompt to choose a recent session when the target is omitted.",
+    )
+    ocr_ignore_list.set_defaults(func=command_ocr_ignore_list)
+
+    ocr_ignore_add = ocr_ignore_subparsers.add_parser(
+        "add",
+        help="Add a bib to the per-session OCR ignore list.",
+    )
+    ocr_ignore_add.add_argument("bib", help="Bib number or PACER token to ignore.")
+    ocr_ignore_add.add_argument(
+        "target",
+        nargs="?",
+        type=Path,
+        help="Optional session directory or media file. Defaults to an interactive picker or the latest session.",
+    )
+    ocr_ignore_add.add_argument(
+        "--interactive",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Prompt to choose a recent session when the target is omitted.",
+    )
+    ocr_ignore_add.set_defaults(func=command_ocr_ignore_add)
+
+    ocr_ignore_remove = ocr_ignore_subparsers.add_parser(
+        "remove",
+        help="Remove a bib from the per-session OCR ignore list.",
+    )
+    ocr_ignore_remove.add_argument(
+        "bib", help="Bib number or PACER token to stop ignoring."
+    )
+    ocr_ignore_remove.add_argument(
+        "target",
+        nargs="?",
+        type=Path,
+        help="Optional session directory or media file. Defaults to an interactive picker or the latest session.",
+    )
+    ocr_ignore_remove.add_argument(
+        "--interactive",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Prompt to choose a recent session when the target is omitted.",
+    )
+    ocr_ignore_remove.set_defaults(func=command_ocr_ignore_remove)
 
     doctor = subparsers.add_parser(
         "doctor", help="Check the main dependencies and device path."

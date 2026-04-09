@@ -16,6 +16,8 @@ These notes are not commitments. They are a backlog of ideas that seem useful in
 
 - Live log tail: a TUI or text view that shows recent bib detections as they happen.
 - Jump-to-review: selecting a bib opens the player a couple seconds before the sighting.
+- Annotated review overlay: draw green bounding boxes around detected bibs during playback or clip export.
+- Bottom-bar labels: list detected bibs near the timestamp area and draw pointer lines back to their bounding boxes for easier multi-runner review.
 - Group clustering: treat nearby detections as one departure pack so volunteers can compare "what I wrote down" versus "what the system saw."
 - Verification states: mark detections as `unreviewed`, `confirmed`, `rejected`, or `manual-only`.
 - Contact-sheet style review: browse saved frame grabs or crops for one bib or one group without opening full video.
@@ -62,5 +64,6 @@ The safest pattern on weak hardware is to keep recording reliable, then layer se
 3. Add clock overlay and frame grabs.
 4. Add bib lookup and simple review tooling.
 5. Add sparse OCR on saved frames or cropped regions.
-6. Add live TUI review flows.
-7. Add optional audio and RFID correlation.
+6. Add annotated OCR review exports or playback overlays.
+7. Add live TUI review flows.
+8. Add optional audio and RFID correlation.
