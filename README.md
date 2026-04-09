@@ -111,6 +111,34 @@ When you want a share-friendly copy after the event:
 
 When possible, `export` now prefers a hardware H.264 encoder that matches the original session and writes a small sidecar JSON file next to the MP4 so you can tell later how the share copy was produced.
 
+## Live OCR
+
+There is now a first-pass live OCR sidecar for bib experiments.
+
+Enable it during recording with:
+
+```bash
+./field-replay record --ocr-live
+```
+
+Or run it independently against an existing or current session:
+
+```bash
+./field-replay ocr-live
+./field-replay ocr-live ~/recordings/run-20260408-181629
+./field-replay ocr-scan
+./field-replay ocr-scan ~/recordings/run-20260408-181629
+./field-replay ocr-scan /path/to/test.ts
+```
+
+That sidecar samples the growing `timeshift.ts`, runs `tesseract`, and writes these files under the session directory:
+
+- `ocr/events.log`: human-readable lines that are easy to `tail -f`
+- `ocr/events.jsonl`: promoted OCR sightings with timestamps, confidence, bbox, and saved frame paths
+- `ocr/ocr-debug.jsonl`: diagnostics showing what OCR saw and why repeats were suppressed
+
+If a bib becomes noisy in the live view, add it to `ocr-ignore.txt` in the session directory. Ignored bibs stay in raw/debug data but stop appearing in promoted live OCR events.
+
 ## Player behavior
 
 For the workflow you described, the important distinction is:
@@ -190,6 +218,7 @@ The default capture settings are:
 ./field-replay record --no-interactive
 ./field-replay record --audio-gain-db 24
 ./field-replay record --audio-bitrate 48k --audio-channels 2 --audio-sample-rate 48000
+./field-replay record --ocr-live
 ./field-replay record --timestamp-source device --timestamps default
 ./field-replay record --no-video-timestamp
 ./field-replay record --video-bitrate 8M --maxrate 10M --bufsize 20M
