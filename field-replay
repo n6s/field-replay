@@ -1439,22 +1439,31 @@ def load_evidence_matches_for_bib(session_dir: Path, bib: str) -> list[dict]:
     return matches
 
 
+def sighting_span_seconds(matches: Sequence[dict]) -> float:
+    if len(matches) < 2:
+        return 0.0
+    try:
+        first_time = float(matches[0].get("t") or 0.0)
+        last_time = float(matches[-1].get("t") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(last_time - first_time, 0.0)
+
+
 def bib_match_summary_lines(session_dir: Path, bib: str, matches: Sequence[dict]) -> list[str]:
-    best_match = max(matches, key=lambda item: int(item.get("c") or 0))
     first_match = matches[0]
     last_match = matches[-1]
-    return [
+    lines = [
         f"Session:   {session_dir}",
         f"Bib:       {bib}",
         f"Matches:   {len(matches)}",
         f"First:     {first_match.get('w', '?')} ({format_duration(first_match.get('t'))})",
         f"Last:      {last_match.get('w', '?')} ({format_duration(last_match.get('t'))})",
-        (
-            "Best:      "
-            f"{event_confidence_label(best_match)} from {best_match.get('_source', '?')} "
-            f"frame={best_match.get('f', '-')}"
-        ),
     ]
+    span_seconds = sighting_span_seconds(matches)
+    if span_seconds >= 60.0:
+        lines.append(f"Span:      {format_duration(span_seconds)}")
+    return lines
 
 
 def event_confidence_label(event: dict) -> str:
@@ -2109,7 +2118,7 @@ def annotate_promoted_frame(
     filter_graph = (
         "drawtext="
         f"text='{ffmpeg_drawtext_escape(label_text)}':"
-        "x=w-tw-20:y=h-th-20:"
+        "x=min(344\\,w-tw-20):y=h-th-20:"
         "box=1:boxcolor=0x00000099:boxborderw=10:"
         "fontcolor=white:fontsize=24:borderw=2"
     )
@@ -2756,11 +2765,11 @@ def run_review_bib_action(
             )
         return 0
 
-    if mode in {"video-last", "video-best"}:
+    if mode in {"video-last", "video-first", "video-best"}:
         chosen_match = (
             matches[-1]
             if mode == "video-last"
-            else max(matches, key=lambda item: int(item.get("c") or 0))
+            else matches[0]
         )
         player = choose_player(args.player)
         if not player:
@@ -2781,7 +2790,7 @@ def run_review_bib_action(
             args.file_caching_ms,
             start_seconds=start_seconds,
         )
-        action_label = "last sighting" if mode == "video-last" else "best sighting"
+        action_label = "last sighting" if mode == "video-last" else "first sighting"
         print(
             f"Opening {action_label} for {normalized_bib} at "
             f"{format_duration(start_seconds)}"
@@ -2876,11 +2885,12 @@ def command_review_bib(args: argparse.Namespace) -> int:
             while True:
                 options = [
                     ("video-last", "Open last sighting in video"),
-                    ("video-best", "Open best evidence sighting"),
                     ("frames", "Browse saved full frames"),
                     ("summary", "Print recent evidence lines"),
                     ("another", "Look up another bib"),
                 ]
+                if sighting_span_seconds(matches) >= 60.0:
+                    options.insert(0, ("video-first", "Open first sighting in video"))
                 chosen_mode = prompt_menu(
                     "Review action",
                     options,
@@ -3670,9 +3680,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     review_bib.add_argument(
         "--mode",
-        choices=("interactive", "video-last", "video-best", "frames", "summary"),
         default="interactive",
-        help="Review action. Defaults to an interactive menu.",
+        help="Review action: interactive, video-first, video-last, frames, or summary. Defaults to an interactive menu.",
     )
     review_bib.add_argument(
         "--player",
