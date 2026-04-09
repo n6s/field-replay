@@ -25,6 +25,7 @@ These notes are not commitments. They are a backlog of ideas that seem useful in
 ## Detection and evidence sources
 
 - OCR for bib numbers: likely most practical when run on sparse frame samples or cropped regions instead of every full-resolution frame.
+- Local vision-model verification: use Ollama or another local multimodal model as a second-pass verifier on saved crops when Tesseract finds a plausible bib, rather than asking a large model to inspect every frame live.
 - Audio callouts: optional speech-to-text for bib numbers called out by volunteers or radio operators.
 - RFID ingest: if a reader and tag-to-bib lookup table exist, log RFID detections into the same event timeline.
 - Evidence correlation: merge nearby OCR, audio, RFID, and manual entries into stronger combined evidence for one bib.
