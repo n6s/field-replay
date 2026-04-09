@@ -2088,6 +2088,57 @@ def promoted_frame_path(
     return runtime_paths["frames_dir"] / f"frame-{stamp}.jpg"
 
 
+def ffmpeg_drawtext_escape(text: str) -> str:
+    return (
+        text.replace("\\", r"\\")
+        .replace(":", r"\:")
+        .replace("'", r"\'")
+        .replace("%", r"\%")
+        .replace(",", r"\,")
+    )
+
+
+def annotate_promoted_frame(
+    *,
+    ffmpeg_bin: str,
+    source_frame_path: Path,
+    output_frame_path: Path,
+    detected_bibs: Sequence[str],
+) -> None:
+    label_text = "bibs: " + ", ".join(detected_bibs)
+    filter_graph = (
+        "drawtext="
+        f"text='{ffmpeg_drawtext_escape(label_text)}':"
+        "x=w-tw-20:y=h-th-20:"
+        "box=1:boxcolor=0x00000099:boxborderw=10:"
+        "fontcolor=white:fontsize=24:borderw=2"
+    )
+    ensure_directory(output_frame_path.parent)
+    result = subprocess.run(
+        [
+            ffmpeg_bin,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-i",
+            str(source_frame_path),
+            "-vf",
+            filter_graph,
+            "-frames:v",
+            "1",
+            "-q:v",
+            "2",
+            str(output_frame_path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr.strip() or "ffmpeg frame annotation failed")
+
+
 def ask_ollama_for_bibs(
     *,
     image_path: Path,
@@ -2138,6 +2189,8 @@ def process_vision_frame(
     runtime_paths: dict[str, Path],
     session_dir: Path,
     frame_path: Path,
+    ffmpeg_bin: str,
+    annotate_frames: bool,
     offset_seconds: float,
     model: str,
     ollama_host: str,
@@ -2175,7 +2228,18 @@ def process_vision_frame(
             if promoted_frame_reference is None:
                 saved_frame_path = promoted_frame_path(runtime_paths, offset_seconds)
                 ensure_directory(saved_frame_path.parent)
-                shutil.copy2(frame_path, saved_frame_path)
+                if annotate_frames:
+                    try:
+                        annotate_promoted_frame(
+                            ffmpeg_bin=ffmpeg_bin,
+                            source_frame_path=frame_path,
+                            output_frame_path=saved_frame_path,
+                            detected_bibs=bibs,
+                        )
+                    except RuntimeError:
+                        shutil.copy2(frame_path, saved_frame_path)
+                else:
+                    shutil.copy2(frame_path, saved_frame_path)
                 promoted_frame_reference = relative_to_session(saved_frame_path, session_dir)
             payload = {
                 "t": round(offset_seconds, 1),
@@ -2415,6 +2479,13 @@ def command_vision_scan(args: argparse.Namespace) -> int:
     if not ffmpeg_path:
         print(f"ffmpeg binary not found: {args.ffmpeg_bin}", file=sys.stderr)
         return 1
+    _, supported_filters = detect_supported_filters(args.ffmpeg_bin)
+    annotate_frames = "drawtext" in supported_filters
+    if not annotate_frames:
+        print(
+            "warning: ffmpeg drawtext filter is unavailable; saving raw promoted frames",
+            file=sys.stderr,
+        )
 
     output_root = (
         args.output_dir.expanduser()
@@ -2462,6 +2533,8 @@ def command_vision_scan(args: argparse.Namespace) -> int:
                 runtime_paths=runtime_paths,
                 session_dir=source.session_dir,
                 frame_path=runtime_paths["scratch_frame"],
+                ffmpeg_bin=ffmpeg_path,
+                annotate_frames=annotate_frames,
                 offset_seconds=offset_seconds,
                 model=args.model,
                 ollama_host=args.ollama_host,
@@ -2516,6 +2589,13 @@ def command_vision_live(args: argparse.Namespace) -> int:
     if not ffmpeg_path:
         print(f"ffmpeg binary not found: {args.ffmpeg_bin}", file=sys.stderr)
         return 1
+    _, supported_filters = detect_supported_filters(args.ffmpeg_bin)
+    annotate_frames = "drawtext" in supported_filters
+    if not annotate_frames:
+        print(
+            "warning: ffmpeg drawtext filter is unavailable; saving raw promoted frames",
+            file=sys.stderr,
+        )
 
     output_root = session_dir / "vision-live"
     runtime_paths = vision_output_paths(output_root)
@@ -2576,6 +2656,8 @@ def command_vision_live(args: argparse.Namespace) -> int:
                 runtime_paths=runtime_paths,
                 session_dir=session_dir,
                 frame_path=runtime_paths["scratch_frame"],
+                ffmpeg_bin=ffmpeg_path,
+                annotate_frames=annotate_frames,
                 offset_seconds=offset_seconds,
                 model=args.model,
                 ollama_host=args.ollama_host,
@@ -2743,18 +2825,96 @@ def run_review_bib_action(
     return 1
 
 
+def prompt_review_bib_value(current_bib: str | None = None) -> str | None:
+    while True:
+        prompt = "Bib number or PACER"
+        if current_bib:
+            prompt += f" [{current_bib}]"
+        prompt += " (q to quit): "
+        raw = input(prompt).strip()
+        if not raw and current_bib:
+            return current_bib
+        if raw.lower() in {"q", "quit"}:
+            return None
+        if raw:
+            return raw
+        print("Enter a bib number, or q to quit.")
+
+
 def command_review_bib(args: argparse.Namespace) -> int:
     session_dir = resolve_evidence_session_from_args(args, "bib review")
     if session_dir is None:
         return 1
 
+    if not evidence_event_sources_for_session(session_dir):
+        print(f"no evidence event logs found under {session_dir}", file=sys.stderr)
+        return 1
+
+    mode = args.mode
+    if mode == "interactive" and interactive_mode_enabled(args):
+        current_bib = args.bib
+        print(f"Review session: {session_dir}")
+        print()
+        while True:
+            selected_bib = prompt_review_bib_value(current_bib)
+            if selected_bib is None:
+                return 0
+            current_bib = selected_bib
+            normalized_bib = normalize_bib_text(current_bib)
+            if not normalized_bib:
+                print(f"not a bib-like lookup value: {current_bib}", file=sys.stderr)
+                print()
+                continue
+            matches = load_evidence_matches_for_bib(session_dir, normalized_bib)
+            if not matches:
+                print(f"no evidence events found for bib {normalized_bib} in {session_dir}", file=sys.stderr)
+                print()
+                continue
+            for line in bib_match_summary_lines(session_dir, normalized_bib, matches):
+                print(line)
+            print()
+            while True:
+                options = [
+                    ("video-last", "Open last sighting in video"),
+                    ("video-best", "Open best evidence sighting"),
+                    ("frames", "Browse saved full frames"),
+                    ("summary", "Print recent evidence lines"),
+                    ("another", "Look up another bib"),
+                ]
+                chosen_mode = prompt_menu(
+                    "Review action",
+                    options,
+                    default_value="video-last",
+                    allow_cancel=True,
+                    cancel_label="Quit",
+                )
+                if chosen_mode is None:
+                    return 0
+                print()
+                if chosen_mode == "another":
+                    current_bib = None
+                    break
+                status = run_review_bib_action(
+                    args=args,
+                    session_dir=session_dir,
+                    normalized_bib=normalized_bib,
+                    matches=matches,
+                    mode=chosen_mode,
+                )
+                print()
+                if status != 0:
+                    return status
+        return 0
+    if mode == "interactive":
+        mode = "video-last"
+
+    if not args.bib:
+        print("review-bib requires a bib unless interactive prompts are enabled", file=sys.stderr)
+        return 1
+
     normalized_bib = normalize_bib_text(args.bib)
     if not normalized_bib:
         print(f"not a bib-like lookup value: {args.bib}", file=sys.stderr)
-        return 1
-
-    if not evidence_event_sources_for_session(session_dir):
-        print(f"no evidence event logs found under {session_dir}", file=sys.stderr)
         return 1
 
     matches = load_evidence_matches_for_bib(session_dir, normalized_bib)
@@ -2765,39 +2925,6 @@ def command_review_bib(args: argparse.Namespace) -> int:
     for line in bib_match_summary_lines(session_dir, normalized_bib, matches):
         print(line)
     print()
-
-    mode = args.mode
-    if mode == "interactive" and interactive_mode_enabled(args):
-        while True:
-            options = [
-                ("video-last", "Open last sighting in video"),
-                ("video-best", "Open best evidence sighting"),
-                ("frames", "Browse saved full frames"),
-                ("summary", "Print recent evidence lines"),
-            ]
-            chosen_mode = prompt_menu(
-                "Review action",
-                options,
-                default_value="video-last",
-                allow_cancel=True,
-                cancel_label="Quit",
-            )
-            if chosen_mode is None:
-                return 0
-            print()
-            status = run_review_bib_action(
-                args=args,
-                session_dir=session_dir,
-                normalized_bib=normalized_bib,
-                matches=matches,
-                mode=chosen_mode,
-            )
-            print()
-            if status != 0:
-                return status
-        return 0
-    if mode == "interactive":
-        mode = "video-last"
 
     return run_review_bib_action(
         args=args,
@@ -3530,7 +3657,11 @@ def build_parser() -> argparse.ArgumentParser:
         "review-bib",
         help="Open vision evidence for one bib in video or saved images.",
     )
-    review_bib.add_argument("bib", help="Bib number or PACER token to review.")
+    review_bib.add_argument(
+        "bib",
+        nargs="?",
+        help="Bib number or PACER token to review. Interactive mode can prompt for this.",
+    )
     review_bib.add_argument(
         "target",
         nargs="?",

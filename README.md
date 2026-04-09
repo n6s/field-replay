@@ -15,7 +15,7 @@ This trades some latency for a much more practical "rewind the tape" workflow.
 
 ## Requirements
 
-On a Debian or Ubuntu style Linux system, including Linux on a Chromebook, plan on these packages:
+On a Debian or Ubuntu style Linux system, plan on these packages:
 
 ```bash
 sudo apt update
@@ -37,14 +37,6 @@ What they are for:
 - `mpv`: optional alternate player
 - `vainfo`: checking video acceleration support
 - `usbutils`: identifying USB capture hardware with `lsusb`
-
-Notes for Linux on a Chromebook:
-
-- Hardware encoding may differ from your workstation, so `field-replay` should be allowed to fall back from `h264_nvenc` to another encoder like `libx264`.
-- USB device forwarding into the Linux environment can matter just as much as package installation.
-- Storage may be tighter, so using an external drive or a larger mounted path is often the right move for long events.
-- In our testing with Crostini, a USB HDMI capture dongle did not appear in the Linux USB-sharing UI and did not create any `/dev/video*` device nodes. As of April 7, 2026, Google documents that cameras are not yet supported for Linux on Chromebook, so a capture dongle may simply be unavailable there.
-- Practical takeaway: a Chromebook running Crostini is not a reliable target for USB capture-card recording right now. It may still be useful as a viewer, notes/logging machine, or remote terminal into a separate Linux recorder.
 
 ## Quick start
 
@@ -130,11 +122,11 @@ The vision commands default to the local Ollama model `gemma4:e2b`, ask for stri
 - `events.log`: human-readable lines that are easy to `tail -f`
 - `events.jsonl`: promoted vision sightings with timestamps and saved frame paths
 - `vision-debug.jsonl`: diagnostics showing the raw model response, promoted vs. suppressed bibs, and `elapsed_ms` timing for each sampled frame
-- `frames/`: saved full-frame grabs for promoted sightings only
+- `frames/`: saved full-frame grabs for promoted sightings only, with detected bibs labeled along the bottom for easier `eog` review
 
 By default, the same bib is only promoted once every 60 seconds. Sampled frames still go through the model and appear in `vision-debug.jsonl`, but only promoted sightings are kept in `frames/` and surfaced in `events.log`.
 
-`review-bib` gives you a simple menu to jump into video a couple seconds before the last or best sighting, or browse the saved full-frame grabs in an image viewer.
+`review-bib` gives you a simple menu to jump into video a couple seconds before the last or best sighting, browse the saved full-frame grabs in an image viewer, and keep looking up more bibs inside the same chosen session until you quit.
 
 ## Player behavior
 
@@ -171,7 +163,7 @@ This makes it easier to use the same script on:
 
 - a workstation with a large `/mnt/storage` partition
 - a laptop or mini PC
-- a Chromebook or Linux laptop writing to external storage
+- a Linux laptop writing to external storage
 
 `record` also places a simple lock file under the recordings root so two recorder processes cannot grab the same video or audio device at the same time.
 
