@@ -129,7 +129,7 @@ The vision commands ask a local Ollama model such as `gemma4:latest` for strict 
 
 - `events.log`: human-readable lines that are easy to `tail -f`
 - `events.jsonl`: promoted vision sightings with timestamps and saved frame paths
-- `vision-debug.jsonl`: diagnostics showing the raw model response for each sampled frame
+- `vision-debug.jsonl`: diagnostics showing the raw model response and `elapsed_ms` timing for each sampled frame
 - `frames/`: saved full-frame grabs used as evidence
 
 `review-bib` gives you a simple menu to jump into video a couple seconds before the last or best sighting, or browse the saved full-frame grabs in an image viewer.

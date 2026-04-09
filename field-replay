@@ -2130,6 +2130,7 @@ def process_vision_frame(
     keepalive: str,
 ) -> None:
     now = datetime.now().astimezone()
+    started_at = time.perf_counter()
     try:
         bibs, response_text = ask_ollama_for_bibs(
             image_path=frame_path,
@@ -2139,6 +2140,7 @@ def process_vision_frame(
             timeout_seconds=timeout_seconds,
             keepalive=keepalive,
         )
+        elapsed_ms = int(round((time.perf_counter() - started_at) * 1000))
         append_jsonl(
             runtime_paths["debug_log"],
             {
@@ -2146,6 +2148,7 @@ def process_vision_frame(
                 "t": round(offset_seconds, 1),
                 "model": model,
                 "frame": relative_to_session(frame_path, session_dir),
+                "elapsed_ms": elapsed_ms,
                 "response": response_text,
                 "bibs": bibs,
             },
@@ -2168,6 +2171,7 @@ def process_vision_frame(
             {
                 "w": event_wall_time(now),
                 "t": round(offset_seconds, 1),
+                "elapsed_ms": int(round((time.perf_counter() - started_at) * 1000)),
                 "error": str(exc),
             },
         )
