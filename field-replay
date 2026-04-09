@@ -35,6 +35,7 @@ DEFAULT_VIDEO_TIMESTAMP_ENABLED = True
 DEFAULT_VISION_MODEL = "gemma4:e2b"
 DEFAULT_VISION_SAMPLE_INTERVAL = 10.0
 DEFAULT_VISION_TAIL_OFFSET = 4.0
+DEFAULT_VISION_REPEAT_COOLDOWN = 60.0
 DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
 EXPORT_PRESETS = {
     "share-high": {
@@ -1946,6 +1947,7 @@ def vision_output_paths(vision_root: Path) -> dict[str, Path]:
     return {
         "root": vision_root,
         "frames_dir": vision_root / "frames",
+        "scratch_frame": vision_root / ".sample-frame.jpg",
         "debug_log": vision_root / "vision-debug.jsonl",
         "events_jsonl": vision_root / "events.jsonl",
         "events_log": vision_root / "events.log",
@@ -2079,6 +2081,13 @@ def normalize_vision_bibs(payload: dict) -> list[str]:
     return bibs
 
 
+def promoted_frame_path(
+    runtime_paths: dict[str, Path], offset_seconds: float
+) -> Path:
+    stamp = f"{int(round(offset_seconds * 10)):010d}"
+    return runtime_paths["frames_dir"] / f"frame-{stamp}.jpg"
+
+
 def ask_ollama_for_bibs(
     *,
     image_path: Path,
@@ -2135,9 +2144,12 @@ def process_vision_frame(
     prompt: str,
     timeout_seconds: float,
     keepalive: str,
+    repeat_cooldown_seconds: float,
+    last_promoted_by_bib: dict[str, float],
 ) -> list[dict]:
     now = datetime.now().astimezone()
     started_at = time.perf_counter()
+    frame_reference = relative_to_session(frame_path, session_dir)
     try:
         bibs, response_text = ask_ollama_for_bibs(
             image_path=frame_path,
@@ -2148,20 +2160,23 @@ def process_vision_frame(
             keepalive=keepalive,
         )
         elapsed_ms = int(round((time.perf_counter() - started_at) * 1000))
-        append_jsonl(
-            runtime_paths["debug_log"],
-            {
-                "w": event_wall_time(now),
-                "t": round(offset_seconds, 1),
-                "model": model,
-                "frame": relative_to_session(frame_path, session_dir),
-                "elapsed_ms": elapsed_ms,
-                "response": response_text,
-                "bibs": bibs,
-            },
-        )
         promoted: list[dict] = []
+        suppressed: list[str] = []
+        promoted_frame_reference: str | None = None
         for bib in bibs:
+            last_promoted_offset = last_promoted_by_bib.get(bib)
+            if (
+                repeat_cooldown_seconds > 0
+                and last_promoted_offset is not None
+                and (offset_seconds - last_promoted_offset) < repeat_cooldown_seconds
+            ):
+                suppressed.append(bib)
+                continue
+            if promoted_frame_reference is None:
+                saved_frame_path = promoted_frame_path(runtime_paths, offset_seconds)
+                ensure_directory(saved_frame_path.parent)
+                shutil.copy2(frame_path, saved_frame_path)
+                promoted_frame_reference = relative_to_session(saved_frame_path, session_dir)
             payload = {
                 "t": round(offset_seconds, 1),
                 "w": event_wall_time(now),
@@ -2169,11 +2184,27 @@ def process_vision_frame(
                 "b": bib,
                 "s": "vision",
                 "m": model,
-                "f": relative_to_session(frame_path, session_dir),
+                "f": promoted_frame_reference,
             }
             append_jsonl(runtime_paths["events_jsonl"], payload)
             append_text_line(runtime_paths["events_log"], vision_event_log_line(payload))
             promoted.append(payload)
+            last_promoted_by_bib[bib] = offset_seconds
+        append_jsonl(
+            runtime_paths["debug_log"],
+            {
+                "w": event_wall_time(now),
+                "t": round(offset_seconds, 1),
+                "model": model,
+                "frame": frame_reference,
+                "elapsed_ms": elapsed_ms,
+                "response": response_text,
+                "bibs": bibs,
+                "promoted": [payload["b"] for payload in promoted],
+                "suppressed": suppressed,
+                "repeat_cooldown_s": repeat_cooldown_seconds,
+            },
+        )
         return promoted
     except RuntimeError as exc:
         append_jsonl(
@@ -2181,6 +2212,7 @@ def process_vision_frame(
             {
                 "w": event_wall_time(now),
                 "t": round(offset_seconds, 1),
+                "frame": frame_reference,
                 "elapsed_ms": int(round((time.perf_counter() - started_at) * 1000)),
                 "error": str(exc),
             },
@@ -2392,7 +2424,7 @@ def command_vision_scan(args: argparse.Namespace) -> int:
     runtime_paths = vision_output_paths(output_root)
     for key in ("root", "frames_dir"):
         ensure_directory(runtime_paths[key])
-    for key in ("events_jsonl", "events_log", "debug_log"):
+    for key in ("events_jsonl", "events_log", "debug_log", "scratch_frame"):
         try:
             runtime_paths[key].unlink()
         except FileNotFoundError:
@@ -2411,31 +2443,33 @@ def command_vision_scan(args: argparse.Namespace) -> int:
     print(f"Vision output dir:  {output_root}")
     print(f"Vision model:       {args.model}")
     print(f"Samples:            {len(sample_points)}")
+    print(f"Repeat cooldown:    {args.repeat_cooldown:.0f}s")
     if args.dry_run:
         for offset_seconds in sample_points:
             print(f"  sample {format_duration(offset_seconds)}")
         return 0
 
+    last_promoted_by_bib: dict[str, float] = {}
     for offset_seconds in sample_points:
-        stamp = f"{int(round(offset_seconds * 10)):010d}"
-        frame_path = runtime_paths["frames_dir"] / f"frame-{stamp}.jpg"
         try:
             extract_frame_at_time(
                 ffmpeg_path,
                 source.source_path,
                 offset_seconds,
-                frame_path,
+                runtime_paths["scratch_frame"],
             )
             process_vision_frame(
                 runtime_paths=runtime_paths,
                 session_dir=source.session_dir,
-                frame_path=frame_path,
+                frame_path=runtime_paths["scratch_frame"],
                 offset_seconds=offset_seconds,
                 model=args.model,
                 ollama_host=args.ollama_host,
                 prompt=prompt,
                 timeout_seconds=args.timeout,
                 keepalive=args.keepalive,
+                repeat_cooldown_seconds=args.repeat_cooldown,
+                last_promoted_by_bib=last_promoted_by_bib,
             )
         except RuntimeError as exc:
             append_jsonl(
@@ -2443,6 +2477,9 @@ def command_vision_scan(args: argparse.Namespace) -> int:
                 {
                     "w": event_wall_time(datetime.now().astimezone()),
                     "t": round(offset_seconds, 1),
+                    "frame": relative_to_session(
+                        runtime_paths["scratch_frame"], source.session_dir
+                    ),
                     "error": str(exc),
                 },
             )
@@ -2484,6 +2521,10 @@ def command_vision_live(args: argparse.Namespace) -> int:
     runtime_paths = vision_output_paths(output_root)
     for key in ("root", "frames_dir"):
         ensure_directory(runtime_paths[key])
+    try:
+        runtime_paths["scratch_frame"].unlink()
+    except FileNotFoundError:
+        pass
 
     config["last_session_dir"] = str(session_dir)
     save_config(config_path, config)
@@ -2492,10 +2533,12 @@ def command_vision_live(args: argparse.Namespace) -> int:
     timeshift_path = session_dir / DEFAULT_TIMESHIFT_NAME
     processed_offsets: set[float] = set()
     sample_count = 0
+    last_promoted_by_bib: dict[str, float] = {}
 
     print(f"Vision live session: {session_dir}")
     print(f"Vision output dir:   {output_root}")
     print(f"Vision model:        {args.model}")
+    print(f"Repeat cooldown:     {args.repeat_cooldown:.0f}s")
     print("Sampling is model-paced; press Ctrl+C to stop.")
 
     while True:
@@ -2522,26 +2565,25 @@ def command_vision_live(args: argparse.Namespace) -> int:
             time.sleep(args.idle_sleep)
             continue
 
-        frame_path = runtime_paths["frames_dir"] / (
-            f"frame-{int(round(offset_seconds * 10)):010d}.jpg"
-        )
         try:
             extract_frame_at_time(
                 ffmpeg_path,
                 timeshift_path,
                 offset_seconds,
-                frame_path,
+                runtime_paths["scratch_frame"],
             )
             promoted = process_vision_frame(
                 runtime_paths=runtime_paths,
                 session_dir=session_dir,
-                frame_path=frame_path,
+                frame_path=runtime_paths["scratch_frame"],
                 offset_seconds=offset_seconds,
                 model=args.model,
                 ollama_host=args.ollama_host,
                 prompt=prompt,
                 timeout_seconds=args.timeout,
                 keepalive=args.keepalive,
+                repeat_cooldown_seconds=args.repeat_cooldown,
+                last_promoted_by_bib=last_promoted_by_bib,
             )
             for payload in promoted:
                 print(vision_event_log_line(payload), flush=True)
@@ -2553,6 +2595,7 @@ def command_vision_live(args: argparse.Namespace) -> int:
                 {
                     "w": event_wall_time(datetime.now().astimezone()),
                     "t": rounded_offset,
+                    "frame": relative_to_session(runtime_paths["scratch_frame"], session_dir),
                     "error": str(exc),
                 },
             )
@@ -3350,6 +3393,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Seconds to wait for each Ollama response.",
     )
     vision_scan.add_argument(
+        "--repeat-cooldown",
+        type=float,
+        default=DEFAULT_VISION_REPEAT_COOLDOWN,
+        help="Minimum seconds before the same bib is promoted again.",
+    )
+    vision_scan.add_argument(
         "--keepalive",
         default="5m",
         help="How long Ollama should keep the model loaded between frames.",
@@ -3412,6 +3461,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=120.0,
         help="Seconds to wait for each Ollama response.",
+    )
+    vision_live.add_argument(
+        "--repeat-cooldown",
+        type=float,
+        default=DEFAULT_VISION_REPEAT_COOLDOWN,
+        help="Minimum seconds before the same bib is promoted again.",
     )
     vision_live.add_argument(
         "--keepalive",

@@ -123,14 +123,16 @@ There is an experimental Ollama vision sidecar for bib detection. It runs indepe
 ./field-replay review-bib 241
 ```
 
-`vision-live` follows a growing session in a model-paced loop: it grabs one frame from a few seconds behind live, waits for the local model response, then grabs the next available frame. `vision-scan` samples a saved session or media file for offline testing.
+`vision-live` follows a growing session in a model-paced loop: it grabs one frame from a few seconds behind live, waits for the local model response, then grabs the next available frame. Promoted sightings are also printed to stdout so the live terminal can be used like a bib tail. `vision-scan` samples a saved session or media file for offline testing.
 
 The vision commands default to the local Ollama model `gemma4:e2b`, ask for strict JSON bib guesses, and write these files under `vision-live/` or `vision-scan/`:
 
 - `events.log`: human-readable lines that are easy to `tail -f`
 - `events.jsonl`: promoted vision sightings with timestamps and saved frame paths
-- `vision-debug.jsonl`: diagnostics showing the raw model response and `elapsed_ms` timing for each sampled frame
-- `frames/`: saved full-frame grabs used as evidence
+- `vision-debug.jsonl`: diagnostics showing the raw model response, promoted vs. suppressed bibs, and `elapsed_ms` timing for each sampled frame
+- `frames/`: saved full-frame grabs for promoted sightings only
+
+By default, the same bib is only promoted once every 60 seconds. Sampled frames still go through the model and appear in `vision-debug.jsonl`, but only promoted sightings are kept in `frames/` and surfaced in `events.log`.
 
 `review-bib` gives you a simple menu to jump into video a couple seconds before the last or best sighting, or browse the saved full-frame grabs in an image viewer.
 

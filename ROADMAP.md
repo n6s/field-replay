@@ -18,6 +18,7 @@ These notes are not commitments. They are a backlog of ideas that seem useful in
 - Jump-to-review: selecting a bib opens the player a couple seconds before the sighting.
 - Annotated review overlay: draw green bounding boxes around detected bibs during playback or clip export.
 - Bottom-bar labels: list detected bibs near the timestamp area and draw pointer lines back to their bounding boxes for easier multi-runner review.
+- Annotated evidence frames: export promoted stills with the timestamp strip plus detected bib numbers burned into the bottom row for quick `eog` review.
 - Group clustering: treat nearby detections as one departure pack so volunteers can compare "what I wrote down" versus "what the system saw."
 - Verification states: mark detections as `unreviewed`, `confirmed`, `rejected`, or `manual-only`.
 - Contact-sheet style review: browse saved frame grabs for one bib or one group without opening full video.
@@ -25,6 +26,7 @@ These notes are not commitments. They are a backlog of ideas that seem useful in
 ## Detection and evidence sources
 
 - AI vision sidecar: continue developing the model-paced Ollama loop that grabs one frame behind live, asks a local image-capable model like `gemma4:e2b` to return bib guesses as strict JSON, then grabs the next frame only after the model responds.
+- Promotion controls: keep every sampled frame and raw response in diagnostics, but only promote first sightings or cooldown-expired repeats into the operator-facing event log and review frame folder.
 - Vision prompt and preprocessing experiments: tune prompts, frame scaling, contrast, and region-of-interest sampling to improve small or low-contrast bib reads.
 - Audio callouts: optional speech-to-text for bib numbers called out by volunteers or radio operators.
 - RFID ingest: if a reader and tag-to-bib lookup table exist, log RFID detections into the same event timeline.
