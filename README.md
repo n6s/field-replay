@@ -22,7 +22,7 @@ What is working well right now:
 - near-live VLC playback with practical rewind behavior
 - local Ollama vision support for bib detection
 - promoted evidence logs plus saved frame grabs
-- `find-bib` and `review-bib` for post-hoc lookup
+- `find-bib` and `review` for post-hoc lookup
 
 What to treat as current assumptions:
 
@@ -163,15 +163,15 @@ Live follow:
 
 ```bash
 ./field-replay find-bib 241
-./field-replay review-bib 241
+./field-replay review 241
 ```
 
-`review-bib` is designed for repeated use inside one chosen session:
+`review` is designed for repeated use inside one chosen session:
 
 - browse saved full frames in `eog`
 - jump to first or last sightings in VLC when useful
 - print recent evidence lines
-- use `review-bib all` to browse the whole promoted frame collection for a session
+- use `review all` to browse the whole promoted frame collection for a session
 - type another bib directly at the action prompt without restarting the command
 
 ### 7. Export a share-friendly copy
@@ -279,7 +279,7 @@ If `h264_nvenc` is unavailable, the tool falls back to another available encoder
 ./field-replay watch
 ./field-replay vision-live
 ./field-replay find-bib 241
-./field-replay review-bib 241
+./field-replay review 241
 ./field-replay export
 ```
 
