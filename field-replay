@@ -25,6 +25,9 @@ DEFAULT_CONFIG_PATH = Path("~/.config/field-replay/config.json").expanduser()
 DEFAULT_SESSION_PREFIX = "run"
 DEFAULT_TIMESHIFT_NAME = "timeshift.ts"
 DEFAULT_ARCHIVE_STEM = "archive"
+DEFAULT_SOURCE_TYPE = "v4l2"
+SOURCE_TYPES = ("v4l2", "rtsp")
+DEFAULT_RTSP_TRANSPORT = "tcp"
 DEFAULT_ENCODER = "h264_nvenc"
 DEFAULT_VIDEO_INPUT_FORMAT = "auto"
 DEFAULT_AUDIO_GAIN_DB = -6.0
@@ -114,6 +117,41 @@ class ExportSource:
     session_dir: Path
     source_path: Path
     source_label: str
+
+
+def source_type_value(args: argparse.Namespace | dict) -> str:
+    if isinstance(args, dict):
+        return str(args.get("source_type", DEFAULT_SOURCE_TYPE))
+    return str(getattr(args, "source_type", DEFAULT_SOURCE_TYPE))
+
+
+def is_rtsp_source(args: argparse.Namespace | dict) -> bool:
+    return source_type_value(args) == "rtsp"
+
+
+def source_reference(args: argparse.Namespace | dict) -> str:
+    if isinstance(args, dict):
+        if is_rtsp_source(args):
+            return str(args.get("rtsp_url", "")).strip()
+        return str(args.get("device", "")).strip()
+    if is_rtsp_source(args):
+        return str(getattr(args, "rtsp_url", "")).strip()
+    return str(getattr(args, "device", "")).strip()
+
+
+def source_display_label(args: argparse.Namespace | dict) -> str:
+    source = source_reference(args) or "unknown"
+    if is_rtsp_source(args):
+        return f"RTSP {source}"
+    return source
+
+
+def uses_alsa_audio_input(args: argparse.Namespace | dict) -> bool:
+    if isinstance(args, dict):
+        audio_enabled = bool(args.get("audio", True))
+    else:
+        audio_enabled = bool(getattr(args, "audio", True))
+    return audio_enabled and not is_rtsp_source(args)
 
 
 def default_session_name(prefix: str) -> str:
@@ -400,30 +438,36 @@ def build_ffmpeg_command(paths: SessionPaths, args: argparse.Namespace) -> list[
         str(args.thread_queue_size),
         "-fflags",
         "+genpts",
-        "-f",
-        "v4l2",
-        "-framerate",
-        str(args.framerate),
-        "-video_size",
-        args.video_size,
     ]
 
-    if args.video_input_format != DEFAULT_VIDEO_INPUT_FORMAT:
-        command.extend(["-input_format", args.video_input_format])
-
-    if args.timestamp_source == "device":
-        command.extend(["-timestamps", args.timestamps])
-    else:
+    if is_rtsp_source(args):
         command.extend(["-use_wallclock_as_timestamps", "1"])
+        if args.rtsp_transport != "auto":
+            command.extend(["-rtsp_transport", args.rtsp_transport])
+        command.extend(["-i", args.rtsp_url])
+    else:
+        command.extend(
+            [
+                "-f",
+                "v4l2",
+                "-framerate",
+                str(args.framerate),
+                "-video_size",
+                args.video_size,
+            ]
+        )
 
-    command.extend(
-        [
-            "-i",
-            args.device,
-        ]
-    )
+        if args.video_input_format != DEFAULT_VIDEO_INPUT_FORMAT:
+            command.extend(["-input_format", args.video_input_format])
 
-    if args.audio:
+        if args.timestamp_source == "device":
+            command.extend(["-timestamps", args.timestamps])
+        else:
+            command.extend(["-use_wallclock_as_timestamps", "1"])
+
+        command.extend(["-i", args.device])
+
+    if uses_alsa_audio_input(args):
         command.extend(
             [
                 "-thread_queue_size",
@@ -449,7 +493,10 @@ def build_ffmpeg_command(paths: SessionPaths, args: argparse.Namespace) -> list[
     )
 
     if args.audio:
-        command.extend(["-map", "1:a:0"])
+        if is_rtsp_source(args):
+            command.extend(["-map", "0:a:0?"])
+        else:
+            command.extend(["-map", "1:a:0"])
 
     command.extend(
         [
@@ -1191,6 +1238,37 @@ def select_video_device(current_device: str) -> str:
     return choice
 
 
+def select_source_type(current_source_type: str) -> str:
+    options = [
+        ("v4l2", "Linux video device (/dev/video*)"),
+        ("rtsp", "RTSP network stream"),
+    ]
+    return (
+        prompt_menu("Capture source type", options, default_value=current_source_type)
+        or current_source_type
+    )
+
+
+def select_rtsp_url(current_url: str) -> str:
+    while True:
+        value = prompt_text("RTSP URL", current_url).strip()
+        if value:
+            return value
+        print("RTSP URL cannot be blank.")
+
+
+def select_rtsp_transport(current_transport: str) -> str:
+    options = [
+        ("tcp", "TCP (recommended)"),
+        ("udp", "UDP"),
+        ("auto", "Auto / let FFmpeg decide"),
+    ]
+    return (
+        prompt_menu("RTSP transport", options, default_value=current_transport)
+        or current_transport
+    )
+
+
 def select_audio_source(audio_enabled: bool, current_device: str) -> tuple[bool, str]:
     devices = list_alsa_capture_devices()
     options: list[tuple[str, str]] = [("__none__", "No audio")]
@@ -1348,7 +1426,10 @@ def configure_vision_profile_interactively(
 
 def profile_from_args(args: argparse.Namespace) -> dict:
     return {
+        "source_type": args.source_type,
         "device": args.device,
+        "rtsp_url": args.rtsp_url,
+        "rtsp_transport": args.rtsp_transport,
         "video_input_format": args.video_input_format,
         "audio": args.audio,
         "audio_device": args.audio_device,
@@ -1367,30 +1448,43 @@ def profile_summary_lines(profile_name: str, profile: dict) -> list[str]:
     recordings_dir = Path(
         profile.get("recordings_dir", str(DEFAULT_RECORDINGS_DIR))
     ).expanduser()
+    source_label = source_display_label(profile)
+    audio_label = (
+        profile.get("audio_device", "disabled")
+        if uses_alsa_audio_input(profile)
+        else ("embedded stream audio" if profile.get("audio", True) else "disabled")
+    )
+    mode_label = (
+        f"{profile.get('video_size', 'source native')} @ {profile.get('framerate', '?')} fps"
+        if not is_rtsp_source(profile)
+        else (
+            f"target {profile.get('framerate', '?')} fps"
+            if profile.get("framerate")
+            else "stream paced"
+        )
+    )
     return [
         f"Quick start: {profile_name}",
-        f"  Video:   {profile.get('device', 'unknown')}",
+        f"  Source:  {source_label}",
+        f"  Type:    {source_type_value(profile)}",
         f"  Format:  {profile.get('video_input_format', DEFAULT_VIDEO_INPUT_FORMAT)}",
-        (
-            "  Mode:    "
-            f"{profile.get('video_size', 'unknown')} @ {profile.get('framerate', '?')} fps"
-        ),
-        (
-            "  Audio:   "
-            f"{profile.get('audio_device', 'disabled') if profile.get('audio', True) else 'disabled'}"
-        ),
-        (
-            "  Audio gain: "
-            f"{profile.get('audio_gain_db', DEFAULT_AUDIO_GAIN_DB):g} dB"
-        ),
+        f"  Mode:    {mode_label}",
+        f"  Audio:   {audio_label}",
+        f"  Audio gain: {profile.get('audio_gain_db', DEFAULT_AUDIO_GAIN_DB):g} dB",
         f"  Storage: {storage_summary(recordings_dir)}",
     ]
 
 
 def profile_menu_label(profile_name: str, profile: dict) -> str:
-    details = [profile.get("device", "unknown device")]
-    if profile.get("video_size") and profile.get("framerate"):
+    details = [source_display_label(profile)]
+    if (
+        not is_rtsp_source(profile)
+        and profile.get("video_size")
+        and profile.get("framerate")
+    ):
         details.append(f"{profile['video_size']} @ {profile['framerate']} fps")
+    elif is_rtsp_source(profile) and profile.get("rtsp_transport"):
+        details.append(f"{profile['rtsp_transport']} transport")
     recordings_dir = profile.get("recordings_dir")
     if recordings_dir:
         details.append(str(Path(recordings_dir).expanduser()))
@@ -1398,7 +1492,12 @@ def profile_menu_label(profile_name: str, profile: dict) -> str:
 
 
 def apply_profile(args: argparse.Namespace, profile: dict) -> None:
+    args.source_type = profile.get("source_type", getattr(args, "source_type", DEFAULT_SOURCE_TYPE))
     args.device = profile.get("device", args.device)
+    args.rtsp_url = profile.get("rtsp_url", getattr(args, "rtsp_url", ""))
+    args.rtsp_transport = profile.get(
+        "rtsp_transport", getattr(args, "rtsp_transport", DEFAULT_RTSP_TRANSPORT)
+    )
     args.video_input_format = profile.get(
         "video_input_format", args.video_input_format
     )
@@ -1456,9 +1555,20 @@ def configure_record_interactively(
         config["last_profile"] = selected_profile_name
 
     print()
-    args.device = select_video_device(args.device)
+    args.source_type = select_source_type(args.source_type)
     print()
-    args.audio, args.audio_device = select_audio_source(args.audio, args.audio_device)
+    if is_rtsp_source(args):
+        args.rtsp_url = select_rtsp_url(args.rtsp_url)
+        print()
+        args.rtsp_transport = select_rtsp_transport(args.rtsp_transport)
+        print()
+        args.audio = prompt_yes_no(
+            "Capture embedded stream audio if present?", default=args.audio
+        )
+    else:
+        args.device = select_video_device(args.device)
+        print()
+        args.audio, args.audio_device = select_audio_source(args.audio, args.audio_device)
     print()
     if args.audio:
         args.audio_gain_db = prompt_float("Audio gain (dB)", args.audio_gain_db)
@@ -1467,11 +1577,17 @@ def configure_record_interactively(
 
     print()
     print("Recording summary")
-    print(f"  Video:   {args.device}")
+    print(f"  Source:  {source_display_label(args)}")
+    print(f"  Type:    {args.source_type}")
+    if is_rtsp_source(args):
+        print(f"  RTSP:    {args.rtsp_transport}")
     print(
         f"  Format:  {args.video_input_format if args.video_input_format != DEFAULT_VIDEO_INPUT_FORMAT else 'auto'}"
     )
-    print(f"  Audio:   {args.audio_device if args.audio else 'disabled'}")
+    if uses_alsa_audio_input(args):
+        print(f"  Audio:   {args.audio_device}")
+    else:
+        print(f"  Audio:   {'embedded stream audio' if args.audio else 'disabled'}")
     if args.audio:
         print(f"  Gain:    {args.audio_gain_db:g} dB")
     print(f"  Storage: {storage_summary(args.recordings_dir)}")
@@ -1533,15 +1649,31 @@ def command_setup(args: argparse.Namespace) -> int:
 
     if interactive_mode_enabled(args):
         print()
-        args.device = select_video_device(args.device)
+        args.source_type = select_source_type(args.source_type)
         print()
-        args.audio, args.audio_device = select_audio_source(args.audio, args.audio_device)
+        if is_rtsp_source(args):
+            args.rtsp_url = select_rtsp_url(args.rtsp_url)
+            print()
+            args.rtsp_transport = select_rtsp_transport(args.rtsp_transport)
+            print()
+            args.audio = prompt_yes_no(
+                "Capture embedded stream audio if present?", default=args.audio
+            )
+        else:
+            args.device = select_video_device(args.device)
+            print()
+            args.audio, args.audio_device = select_audio_source(args.audio, args.audio_device)
         print()
         if args.audio:
             args.audio_gain_db = prompt_float("Audio gain (dB)", args.audio_gain_db)
             print()
         args.recordings_dir = select_storage_path(args.recordings_dir.expanduser())
         print()
+
+    source_error = validate_source_args(args)
+    if source_error:
+        print(source_error, file=sys.stderr)
+        return 1
 
     ffmpeg_path, supported_encoders = detect_supported_encoders(args.ffmpeg_bin)
     resolved_encoder = resolve_encoder(ffmpeg_path, supported_encoders, args.encoder)
@@ -1553,70 +1685,88 @@ def command_setup(args: argparse.Namespace) -> int:
             print(f"ffmpeg binary not found: {args.ffmpeg_bin}", file=sys.stderr)
             return 1
 
-        print(f"Probing video modes for {args.device}...")
-        selected_size, selected_fps, selected_format, video_results, video_failure = choose_video_profile_settings(
-            ffmpeg_path,
-            args.device,
-            args.video_size,
-            args.framerate,
-            args.video_input_format,
-            stop_on_exact=not interactive_mode_enabled(args),
-        )
-        if video_results:
-            if interactive_mode_enabled(args):
-                chosen_result = choose_video_probe_result(
-                    video_results,
-                    current_size=args.video_size,
-                    current_fps=args.framerate,
-                    current_input_format=args.video_input_format,
-                )
-                if chosen_result:
-                    args.video_size = chosen_result["actual_size"]
-                    args.framerate = int(round(chosen_result["actual_fps"]))
-                    args.video_input_format = chosen_result["input_format"]
+        if is_rtsp_source(args):
+            print(
+                "RTSP source probing is not implemented yet. Keeping the configured stream settings."
+            )
+        else:
+            print(f"Probing video modes for {args.device}...")
+            selected_size, selected_fps, selected_format, video_results, video_failure = choose_video_profile_settings(
+                ffmpeg_path,
+                args.device,
+                args.video_size,
+                args.framerate,
+                args.video_input_format,
+                stop_on_exact=not interactive_mode_enabled(args),
+            )
+            if video_results:
+                if interactive_mode_enabled(args):
+                    chosen_result = choose_video_probe_result(
+                        video_results,
+                        current_size=args.video_size,
+                        current_fps=args.framerate,
+                        current_input_format=args.video_input_format,
+                    )
+                    if chosen_result:
+                        args.video_size = chosen_result["actual_size"]
+                        args.framerate = int(round(chosen_result["actual_fps"]))
+                        args.video_input_format = chosen_result["input_format"]
+                    else:
+                        args.video_size = selected_size
+                        args.framerate = selected_fps
+                        args.video_input_format = selected_format
                 else:
+                    print_video_probe_results(video_results)
                     args.video_size = selected_size
                     args.framerate = selected_fps
                     args.video_input_format = selected_format
             else:
-                print_video_probe_results(video_results)
-                args.video_size = selected_size
-                args.framerate = selected_fps
-                args.video_input_format = selected_format
-        else:
-            print("Video probe did not find a better mode. Keeping current defaults.")
-            if video_failure:
-                print(f"  Probe detail: {video_failure}")
+                print("Video probe did not find a better mode. Keeping current defaults.")
+                if video_failure:
+                    print(f"  Probe detail: {video_failure}")
 
-        if args.audio:
-            print()
-            print(f"Probing audio input modes for {args.audio_device}...")
-            input_rate, input_channels, audio_results, audio_failure = choose_audio_profile_settings(
-                ffmpeg_path, args.audio_device, args.audio_input_rate, args.audio_input_channels
-            )
-            if audio_results:
-                print_audio_probe_results(audio_results)
-                args.audio_input_rate = input_rate
-                args.audio_input_channels = input_channels
-            else:
-                print("Audio probe did not find a working input mode. Audio will stay as configured.")
-                if audio_failure:
-                    print(f"  Probe detail: {audio_failure}")
+            if args.audio:
+                print()
+                print(f"Probing audio input modes for {args.audio_device}...")
+                input_rate, input_channels, audio_results, audio_failure = choose_audio_profile_settings(
+                    ffmpeg_path, args.audio_device, args.audio_input_rate, args.audio_input_channels
+                )
+                if audio_results:
+                    print_audio_probe_results(audio_results)
+                    args.audio_input_rate = input_rate
+                    args.audio_input_channels = input_channels
+                else:
+                    print("Audio probe did not find a working input mode. Audio will stay as configured.")
+                    if audio_failure:
+                        print(f"  Probe detail: {audio_failure}")
 
         print()
 
     print("Setup summary")
-    print(f"  Video device:      {args.device}")
+    print(f"  Source type:       {args.source_type}")
+    print(f"  Video source:      {source_display_label(args)}")
+    if is_rtsp_source(args):
+        print(f"  RTSP transport:    {args.rtsp_transport}")
     print(
         f"  Video input fmt:   {args.video_input_format if args.video_input_format != DEFAULT_VIDEO_INPUT_FORMAT else 'auto'}"
     )
-    print(f"  Video mode:        {args.video_size} @ {args.framerate} fps")
-    print(f"  Audio device:      {args.audio_device if args.audio else 'disabled'}")
-    if args.audio:
+    if is_rtsp_source(args):
+        print(f"  Output pacing:     target {args.framerate} fps")
+    else:
+        print(f"  Video mode:        {args.video_size} @ {args.framerate} fps")
+    if uses_alsa_audio_input(args):
+        print(f"  Audio device:      {args.audio_device}")
         print(
             f"  Audio input mode:  {args.audio_input_rate} Hz, {args.audio_input_channels} channel(s)"
         )
         print(f"  Audio gain:        {args.audio_gain_db:g} dB")
+    else:
+        print(
+            "  Audio source:      "
+            f"{'embedded stream audio' if args.audio else 'disabled'}"
+        )
+        if args.audio:
+            print(f"  Audio gain:        {args.audio_gain_db:g} dB")
     print(f"  Storage:           {storage_summary(args.recordings_dir)}")
     print(f"  Video encoder:     {args.encoder}")
     print(
@@ -1897,8 +2047,9 @@ def lock_pid_is_active(lock_path: Path) -> bool:
 def acquire_device_locks(recordings_dir: Path, args: argparse.Namespace, session_name: str) -> list[Path]:
     lock_dir = recordings_dir / ".locks"
     ensure_directory(lock_dir)
-    lock_specs = [(lock_name("video", args.device), args.device)]
-    if args.audio:
+    primary_source = source_reference(args) or source_display_label(args)
+    lock_specs = [(lock_name(args.source_type, primary_source), primary_source)]
+    if uses_alsa_audio_input(args):
         lock_specs.append((lock_name("audio", args.audio_device), args.audio_device))
 
     acquired: list[Path] = []
@@ -2008,7 +2159,12 @@ def write_metadata(
         "session_dir": str(paths.session_dir),
         "archive_path": str(paths.archive_path),
         "timeshift_path": str(paths.timeshift_path),
+        "source_type": args.source_type,
+        "source": source_reference(args),
+        "source_label": source_display_label(args),
         "device": args.device,
+        "rtsp_url": args.rtsp_url,
+        "rtsp_transport": args.rtsp_transport,
         "audio_enabled": args.audio,
         "audio_device": args.audio_device,
         "audio_channels": args.audio_channels,
@@ -2787,6 +2943,11 @@ def run_record_command(args: argparse.Namespace, *, launch_player: bool = False)
                 return 0
             print()
             save_config(config_path, config)
+
+    source_error = validate_source_args(args)
+    if source_error:
+        print(source_error, file=sys.stderr)
+        return 1
 
     ffmpeg_path, supported_encoders = detect_supported_encoders(args.ffmpeg_bin)
     if not ffmpeg_path:
@@ -3777,6 +3938,20 @@ def check_ffmpeg_support(ffmpeg_bin: str) -> tuple[str | None, bool]:
     )
 
 
+def validate_source_args(args: argparse.Namespace) -> str | None:
+    if is_rtsp_source(args) and not args.rtsp_url.strip():
+        return "RTSP source type requires --rtsp-url"
+    return None
+
+
+def source_readiness(args: argparse.Namespace) -> tuple[bool, str]:
+    if is_rtsp_source(args):
+        source = args.rtsp_url.strip()
+        return bool(source), f"{source or '(missing)'} ({'configured' if source else 'missing'})"
+    device_exists = Path(args.device).exists()
+    return device_exists, f"{args.device} ({'ok' if device_exists else 'missing'})"
+
+
 def command_doctor(args: argparse.Namespace) -> int:
     ffmpeg_path, supported_encoders = detect_supported_encoders(args.ffmpeg_bin)
     has_nvenc = bool(
@@ -3786,21 +3961,26 @@ def command_doctor(args: argparse.Namespace) -> int:
     )
     resolved_encoder = resolve_encoder(ffmpeg_path, supported_encoders, args.encoder)
     player = choose_player(args.player)
-    device_exists = Path(args.device).exists()
-    audio_ok = alsa_device_exists(args.audio_device) if args.audio else True
+    source_ok, source_status = source_readiness(args)
+    if uses_alsa_audio_input(args):
+        audio_ok = alsa_device_exists(args.audio_device)
+        audio_status = f"{args.audio_device} ({'ok' if audio_ok else 'missing'})"
+    else:
+        audio_ok = True
+        audio_status = "embedded stream audio (connectivity not checked)" if args.audio else "disabled"
 
     print(f"ffmpeg:   {ffmpeg_path or 'missing'}")
     print(f"nvenc:    {'yes' if has_nvenc else 'no'}")
     print(f"encoder:  {resolved_encoder or 'missing'}")
     print(f"player:   {player or 'missing'}")
-    print(f"device:   {args.device} ({'ok' if device_exists else 'missing'})")
-    print(
-        f"audio:    {args.audio_device if args.audio else 'disabled'} "
-        f"({'ok' if audio_ok else 'missing'})"
-    )
+    print(f"type:     {args.source_type}")
+    print(f"source:   {source_status}")
+    if is_rtsp_source(args):
+        print(f"rtsp:     transport={args.rtsp_transport}")
+    print(f"audio:    {audio_status}")
     print(f"outputs:  {args.recordings_dir.expanduser()}")
 
-    if not ffmpeg_path or not resolved_encoder or not device_exists or not audio_ok:
+    if not ffmpeg_path or not resolved_encoder or not source_ok or not audio_ok:
         return 1
     return 0
 
@@ -3808,7 +3988,24 @@ def command_doctor(args: argparse.Namespace) -> int:
 def add_record_arguments(
     parser: argparse.ArgumentParser, *, include_player_options: bool = False
 ) -> None:
+    parser.add_argument(
+        "--source-type",
+        choices=SOURCE_TYPES,
+        default=DEFAULT_SOURCE_TYPE,
+        help="Capture source type. Defaults to %(default)s.",
+    )
     parser.add_argument("--device", default="/dev/video2", help="Video device path.")
+    parser.add_argument(
+        "--rtsp-url",
+        default="",
+        help="RTSP URL when --source-type=rtsp.",
+    )
+    parser.add_argument(
+        "--rtsp-transport",
+        choices=("tcp", "udp", "auto"),
+        default=DEFAULT_RTSP_TRANSPORT,
+        help="Preferred RTSP transport when --source-type=rtsp.",
+    )
     parser.add_argument(
         "--video-input-format",
         default=DEFAULT_VIDEO_INPUT_FORMAT,
@@ -3818,12 +4015,12 @@ def add_record_arguments(
         "--audio",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Capture audio from the USB capture device.",
+        help="Capture audio from the selected source.",
     )
     parser.add_argument(
         "--audio-device",
         default="hw:Capture,0",
-        help="ALSA capture device. Default matches the MACROSILICON USB audio card.",
+        help="ALSA capture device for V4L2 sources. Default matches the MACROSILICON USB audio card.",
     )
     parser.add_argument(
         "--audio-input-rate",
@@ -3955,7 +4152,7 @@ def add_record_arguments(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Record a capture card with ffmpeg and watch the latest session like a DVR."
+        description="Record a local capture device or RTSP stream with ffmpeg and watch the latest session like a DVR."
     )
     parser.add_argument(
         "--recordings-dir",
@@ -3985,7 +4182,24 @@ def build_parser() -> argparse.ArgumentParser:
         "setup",
         help="Save or update a reusable recording profile with probed settings.",
     )
+    setup.add_argument(
+        "--source-type",
+        choices=SOURCE_TYPES,
+        default=DEFAULT_SOURCE_TYPE,
+        help="Capture source type. Defaults to %(default)s.",
+    )
     setup.add_argument("--device", default="/dev/video2", help="Video device path.")
+    setup.add_argument(
+        "--rtsp-url",
+        default="",
+        help="RTSP URL when --source-type=rtsp.",
+    )
+    setup.add_argument(
+        "--rtsp-transport",
+        choices=("tcp", "udp", "auto"),
+        default=DEFAULT_RTSP_TRANSPORT,
+        help="Preferred RTSP transport when --source-type=rtsp.",
+    )
     setup.add_argument(
         "--video-input-format",
         default=DEFAULT_VIDEO_INPUT_FORMAT,
@@ -4000,7 +4214,7 @@ def build_parser() -> argparse.ArgumentParser:
     setup.add_argument(
         "--audio-device",
         default="hw:Capture,0",
-        help="ALSA capture device for the saved setup.",
+        help="ALSA capture device for V4L2 setups.",
     )
     setup.add_argument(
         "--audio-input-rate",
@@ -4388,9 +4602,26 @@ def build_parser() -> argparse.ArgumentParser:
     review_bib.set_defaults(func=command_review_bib)
 
     doctor = subparsers.add_parser(
-        "doctor", help="Check the main dependencies and device path."
+        "doctor", help="Check the main dependencies and source configuration."
+    )
+    doctor.add_argument(
+        "--source-type",
+        choices=SOURCE_TYPES,
+        default=DEFAULT_SOURCE_TYPE,
+        help="Capture source type. Defaults to %(default)s.",
     )
     doctor.add_argument("--device", default="/dev/video2", help="Video device path.")
+    doctor.add_argument(
+        "--rtsp-url",
+        default="",
+        help="RTSP URL when --source-type=rtsp.",
+    )
+    doctor.add_argument(
+        "--rtsp-transport",
+        choices=("tcp", "udp", "auto"),
+        default=DEFAULT_RTSP_TRANSPORT,
+        help="Preferred RTSP transport when --source-type=rtsp.",
+    )
     doctor.add_argument(
         "--audio",
         action=argparse.BooleanOptionalAction,
@@ -4400,7 +4631,7 @@ def build_parser() -> argparse.ArgumentParser:
     doctor.add_argument(
         "--audio-device",
         default="hw:Capture,0",
-        help="ALSA capture device to check.",
+        help="ALSA capture device to check for V4L2 sources.",
     )
     doctor.add_argument(
         "--player",

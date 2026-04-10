@@ -27,6 +27,7 @@ What is working well right now:
 What to treat as current assumptions:
 
 - use a real Linux machine with direct access to `/dev/video*`
+- RTSP input support is now scaffolded, but still lightly tested compared with V4L2 capture
 - VLC has been the most reliable player for the growing DVR file
 - the vision workflow is useful as a second set of eyes, not as gospel
 - saved frame review in `eog` is now a first-class workflow, not just debugging
@@ -108,11 +109,24 @@ If you want live vision features, also install and run Ollama separately.
 `setup` is the best place to save a profile for a USB capture dongle or webcam. It can probe devices and remember useful settings like:
 
 - video device
+- or an RTSP URL plus transport preference
 - V4L2 input format such as `mjpeg` or `yuyv422`
 - video size and framerate
 - audio input mode
 - encoder choice
 - storage destination
+
+For RTSP sources, the initial support is aimed at:
+
+- saving a source profile
+- generating the right FFmpeg ingest command
+- recording into the usual `timeshift.ts` and `archive.*` session layout
+
+The current RTSP caveats are:
+
+- setup does not auto-probe RTSP streams yet
+- `doctor` only validates that an RTSP URL is configured, not that the stream is reachable
+- embedded stream audio is supported as a simple on or off choice, but the workflow has been tested much more with V4L2 plus ALSA
 
 ### 3. Record
 
