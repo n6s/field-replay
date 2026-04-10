@@ -160,6 +160,14 @@ Offline scan:
 ./field-replay vision-scan ~/recordings/run-20260408-181629 --max-samples 3
 ```
 
+Offline resolution sweep:
+
+```bash
+./field-replay vision-sweep ~/recordings/run-20260408-181629 --max-samples 12
+```
+
+Based on local sweeps against real race footage, `720p` is the current recommended minimum for reliable bib-reading. Lower rungs such as `640x360` can still work on easier frames, but they started missing or mutating bibs often enough that they should be treated as experimental.
+
 Live follow:
 
 ```bash
@@ -306,9 +314,13 @@ A few common variations:
 ./field-replay record --no-video-timestamp
 ./field-replay vision-live ~/recordings/run-20260408-181629
 ./field-replay vision-scan ~/recordings/run-20260408-181629 --max-samples 20
+./field-replay vision-scan ~/recordings/run-20260408-181629 --scale-to 640x360 --max-samples 20
+./field-replay vision-sweep ~/recordings/run-20260408-181629 --variant source --variant 1280x720 --variant 640x360 --variant 320x180
 ./field-replay watch --player mpv
 ./field-replay export --preset share-small
 ```
+
+`vision-sweep` writes one scan directory per tested rung plus `summary.json` and `summary.txt` under `vision-scan-sweep/`. The first rung is treated as the reference baseline for comparison, so the default ladder starts with `source`. In the sweeps so far, `720p` matched source reliably, while `640x360` and below were more likely to drop or misread harder bibs.
 
 ## Resource Review
 

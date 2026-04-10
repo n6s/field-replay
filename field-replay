@@ -9,6 +9,7 @@ import re
 import shlex
 import shutil
 import signal
+import statistics
 import subprocess
 import sys
 import time
@@ -41,6 +42,23 @@ DEFAULT_VISION_SAMPLE_INTERVAL = 10.0
 DEFAULT_VISION_TAIL_OFFSET = 4.0
 DEFAULT_VISION_REPEAT_COOLDOWN = 60.0
 DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
+DEFAULT_VISION_SWEEP_VARIANTS = (
+    "source",
+    "1280x720",
+    "960x540",
+    "640x360",
+    "426x240",
+    "320x180",
+)
+VISION_RESOLUTION_ALIASES = {
+    "1080p": "1920x1080",
+    "720p": "1280x720",
+    "540p": "960x540",
+    "480p": "854x480",
+    "360p": "640x360",
+    "240p": "426x240",
+    "200p": "320x200",
+}
 EXPORT_PRESETS = {
     "share-high": {
         "label": "Share high",
@@ -117,6 +135,14 @@ class ExportSource:
     session_dir: Path
     source_path: Path
     source_label: str
+
+
+@dataclass(frozen=True)
+class VisionSweepVariant:
+    spec: str
+    label: str
+    output_slug: str
+    frame_filter: str | None
 
 
 def source_type_value(args: argparse.Namespace | dict) -> str:
@@ -2320,6 +2346,79 @@ def video_size_label(video_size: str | None) -> str:
     return f"{width}x{height}"
 
 
+def parse_scale_dimensions(value: str) -> tuple[int, int] | None:
+    normalized = value.strip().lower()
+    normalized = VISION_RESOLUTION_ALIASES.get(normalized, normalized)
+    if "x" not in normalized:
+        return None
+    try:
+        width_text, height_text = normalized.split("x", 1)
+        width = int(width_text)
+        height = int(height_text)
+    except ValueError:
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    return width, height
+
+
+def scale_filter_for_dimensions(width: int, height: int) -> str:
+    return (
+        "scale="
+        f"w={width}:h={height}:force_original_aspect_ratio=decrease,"
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black"
+    )
+
+
+def frame_filter_for_vision_size(vision_size: str | None) -> str | None:
+    if not vision_size:
+        return None
+    dimensions = parse_scale_dimensions(vision_size.strip())
+    if not dimensions:
+        raise ValueError(
+            f"invalid vision size: {vision_size!r}; expected WxH like 640x360"
+        )
+    width, height = dimensions
+    return f"scale={width}:{height}:force_original_aspect_ratio=decrease"
+
+
+def resolve_vision_variant(spec: str) -> VisionSweepVariant:
+    normalized = spec.strip().lower()
+    if normalized in ("", "source", "native", "full", "fullres", "full-resolution"):
+        return VisionSweepVariant(
+            spec=spec,
+            label="source",
+            output_slug="source",
+            frame_filter=None,
+        )
+    dimensions = parse_scale_dimensions(normalized)
+    if not dimensions:
+        raise ValueError(
+            f"invalid resolution variant: {spec!r}; expected 'source' or WxH like 640x360"
+        )
+    width, height = dimensions
+    resolution_label = video_size_label(f"{width}x{height}")
+    return VisionSweepVariant(
+        spec=spec,
+        label=resolution_label,
+        output_slug=f"{width}x{height}",
+        frame_filter=scale_filter_for_dimensions(width, height),
+    )
+
+
+def resolve_vision_variants(variant_specs: Sequence[str] | None) -> list[VisionSweepVariant]:
+    requested_specs = list(variant_specs or DEFAULT_VISION_SWEEP_VARIANTS)
+    variants: list[VisionSweepVariant] = []
+    seen_slugs: set[str] = set()
+    for spec in requested_specs:
+        variant = resolve_vision_variant(spec)
+        if variant.output_slug in seen_slugs:
+            continue
+        variants.append(variant)
+        seen_slugs.add(variant.output_slug)
+    return variants
+
+
 def export_resolution_label(preset_name: str, session_metadata: dict) -> str:
     if EXPORT_PRESETS[preset_name]["scale"]:
         return "720p"
@@ -2552,6 +2651,20 @@ def session_asset_path(session_dir: Path, relative_or_absolute: str | None) -> P
     return session_dir / candidate
 
 
+def default_vision_output_root(
+    source: ExportSource,
+    default_dir_name: str,
+) -> tuple[Path, str | None]:
+    preferred_root = source.session_dir / default_dir_name
+    if source.session_dir.exists() and os.access(source.session_dir, os.W_OK):
+        return preferred_root, None
+    fallback_root = Path.cwd() / f"{source.session_dir.name}-{default_dir_name}"
+    reason = (
+        f"session directory is not writable; using workspace output root {fallback_root}"
+    )
+    return fallback_root, reason
+
+
 def normalize_bib_text(value: str) -> str | None:
     normalized = re.sub(r"[^A-Za-z0-9]+", "", value.upper())
     if not normalized:
@@ -2569,7 +2682,8 @@ def extract_frame_at_time(
     source_path: Path,
     offset_seconds: float,
     output_path: Path,
-    vision_size: str | None = None,
+    *,
+    frame_filter: str | None = None,
 ) -> None:
     ensure_directory(output_path.parent)
     command = [
@@ -2583,8 +2697,8 @@ def extract_frame_at_time(
         "-i",
         str(source_path),
     ]
-    if vision_size:
-        command.extend(["-vf", f"scale={vision_size}:force_original_aspect_ratio=decrease"])
+    if frame_filter:
+        command.extend(["-vf", frame_filter])
     command.extend(
         [
             "-frames:v",
@@ -2775,6 +2889,140 @@ def ask_ollama_for_bibs(
     response_text = str(response_payload.get("response") or "")
     bibs = normalize_vision_bibs(extract_json_object(response_text))
     return bibs, response_text
+
+
+def summarize_vision_scan_output(output_root: Path) -> dict:
+    debug_records = load_jsonl_records(output_root / "vision-debug.jsonl")
+    event_records = load_jsonl_records(output_root / "events.jsonl")
+    elapsed_values = [
+        int(record["elapsed_ms"])
+        for record in debug_records
+        if isinstance(record.get("elapsed_ms"), int)
+    ]
+    sample_bibs_by_time: dict[str, list[str]] = {}
+    for record in debug_records:
+        time_key = f"{float(record.get('t') or 0.0):.3f}"
+        bibs = record.get("bibs")
+        if isinstance(bibs, list):
+            sample_bibs_by_time[time_key] = [
+                str(item) for item in bibs if normalize_bib_text(str(item))
+            ]
+    unique_bibs = sorted(
+        {
+            str(record.get("b") or "")
+            for record in event_records
+            if normalize_bib_text(str(record.get("b") or ""))
+        }
+    )
+    summary = {
+        "samples": len(debug_records),
+        "successful_samples": sum(1 for record in debug_records if "bibs" in record),
+        "samples_with_any_bib": sum(
+            1 for record in debug_records if isinstance(record.get("bibs"), list) and record["bibs"]
+        ),
+        "error_count": sum(1 for record in debug_records if "error" in record),
+        "promoted_total": len(event_records),
+        "unique_bibs": unique_bibs,
+        "unique_bib_count": len(unique_bibs),
+        "median_elapsed_ms": int(round(statistics.median(elapsed_values))) if elapsed_values else None,
+        "p95_elapsed_ms": (
+            int(round(statistics.quantiles(elapsed_values, n=20)[18]))
+            if len(elapsed_values) >= 20
+            else max(elapsed_values, default=None)
+        ),
+        "sample_bibs_by_time": sample_bibs_by_time,
+    }
+    return summary
+
+
+def compare_vision_summaries(reference_summary: dict, variant_summary: dict) -> dict:
+    reference_bibs_by_time = reference_summary.get("sample_bibs_by_time") or {}
+    variant_bibs_by_time = variant_summary.get("sample_bibs_by_time") or {}
+    matched_instances = 0
+    reference_instances = 0
+    extra_instances = 0
+    for time_key, reference_bibs in reference_bibs_by_time.items():
+        reference_set = set(reference_bibs)
+        variant_set = set(variant_bibs_by_time.get(time_key) or [])
+        matched_instances += len(reference_set & variant_set)
+        reference_instances += len(reference_set)
+        extra_instances += len(variant_set - reference_set)
+    reference_unique = set(reference_summary.get("unique_bibs") or [])
+    variant_unique = set(variant_summary.get("unique_bibs") or [])
+    matched_unique = len(reference_unique & variant_unique)
+    return {
+        "reference_unique_bib_count": len(reference_unique),
+        "matched_unique_bib_count": matched_unique,
+        "unique_recall": (
+            round(matched_unique / len(reference_unique), 3) if reference_unique else None
+        ),
+        "reference_instances": reference_instances,
+        "matched_instances": matched_instances,
+        "instance_recall": (
+            round(matched_instances / reference_instances, 3) if reference_instances else None
+        ),
+        "extra_instances_vs_reference": extra_instances,
+    }
+
+
+def write_vision_sweep_summary(
+    output_root: Path,
+    source_path: Path,
+    sample_points: Sequence[float],
+    results: Sequence[dict],
+) -> tuple[Path, Path]:
+    summary_json_path = output_root / "summary.json"
+    summary_text_path = output_root / "summary.txt"
+    payload = {
+        "created_at": datetime.now().astimezone().isoformat(),
+        "source_path": str(source_path),
+        "sample_interval_seconds": (
+            round(sample_points[1] - sample_points[0], 3) if len(sample_points) >= 2 else None
+        ),
+        "sample_points_seconds": [round(point, 3) for point in sample_points],
+        "results": list(results),
+        "notes": [
+            "Reference comparisons use the first variant as a baseline, not ground truth.",
+            "Frame scaling preserves aspect ratio and pads to the requested canvas when needed.",
+        ],
+    }
+    summary_json_path.write_text(json.dumps(payload, indent=2) + "\n")
+
+    lines = [
+        "Vision Sweep Summary",
+        f"Source: {source_path}",
+        f"Samples: {len(sample_points)}",
+        "",
+        "Variant comparison",
+    ]
+    for result in results:
+        summary = result["summary"]
+        compare = result.get("compare_to_reference") or {}
+        comparison_bits = []
+        if compare.get("unique_recall") is not None:
+            comparison_bits.append(f"unique recall {compare['unique_recall']:.0%}")
+        if compare.get("instance_recall") is not None:
+            comparison_bits.append(f"sample recall {compare['instance_recall']:.0%}")
+        if compare.get("extra_instances_vs_reference") is not None:
+            comparison_bits.append(
+                f"extra sample hits {compare['extra_instances_vs_reference']}"
+            )
+        lines.append(
+            "  "
+            f"{result['label']}: unique {summary['unique_bib_count']}, "
+            f"promoted {summary['promoted_total']}, "
+            f"samples-with-bibs {summary['samples_with_any_bib']}, "
+            f"median {summary['median_elapsed_ms'] or 0} ms"
+            + (f" ({', '.join(comparison_bits)})" if comparison_bits else "")
+        )
+    lines.extend(
+        [
+            "",
+            "Reference comparisons use the first variant as a baseline, not ground truth.",
+        ]
+    )
+    summary_text_path.write_text("\n".join(lines) + "\n")
+    return summary_json_path, summary_text_path
 
 
 def process_vision_frame(
@@ -3065,6 +3313,86 @@ def run_record_command(args: argparse.Namespace, *, launch_player: bool = False)
     return 1 if archive_ok else exit_code
 
 
+def run_offline_vision_scan(
+    *,
+    source: ExportSource,
+    ffmpeg_path: str,
+    model: str,
+    ollama_host: str,
+    prompt: str,
+    timeout_seconds: float,
+    keepalive: str,
+    repeat_cooldown_seconds: float,
+    output_root: Path,
+    sample_points: Sequence[float],
+    annotate_frames: bool,
+    frame_filter: str | None = None,
+    dry_run: bool = False,
+) -> int:
+    runtime_paths = vision_output_paths(output_root)
+    for key in ("root", "frames_dir"):
+        ensure_directory(runtime_paths[key])
+    for key in ("events_jsonl", "events_log", "debug_log", "scratch_frame"):
+        try:
+            runtime_paths[key].unlink()
+        except FileNotFoundError:
+            pass
+
+    print(f"Vision scan source: {source.source_path}")
+    print(f"Vision output dir:  {output_root}")
+    print(f"Vision model:       {model}")
+    print(f"Samples:            {len(sample_points)}")
+    print(f"Repeat cooldown:    {repeat_cooldown_seconds:.0f}s")
+    if frame_filter:
+        print(f"Frame filter:       {frame_filter}")
+    if dry_run:
+        for offset_seconds in sample_points:
+            print(f"  sample {format_duration(offset_seconds)}")
+        return 0
+
+    last_promoted_by_bib: dict[str, float] = {}
+    for offset_seconds in sample_points:
+        try:
+            extract_frame_at_time(
+                ffmpeg_path,
+                source.source_path,
+                offset_seconds,
+                runtime_paths["scratch_frame"],
+                frame_filter=frame_filter,
+            )
+            process_vision_frame(
+                runtime_paths=runtime_paths,
+                session_dir=source.session_dir,
+                frame_path=runtime_paths["scratch_frame"],
+                ffmpeg_bin=ffmpeg_path,
+                annotate_frames=annotate_frames,
+                offset_seconds=offset_seconds,
+                model=model,
+                ollama_host=ollama_host,
+                prompt=prompt,
+                timeout_seconds=timeout_seconds,
+                keepalive=keepalive,
+                repeat_cooldown_seconds=repeat_cooldown_seconds,
+                last_promoted_by_bib=last_promoted_by_bib,
+            )
+        except RuntimeError as exc:
+            append_jsonl(
+                runtime_paths["debug_log"],
+                {
+                    "w": event_wall_time(datetime.now().astimezone()),
+                    "t": round(offset_seconds, 1),
+                    "frame": relative_to_session(
+                        runtime_paths["scratch_frame"], source.session_dir
+                    ),
+                    "error": str(exc),
+                },
+            )
+
+    print(f"Vision events:      {runtime_paths['events_log']}")
+    print(f"Vision debug:       {runtime_paths['debug_log']}")
+    return 0
+
+
 def command_vision_scan(args: argparse.Namespace) -> int:
     config_path = args.config_file.expanduser()
     config = load_config(config_path)
@@ -3134,19 +3462,13 @@ def command_vision_scan(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
-    output_root = (
-        args.output_dir.expanduser()
-        if args.output_dir
-        else source.session_dir / "vision-scan"
-    )
-    runtime_paths = vision_output_paths(output_root)
-    for key in ("root", "frames_dir"):
-        ensure_directory(runtime_paths[key])
-    for key in ("events_jsonl", "events_log", "debug_log", "scratch_frame"):
-        try:
-            runtime_paths[key].unlink()
-        except FileNotFoundError:
-            pass
+    output_notice = None
+    if args.output_dir:
+        output_root = args.output_dir.expanduser()
+    else:
+        output_root, output_notice = default_vision_output_root(source, "vision-scan")
+    if output_notice:
+        print(f"warning: {output_notice}", file=sys.stderr)
 
     config["last_session_dir"] = str(source.session_dir)
     save_config(config_path, config)
@@ -3156,71 +3478,168 @@ def command_vision_scan(args: argparse.Namespace) -> int:
     if args.max_samples is not None:
         sample_points = sample_points[: max(args.max_samples, 0)]
     prompt = args.prompt or default_vision_prompt()
+    try:
+        frame_filter = (
+            resolve_vision_variant(args.scale_to).frame_filter
+            if args.scale_to and args.scale_to.strip().lower() not in ("source", "native")
+            else None
+        )
+    except ValueError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+    if not frame_filter and args.vision_size:
+        try:
+            frame_filter = frame_filter_for_vision_size(args.vision_size)
+        except ValueError as exc:
+            print(exc, file=sys.stderr)
+            return 1
+    return run_offline_vision_scan(
+        source=source,
+        ffmpeg_path=ffmpeg_path,
+        model=args.model,
+        ollama_host=args.ollama_host,
+        prompt=prompt,
+        timeout_seconds=args.timeout,
+        keepalive=args.keepalive,
+        repeat_cooldown_seconds=args.repeat_cooldown,
+        output_root=output_root,
+        sample_points=sample_points,
+        annotate_frames=annotate_frames,
+        frame_filter=frame_filter,
+        dry_run=args.dry_run,
+    )
 
-    print(f"Vision scan source: {source.source_path}")
-    print(f"Vision output dir:  {output_root}")
-    print(f"Vision model:       {args.model}")
-    print(f"Vision frame size:  {args.vision_size or 'native'}")
-    print(f"Samples:            {len(sample_points)}")
-    print(f"Repeat cooldown:    {args.repeat_cooldown:.0f}s")
+def command_vision_sweep(args: argparse.Namespace) -> int:
+    config_path = args.config_file.expanduser()
+    config = load_config(config_path)
+    if not args.target and interactive_mode_enabled(args):
+        selected_target = select_export_target(
+            args,
+            config,
+            title="Choose a session for vision sweep",
+        )
+        if not selected_target:
+            print("no sessions found for vision sweep", file=sys.stderr)
+            return 1
+        args.target = selected_target
+
+    try:
+        source = resolve_export_source(
+            args.recordings_dir.expanduser(),
+            str(args.target) if args.target else None,
+        )
+    except FileNotFoundError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+
+    ffmpeg_path = shutil.which(args.ffmpeg_bin)
+    if not ffmpeg_path:
+        print(f"ffmpeg binary not found: {args.ffmpeg_bin}", file=sys.stderr)
+        return 1
+    _, supported_filters = detect_supported_filters(args.ffmpeg_bin)
+    annotate_frames = "drawtext" in supported_filters
+    if not annotate_frames:
+        print(
+            "warning: ffmpeg drawtext filter is unavailable; saving raw promoted frames",
+            file=sys.stderr,
+        )
+
+    try:
+        variants = resolve_vision_variants(args.variant)
+    except ValueError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+
+    output_notice = None
+    if args.output_dir:
+        output_root = args.output_dir.expanduser()
+    else:
+        output_root, output_notice = default_vision_output_root(source, "vision-scan-sweep")
+    if output_notice:
+        print(f"warning: {output_notice}", file=sys.stderr)
+    ensure_directory(output_root)
+    config["last_session_dir"] = str(source.session_dir)
+    save_config(config_path, config)
+
+    duration_seconds = probe_media_duration(args.ffmpeg_bin, source.source_path) or 0.0
+    sample_points = media_sample_points(duration_seconds, args.sample_interval)
+    if args.max_samples is not None:
+        sample_points = sample_points[: max(args.max_samples, 0)]
+    prompt = args.prompt or default_vision_prompt()
+
+    print(f"Vision sweep source: {source.source_path}")
+    print(f"Vision sweep dir:    {output_root}")
+    print(f"Vision model:        {args.model}")
+    print(f"Samples:             {len(sample_points)}")
+    print(f"Variants:            {', '.join(variant.label for variant in variants)}")
     if args.dry_run:
+        for variant in variants:
+            print(f"  variant {variant.label} -> {output_root / variant.output_slug}")
         for offset_seconds in sample_points:
             print(f"  sample {format_duration(offset_seconds)}")
         return 0
 
-    last_promoted_by_bib: dict[str, float] = {}
-    for offset_seconds in sample_points:
-        try:
-            extract_frame_at_time(
-                ffmpeg_path,
-                source.source_path,
-                offset_seconds,
-                runtime_paths["scratch_frame"],
-                vision_size=args.vision_size,
-            )
-            result = process_vision_frame(
-                runtime_paths=runtime_paths,
-                session_dir=source.session_dir,
-                frame_path=runtime_paths["scratch_frame"],
-                ffmpeg_bin=ffmpeg_path,
-                annotate_frames=annotate_frames,
-                offset_seconds=offset_seconds,
-                model=args.model,
-                ollama_host=args.ollama_host,
-                prompt=prompt,
-                timeout_seconds=args.timeout,
-                keepalive=args.keepalive,
-                repeat_cooldown_seconds=args.repeat_cooldown,
-                last_promoted_by_bib=last_promoted_by_bib,
-            )
-            if result.error:
-                print(
-                    f"  sample {format_duration(offset_seconds)} error after {result.elapsed_ms} ms: {result.error}"
-                )
-            elif result.promoted:
-                print(
-                    f"  sample {format_duration(offset_seconds)} promoted {', '.join(payload['b'] for payload in result.promoted)} in {result.elapsed_ms} ms"
-                )
-            else:
-                detected = ", ".join(result.bibs) if result.bibs else "nothing"
-                print(
-                    f"  sample {format_duration(offset_seconds)} saw {detected} in {result.elapsed_ms} ms"
-                )
-        except RuntimeError as exc:
-            append_jsonl(
-                runtime_paths["debug_log"],
-                {
-                    "w": event_wall_time(datetime.now().astimezone()),
-                    "t": round(offset_seconds, 1),
-                    "frame": relative_to_session(
-                        runtime_paths["scratch_frame"], source.session_dir
-                    ),
-                    "error": str(exc),
-                },
-            )
+    results: list[dict] = []
+    reference_summary: dict | None = None
+    for index, variant in enumerate(variants):
+        variant_output_root = output_root / variant.output_slug
+        print()
+        print(f"[{index + 1}/{len(variants)}] Scanning {variant.label}")
+        run_offline_vision_scan(
+            source=source,
+            ffmpeg_path=ffmpeg_path,
+            model=args.model,
+            ollama_host=args.ollama_host,
+            prompt=prompt,
+            timeout_seconds=args.timeout,
+            keepalive=args.keepalive,
+            repeat_cooldown_seconds=args.repeat_cooldown,
+            output_root=variant_output_root,
+            sample_points=sample_points,
+            annotate_frames=annotate_frames,
+            frame_filter=variant.frame_filter,
+            dry_run=False,
+        )
+        summary = summarize_vision_scan_output(variant_output_root)
+        result = {
+            "label": variant.label,
+            "variant_spec": variant.spec,
+            "output_dir": str(variant_output_root),
+            "frame_filter": variant.frame_filter,
+            "summary": summary,
+        }
+        if reference_summary is None:
+            reference_summary = summary
+        else:
+            result["compare_to_reference"] = compare_vision_summaries(reference_summary, summary)
+        results.append(result)
 
-    print(f"Vision events:      {runtime_paths['events_log']}")
-    print(f"Vision debug:       {runtime_paths['debug_log']}")
+    summary_json_path, summary_text_path = write_vision_sweep_summary(
+        output_root,
+        source.source_path,
+        sample_points,
+        results,
+    )
+    print()
+    print("Vision sweep complete")
+    print(f"  JSON: {summary_json_path}")
+    print(f"  Text: {summary_text_path}")
+    for result in results:
+        summary = result["summary"]
+        compare = result.get("compare_to_reference") or {}
+        compare_bits = []
+        if compare.get("unique_recall") is not None:
+            compare_bits.append(f"unique recall {compare['unique_recall']:.0%}")
+        if compare.get("instance_recall") is not None:
+            compare_bits.append(f"sample recall {compare['instance_recall']:.0%}")
+        comparison_suffix = f", {', '.join(compare_bits)}" if compare_bits else ""
+        print(
+            "  "
+            f"{result['label']}: unique {summary['unique_bib_count']}, "
+            f"promoted {summary['promoted_total']}, "
+            f"median {summary['median_elapsed_ms'] or 0} ms"
+            f"{comparison_suffix}"
+        )
     return 0
 
 
@@ -3306,6 +3725,11 @@ def command_vision_live(args: argparse.Namespace) -> int:
     save_config(config_path, config)
 
     prompt = args.prompt or default_vision_prompt()
+    try:
+        frame_filter = frame_filter_for_vision_size(args.vision_size)
+    except ValueError as exc:
+        print(exc, file=sys.stderr)
+        return 1
     timeshift_path = session_dir / DEFAULT_TIMESHIFT_NAME
     processed_offsets: set[float] = set()
     sample_count = 0
@@ -3348,7 +3772,7 @@ def command_vision_live(args: argparse.Namespace) -> int:
                 timeshift_path,
                 offset_seconds,
                 runtime_paths["scratch_frame"],
-                vision_size=args.vision_size,
+                frame_filter=frame_filter,
             )
             print(
                 f"[vision-live] analyzing {format_duration(offset_seconds)} with {args.model}...",
@@ -4421,6 +4845,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Directory for vision scan output. Defaults to vision-scan under the session directory.",
     )
     vision_scan.add_argument(
+        "--scale-to",
+        help="Optionally scale frames before vision inference. Use 'source' or WxH like 640x360.",
+    )
+    vision_scan.add_argument(
         "--dry-run",
         action="store_true",
         help="Print scan samples without calling Ollama.",
@@ -4432,6 +4860,86 @@ def build_parser() -> argparse.ArgumentParser:
         help="Prompt to choose a recent session when the target is omitted.",
     )
     vision_scan.set_defaults(func=command_vision_scan)
+
+    vision_sweep = subparsers.add_parser(
+        "vision-sweep",
+        help="Run repeated offline vision scans across several frame resolutions and compare results.",
+    )
+    vision_sweep.add_argument(
+        "target",
+        nargs="?",
+        type=Path,
+        help="Optional session directory or media file. Defaults to an interactive picker or the latest session.",
+    )
+    vision_sweep.add_argument(
+        "--ffmpeg-bin",
+        default="ffmpeg",
+        help="FFmpeg binary to use for frame extraction.",
+    )
+    vision_sweep.add_argument(
+        "--model",
+        default=DEFAULT_VISION_MODEL,
+        help="Ollama vision model to query.",
+    )
+    vision_sweep.add_argument(
+        "--ollama-host",
+        default=DEFAULT_OLLAMA_HOST,
+        help="Base URL for the local Ollama server.",
+    )
+    vision_sweep.add_argument(
+        "--sample-interval",
+        type=float,
+        default=DEFAULT_VISION_SAMPLE_INTERVAL,
+        help="Seconds between sampled frames.",
+    )
+    vision_sweep.add_argument(
+        "--max-samples",
+        type=int,
+        help="Maximum number of frames to send to the vision model for each variant.",
+    )
+    vision_sweep.add_argument(
+        "--timeout",
+        type=float,
+        default=120.0,
+        help="Seconds to wait for each Ollama response.",
+    )
+    vision_sweep.add_argument(
+        "--repeat-cooldown",
+        type=float,
+        default=DEFAULT_VISION_REPEAT_COOLDOWN,
+        help="Minimum seconds before the same bib is promoted again within one variant.",
+    )
+    vision_sweep.add_argument(
+        "--keepalive",
+        default="5m",
+        help="How long Ollama should keep the model loaded between frames.",
+    )
+    vision_sweep.add_argument(
+        "--prompt",
+        help="Override the default strict JSON bib-reading prompt.",
+    )
+    vision_sweep.add_argument(
+        "--output-dir",
+        type=Path,
+        help="Directory for sweep output. Defaults to vision-scan-sweep under the session directory.",
+    )
+    vision_sweep.add_argument(
+        "--variant",
+        action="append",
+        help="Resolution rung to test. Repeatable. Use 'source' or WxH like 640x360. Defaults to a built-in ladder.",
+    )
+    vision_sweep.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print planned variants and sample points without calling Ollama.",
+    )
+    vision_sweep.add_argument(
+        "--interactive",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Prompt to choose a recent session when the target is omitted.",
+    )
+    vision_sweep.set_defaults(func=command_vision_sweep)
 
     vision_live = subparsers.add_parser(
         "vision-live",
