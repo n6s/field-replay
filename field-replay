@@ -27,6 +27,7 @@ DEFAULT_TIMESHIFT_NAME = "timeshift.ts"
 DEFAULT_ARCHIVE_STEM = "archive"
 DEFAULT_ENCODER = "h264_nvenc"
 DEFAULT_VIDEO_INPUT_FORMAT = "auto"
+DEFAULT_AUDIO_GAIN_DB = -6.0
 COMMON_VIDEO_SIZES = ("1920x1080", "1280x720", "1024x576", "640x480")
 COMMON_FRAME_RATES = (30, 25, 15, 10, 5)
 COMMON_VIDEO_INPUT_FORMATS = ("auto", "mjpeg", "yuyv422", "uyvy422", "nv12")
@@ -83,6 +84,13 @@ class AudioDevice:
     label: str
 
 
+@dataclass(frozen=True)
+class V4L2Mode:
+    input_format: str
+    video_size: str
+    framerate: int
+
+
 @dataclass
 class SessionPaths:
     recordings_dir: Path
@@ -91,6 +99,14 @@ class SessionPaths:
     timeshift_path: Path
     metadata_path: Path
     latest_link: Path
+
+
+@dataclass
+class VisionFrameResult:
+    promoted: list[dict]
+    bibs: list[str]
+    elapsed_ms: int
+    error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -137,16 +153,17 @@ def ensure_directory(path: Path) -> None:
 
 def load_config(config_path: Path) -> dict:
     if not config_path.exists():
-        return {"profiles": {}}
+        return {"profiles": {}, "vision_profiles": {}}
 
     try:
         payload = json.loads(config_path.read_text())
     except (OSError, json.JSONDecodeError):
-        return {"profiles": {}}
+        return {"profiles": {}, "vision_profiles": {}}
 
     if not isinstance(payload, dict):
-        return {"profiles": {}}
+        return {"profiles": {}, "vision_profiles": {}}
     payload.setdefault("profiles", {})
+    payload.setdefault("vision_profiles", {})
     return payload
 
 
@@ -243,6 +260,20 @@ def prompt_text(prompt: str, default: str | None = None) -> str:
     if default is not None:
         return default
     return ""
+
+
+def prompt_float(prompt: str, default: float) -> float:
+    while True:
+        raw = prompt_text(prompt, f"{default:g}")
+        try:
+            return float(raw)
+        except ValueError:
+            print("Please enter a number.")
+
+
+def prompt_optional_text(prompt: str, default: str | None = None) -> str | None:
+    raw = prompt_text(prompt, default)
+    return raw or None
 
 
 def prompt_yes_no(prompt: str, default: bool = True) -> bool:
@@ -397,6 +428,8 @@ def build_ffmpeg_command(paths: SessionPaths, args: argparse.Namespace) -> list[
             [
                 "-thread_queue_size",
                 str(args.audio_thread_queue_size),
+                "-use_wallclock_as_timestamps",
+                "1",
                 "-f",
                 "alsa",
                 "-sample_rate",
@@ -448,7 +481,7 @@ def build_ffmpeg_command(paths: SessionPaths, args: argparse.Namespace) -> list[
         command.extend(
             [
                 "-af",
-                f"volume={args.audio_gain_db}dB",
+                build_audio_filter(args),
                 "-c:a",
                 args.audio_encoder,
                 "-b:a",
@@ -490,6 +523,13 @@ def build_video_filter(args: argparse.Namespace) -> str:
             "box=1:boxcolor=0x00000099:boxborderw=10:"
             "fontcolor=white:fontsize=24:borderw=2"
         )
+    return ",".join(filters)
+
+
+def build_audio_filter(args: argparse.Namespace) -> str:
+    filters = ["aresample=async=1:first_pts=0"]
+    if abs(args.audio_gain_db) >= 0.05:
+        filters.append(f"volume={args.audio_gain_db}dB")
     return ",".join(filters)
 
 
@@ -600,6 +640,31 @@ def detect_supported_encoders(ffmpeg_bin: str) -> tuple[str | None, set[str]]:
     return ffmpeg_path, encoders
 
 
+def encoder_smoke_test(
+    ffmpeg_path: str, encoder: str, *, video_size: str = "640x480", framerate: int = 30
+) -> bool:
+    command = [
+        ffmpeg_path,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        f"nullsrc=s={video_size}:r={framerate}",
+        "-frames:v",
+        "1",
+        "-an",
+        "-c:v",
+        encoder,
+        "-f",
+        "null",
+        "-",
+    ]
+    ok, _ = run_ffmpeg_probe(command, timeout_seconds=8.0)
+    return ok
+
+
 def detect_supported_filters(ffmpeg_bin: str) -> tuple[str | None, set[str]]:
     ffmpeg_path = shutil.which(ffmpeg_bin)
     if not ffmpeg_path:
@@ -652,12 +717,77 @@ def resolve_encoder(
 ) -> str | None:
     if not ffmpeg_path:
         return None
-    if requested in supported_encoders:
+    if requested in supported_encoders and encoder_smoke_test(ffmpeg_path, requested):
         return requested
     for candidate in ("h264_nvenc", "libx264", "h264_v4l2m2m", "h264_vaapi", "mpeg4"):
-        if candidate in supported_encoders:
+        if candidate in supported_encoders and encoder_smoke_test(ffmpeg_path, candidate):
             return candidate
     return None
+
+
+def v4l2ctl_pixel_format_alias(code: str) -> str:
+    aliases = {
+        "MJPG": "mjpeg",
+        "YUYV": "yuyv422",
+        "UYVY": "uyvy422",
+        "NV12": "nv12",
+    }
+    return aliases.get(code.upper(), code.lower())
+
+
+def list_v4l2_modes(device: str) -> list[V4L2Mode]:
+    v4l2_ctl = shutil.which("v4l2-ctl")
+    if not v4l2_ctl:
+        return []
+
+    result = subprocess.run(
+        [v4l2_ctl, "-d", device, "--list-formats-ext"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return []
+
+    modes: list[V4L2Mode] = []
+    current_format = DEFAULT_VIDEO_INPUT_FORMAT
+    current_size = None
+    format_pattern = re.compile(r"\[\d+\]:\s+'([^']+)'")
+    size_pattern = re.compile(r"Size:\s+Discrete\s+(\d+x\d+)")
+    fps_pattern = re.compile(r"\(([\d.]+)\s+fps\)")
+    for line in result.stdout.splitlines():
+        format_match = format_pattern.search(line)
+        if format_match:
+            current_format = v4l2ctl_pixel_format_alias(format_match.group(1))
+            current_size = None
+            continue
+        size_match = size_pattern.search(line)
+        if size_match:
+            current_size = size_match.group(1)
+            continue
+        fps_match = fps_pattern.search(line)
+        if fps_match and current_size:
+            try:
+                framerate = int(round(float(fps_match.group(1))))
+            except ValueError:
+                continue
+            modes.append(
+                V4L2Mode(
+                    input_format=current_format,
+                    video_size=current_size,
+                    framerate=framerate,
+                )
+            )
+
+    unique: list[V4L2Mode] = []
+    seen: set[tuple[str, str, int]] = set()
+    for mode in modes:
+        key = (mode.input_format, mode.video_size, mode.framerate)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(mode)
+    return unique
 
 
 def run_ffmpeg_probe(command: Sequence[str], timeout_seconds: float = 8.0) -> tuple[bool, str]:
@@ -764,8 +894,31 @@ def probe_video_mode(
 
 
 def video_probe_candidates(
-    video_size: str, framerate: int, input_format: str
+    device: str, video_size: str, framerate: int, input_format: str
 ) -> list[tuple[str, int, str]]:
+    advertised_modes = list_v4l2_modes(device)
+    if advertised_modes:
+        requested_width, requested_height = parse_video_size(video_size)
+
+        def sort_key(mode: V4L2Mode) -> tuple[int, float, int, int, int]:
+            width, height = parse_video_size(mode.video_size)
+            area = (width or 0) * (height or 0)
+            exact_match = int(
+                mode.video_size == video_size
+                and mode.framerate == framerate
+                and mode.input_format == input_format
+            )
+            fps_delta = abs(mode.framerate - framerate)
+            if requested_width and requested_height and width and height:
+                pixel_delta = abs((width * height) - (requested_width * requested_height))
+            else:
+                pixel_delta = float("inf")
+            preferred_format = int(mode.input_format == input_format)
+            return (exact_match, preferred_format, -fps_delta, area, -pixel_delta)
+
+        ordered = sorted(advertised_modes, key=sort_key, reverse=True)
+        return [(mode.video_size, mode.framerate, mode.input_format) for mode in ordered]
+
     sizes = [video_size, *[size for size in COMMON_VIDEO_SIZES if size != video_size]]
     fps_values = [framerate, *[fps for fps in COMMON_FRAME_RATES if fps != framerate]]
     formats = [
@@ -788,12 +941,14 @@ def choose_video_profile_settings(
     current_size: str,
     current_fps: int,
     current_input_format: str,
+    *,
+    stop_on_exact: bool = True,
 ) -> tuple[str, int, str, list[dict], str | None]:
     successful: list[dict] = []
     seen_actual: set[tuple[str, int, str]] = set()
     failure_reason = None
     for size, fps, input_format in video_probe_candidates(
-        current_size, current_fps, current_input_format
+        device, current_size, current_fps, current_input_format
     ):
         result = probe_video_mode(ffmpeg_bin, device, size, fps, input_format)
         if not result["ok"]:
@@ -808,9 +963,9 @@ def choose_video_profile_settings(
             continue
         successful.append(result)
         seen_actual.add(actual_key)
-        if result["exact"]:
+        if stop_on_exact and result["exact"]:
             return size, fps, input_format, successful, failure_reason
-        if len(successful) >= 4:
+        if stop_on_exact and len(successful) >= 4:
             break
 
     if not successful:
@@ -909,6 +1064,45 @@ def print_video_probe_results(results: Sequence[dict]) -> None:
         fmt = item["input_format"]
         fmt_label = "auto" if fmt == DEFAULT_VIDEO_INPUT_FORMAT else fmt
         print(f"  {index}. {item['actual_size']} @ {actual_fps} fps via {fmt_label}{note}")
+
+
+def choose_video_probe_result(
+    results: Sequence[dict],
+    *,
+    current_size: str,
+    current_fps: int,
+    current_input_format: str,
+) -> dict | None:
+    if not results:
+        return None
+
+    options: list[tuple[str, str]] = []
+    default_value = None
+    for index, item in enumerate(results, start=1):
+        actual_fps = int(round(item["actual_fps"]))
+        fmt = item["input_format"]
+        fmt_label = "auto" if fmt == DEFAULT_VIDEO_INPUT_FORMAT else fmt
+        requested_note = ""
+        if not item["exact"]:
+            requested_note = (
+                f" (requested {item['requested_size']} @ {item['requested_fps']} fps)"
+            )
+        label = f"{item['actual_size']} @ {actual_fps} fps via {fmt_label}{requested_note}"
+        value = str(index)
+        options.append((value, label))
+        if (
+            item["actual_size"] == current_size
+            and actual_fps == current_fps
+            and item["input_format"] == current_input_format
+        ):
+            default_value = value
+
+    if default_value is None:
+        default_value = options[0][0]
+    choice = prompt_menu("Choose a video mode", options, default_value=default_value)
+    if choice is None:
+        return None
+    return results[int(choice) - 1]
 
 
 def print_audio_probe_results(results: Sequence[dict]) -> None:
@@ -1047,6 +1241,111 @@ def known_recordings_roots(args: argparse.Namespace, config: dict) -> list[Path]
     return unique
 
 
+def vision_profile_from_args(args: argparse.Namespace) -> dict:
+    return {
+        "model": args.model,
+        "ollama_host": args.ollama_host,
+        "timeout": args.timeout,
+        "keepalive": args.keepalive,
+        "repeat_cooldown": args.repeat_cooldown,
+        "vision_size": args.vision_size,
+        "prompt": args.prompt,
+    }
+
+
+def vision_profile_summary_lines(profile_name: str, profile: dict) -> list[str]:
+    prompt_override = profile.get("prompt")
+    prompt_label = "custom" if prompt_override else "default"
+    return [
+        f"Vision profile: {profile_name}",
+        f"  Model:    {profile.get('model', DEFAULT_VISION_MODEL)}",
+        f"  Host:     {profile.get('ollama_host', DEFAULT_OLLAMA_HOST)}",
+        f"  Timeout:  {profile.get('timeout', 120.0):g}s",
+        f"  Keepalive:{profile.get('keepalive', '5m')}",
+        f"  Vision:   {profile.get('vision_size') or 'native resolution'}",
+        f"  Prompt:   {prompt_label}",
+    ]
+
+
+def vision_profile_menu_label(profile_name: str, profile: dict) -> str:
+    details = [profile.get("model", DEFAULT_VISION_MODEL)]
+    if profile.get("vision_size"):
+        details.append(str(profile["vision_size"]))
+    if profile.get("prompt"):
+        details.append("custom prompt")
+    return f"{profile_name} ({'; '.join(details)})"
+
+
+def apply_vision_profile(args: argparse.Namespace, profile: dict) -> None:
+    args.model = profile.get("model", args.model)
+    args.ollama_host = profile.get("ollama_host", args.ollama_host)
+    args.timeout = profile.get("timeout", args.timeout)
+    args.keepalive = profile.get("keepalive", args.keepalive)
+    args.repeat_cooldown = profile.get("repeat_cooldown", args.repeat_cooldown)
+    args.vision_size = profile.get("vision_size", args.vision_size)
+    args.prompt = profile.get("prompt", args.prompt)
+
+
+def choose_vision_profile(
+    config: dict,
+    preferred_profile: str | None = None,
+    *,
+    allow_manual: bool = True,
+) -> str | None:
+    profiles = config.get("vision_profiles", {})
+    if not profiles and not allow_manual:
+        return None
+
+    options = [
+        (name, vision_profile_menu_label(name, profile))
+        for name, profile in sorted(profiles.items())
+    ]
+    if allow_manual:
+        options.append(("__manual__", "Manual / one-time vision setup"))
+    default_value = preferred_profile or config.get("last_vision_profile")
+    if default_value not in profiles:
+        default_value = "__manual__" if allow_manual else (options[0][0] if options else None)
+    print("Choose a vision setup")
+    return prompt_menu("", options, default_value=default_value)
+
+
+def configure_vision_profile_interactively(
+    args: argparse.Namespace,
+    config: dict,
+) -> str | None:
+    print()
+    args.model = prompt_text("Vision model", args.model)
+    args.ollama_host = prompt_text("Ollama host", args.ollama_host)
+    args.timeout = prompt_float("Model timeout (seconds)", args.timeout)
+    args.keepalive = prompt_text("Model keepalive", args.keepalive)
+    args.repeat_cooldown = prompt_float(
+        "Repeat cooldown (seconds)", args.repeat_cooldown
+    )
+    args.vision_size = prompt_optional_text(
+        "Vision frame size WIDTHxHEIGHT (leave blank for native)",
+        args.vision_size,
+    )
+    args.prompt = prompt_optional_text(
+        "Prompt override (leave blank for default)", args.prompt
+    )
+
+    print()
+    print("Vision summary")
+    print(f"  Model:    {args.model}")
+    print(f"  Host:     {args.ollama_host}")
+    print(f"  Timeout:  {args.timeout:g}s")
+    print(f"  Keepalive:{args.keepalive}")
+    print(f"  Vision:   {args.vision_size or 'native resolution'}")
+    print(
+        "  Prompt:   "
+        f"{'custom override' if args.prompt else 'default bib prompt'}"
+    )
+
+    if not prompt_yes_no("Save this vision setup as a reusable profile?", default=False):
+        return None
+    return ensure_profile_name(config)
+
+
 def profile_from_args(args: argparse.Namespace) -> dict:
     return {
         "device": args.device,
@@ -1055,6 +1354,7 @@ def profile_from_args(args: argparse.Namespace) -> dict:
         "audio_device": args.audio_device,
         "audio_input_rate": args.audio_input_rate,
         "audio_input_channels": args.audio_input_channels,
+        "audio_gain_db": args.audio_gain_db,
         "framerate": args.framerate,
         "video_size": args.video_size,
         "encoder": args.encoder,
@@ -1078,6 +1378,10 @@ def profile_summary_lines(profile_name: str, profile: dict) -> list[str]:
         (
             "  Audio:   "
             f"{profile.get('audio_device', 'disabled') if profile.get('audio', True) else 'disabled'}"
+        ),
+        (
+            "  Audio gain: "
+            f"{profile.get('audio_gain_db', DEFAULT_AUDIO_GAIN_DB):g} dB"
         ),
         f"  Storage: {storage_summary(recordings_dir)}",
     ]
@@ -1104,6 +1408,7 @@ def apply_profile(args: argparse.Namespace, profile: dict) -> None:
     args.audio_input_channels = profile.get(
         "audio_input_channels", args.audio_input_channels
     )
+    args.audio_gain_db = profile.get("audio_gain_db", args.audio_gain_db)
     args.framerate = profile.get("framerate", args.framerate)
     args.video_size = profile.get("video_size", args.video_size)
     args.encoder = profile.get("encoder", args.encoder)
@@ -1155,6 +1460,9 @@ def configure_record_interactively(
     print()
     args.audio, args.audio_device = select_audio_source(args.audio, args.audio_device)
     print()
+    if args.audio:
+        args.audio_gain_db = prompt_float("Audio gain (dB)", args.audio_gain_db)
+        print()
     args.recordings_dir = select_storage_path(args.recordings_dir.expanduser())
 
     print()
@@ -1164,6 +1472,8 @@ def configure_record_interactively(
         f"  Format:  {args.video_input_format if args.video_input_format != DEFAULT_VIDEO_INPUT_FORMAT else 'auto'}"
     )
     print(f"  Audio:   {args.audio_device if args.audio else 'disabled'}")
+    if args.audio:
+        print(f"  Gain:    {args.audio_gain_db:g} dB")
     print(f"  Storage: {storage_summary(args.recordings_dir)}")
     print(
         "  Stamp:   "
@@ -1227,6 +1537,9 @@ def command_setup(args: argparse.Namespace) -> int:
         print()
         args.audio, args.audio_device = select_audio_source(args.audio, args.audio_device)
         print()
+        if args.audio:
+            args.audio_gain_db = prompt_float("Audio gain (dB)", args.audio_gain_db)
+            print()
         args.recordings_dir = select_storage_path(args.recordings_dir.expanduser())
         print()
 
@@ -1247,12 +1560,29 @@ def command_setup(args: argparse.Namespace) -> int:
             args.video_size,
             args.framerate,
             args.video_input_format,
+            stop_on_exact=not interactive_mode_enabled(args),
         )
         if video_results:
-            print_video_probe_results(video_results)
-            args.video_size = selected_size
-            args.framerate = selected_fps
-            args.video_input_format = selected_format
+            if interactive_mode_enabled(args):
+                chosen_result = choose_video_probe_result(
+                    video_results,
+                    current_size=args.video_size,
+                    current_fps=args.framerate,
+                    current_input_format=args.video_input_format,
+                )
+                if chosen_result:
+                    args.video_size = chosen_result["actual_size"]
+                    args.framerate = int(round(chosen_result["actual_fps"]))
+                    args.video_input_format = chosen_result["input_format"]
+                else:
+                    args.video_size = selected_size
+                    args.framerate = selected_fps
+                    args.video_input_format = selected_format
+            else:
+                print_video_probe_results(video_results)
+                args.video_size = selected_size
+                args.framerate = selected_fps
+                args.video_input_format = selected_format
         else:
             print("Video probe did not find a better mode. Keeping current defaults.")
             if video_failure:
@@ -1286,6 +1616,7 @@ def command_setup(args: argparse.Namespace) -> int:
         print(
             f"  Audio input mode:  {args.audio_input_rate} Hz, {args.audio_input_channels} channel(s)"
         )
+        print(f"  Audio gain:        {args.audio_gain_db:g} dB")
     print(f"  Storage:           {storage_summary(args.recordings_dir)}")
     print(f"  Video encoder:     {args.encoder}")
     print(
@@ -1542,6 +1873,27 @@ def lock_name(prefix: str, device_name: str) -> str:
     return f"{prefix}-{slugify(device_name)}.lock"
 
 
+def lock_pid_is_active(lock_path: Path) -> bool:
+    try:
+        payload = lock_path.read_text()
+    except OSError:
+        return True
+    for line in payload.splitlines():
+        if not line.startswith("pid="):
+            continue
+        pid_text = line.split("=", 1)[1].strip()
+        if not pid_text.isdigit():
+            return True
+        try:
+            os.kill(int(pid_text), 0)
+        except ProcessLookupError:
+            return False
+        except OSError:
+            return True
+        return True
+    return True
+
+
 def acquire_device_locks(recordings_dir: Path, args: argparse.Namespace, session_name: str) -> list[Path]:
     lock_dir = recordings_dir / ".locks"
     ensure_directory(lock_dir)
@@ -1553,7 +1905,16 @@ def acquire_device_locks(recordings_dir: Path, args: argparse.Namespace, session
     try:
         for filename, device_name in lock_specs:
             lock_path = lock_dir / filename
-            fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            try:
+                fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            except FileExistsError:
+                if lock_pid_is_active(lock_path):
+                    raise
+                try:
+                    lock_path.unlink()
+                except OSError:
+                    raise
+                fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
             with os.fdopen(fd, "w") as handle:
                 handle.write(f"pid={os.getpid()}\n")
                 handle.write(f"session={session_name}\n")
@@ -1653,6 +2014,7 @@ def write_metadata(
         "audio_channels": args.audio_channels,
         "audio_sample_rate": args.audio_sample_rate,
         "audio_bitrate": args.audio_bitrate,
+        "audio_gain_db": args.audio_gain_db,
         "framerate": args.framerate,
         "video_size": args.video_size,
         "encoder": args.encoder,
@@ -1827,19 +2189,30 @@ def export_metadata_path(output_path: Path) -> Path:
 
 
 def resolve_export_encoder(
-    supported_encoders: set[str], session_metadata: dict
+    ffmpeg_path: str | None, supported_encoders: set[str], session_metadata: dict
 ) -> tuple[str | None, str, str]:
     session_encoder = session_metadata.get("encoder")
     session_preset = str(session_metadata.get("preset") or "fast")
-    if session_encoder and session_encoder in supported_encoders:
+    if (
+        ffmpeg_path
+        and session_encoder
+        and session_encoder in supported_encoders
+        and encoder_smoke_test(ffmpeg_path, session_encoder)
+    ):
         return session_encoder, session_preset, "matched session encoder"
-    if "h264_nvenc" in supported_encoders:
+    if ffmpeg_path and "h264_nvenc" in supported_encoders and encoder_smoke_test(
+        ffmpeg_path, "h264_nvenc"
+    ):
         return "h264_nvenc", "fast", "hardware export encoder available"
-    if "libx264" in supported_encoders:
+    if ffmpeg_path and "libx264" in supported_encoders and encoder_smoke_test(
+        ffmpeg_path, "libx264"
+    ):
         return "libx264", "medium", "software export fallback"
     fallback = None
     for candidate in ("h264_vaapi", "h264_v4l2m2m", "mpeg4"):
-        if candidate in supported_encoders:
+        if ffmpeg_path and candidate in supported_encoders and encoder_smoke_test(
+            ffmpeg_path, candidate
+        ):
             fallback = candidate
             break
     if fallback:
@@ -2036,26 +2409,37 @@ def normalize_bib_text(value: str) -> str | None:
 
 
 def extract_frame_at_time(
-    ffmpeg_bin: str, source_path: Path, offset_seconds: float, output_path: Path
+    ffmpeg_bin: str,
+    source_path: Path,
+    offset_seconds: float,
+    output_path: Path,
+    vision_size: str | None = None,
 ) -> None:
     ensure_directory(output_path.parent)
-    result = subprocess.run(
+    command = [
+        ffmpeg_bin,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-ss",
+        f"{max(0.0, offset_seconds):.3f}",
+        "-i",
+        str(source_path),
+    ]
+    if vision_size:
+        command.extend(["-vf", f"scale={vision_size}:force_original_aspect_ratio=decrease"])
+    command.extend(
         [
-            ffmpeg_bin,
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-ss",
-            f"{max(0.0, offset_seconds):.3f}",
-            "-i",
-            str(source_path),
             "-frames:v",
             "1",
             "-q:v",
             "2",
             str(output_path),
-        ],
+        ]
+    )
+    result = subprocess.run(
+        command,
         capture_output=True,
         text=True,
         check=False,
@@ -2252,7 +2636,7 @@ def process_vision_frame(
     keepalive: str,
     repeat_cooldown_seconds: float,
     last_promoted_by_bib: dict[str, float],
-) -> list[dict]:
+) -> VisionFrameResult:
     now = datetime.now().astimezone()
     started_at = time.perf_counter()
     frame_reference = relative_to_session(frame_path, session_dir)
@@ -2322,19 +2706,30 @@ def process_vision_frame(
                 "repeat_cooldown_s": repeat_cooldown_seconds,
             },
         )
-        return promoted
+        return VisionFrameResult(
+            promoted=promoted,
+            bibs=bibs,
+            elapsed_ms=elapsed_ms,
+            error=None,
+        )
     except RuntimeError as exc:
+        elapsed_ms = int(round((time.perf_counter() - started_at) * 1000))
         append_jsonl(
             runtime_paths["debug_log"],
             {
                 "w": event_wall_time(now),
                 "t": round(offset_seconds, 1),
                 "frame": frame_reference,
-                "elapsed_ms": int(round((time.perf_counter() - started_at) * 1000)),
+                "elapsed_ms": elapsed_ms,
                 "error": str(exc),
             },
         )
-    return []
+        return VisionFrameResult(
+            promoted=[],
+            bibs=[],
+            elapsed_ms=elapsed_ms,
+            error=str(exc),
+        )
 
 
 def print_session_summary(paths: SessionPaths) -> None:
@@ -2361,6 +2756,10 @@ def run_record_command(args: argparse.Namespace, *, launch_player: bool = False)
     config_path = args.config_file.expanduser()
     config = load_config(config_path)
     profiles = config.get("profiles", {})
+    if not args.profile:
+        last_profile = config.get("last_profile")
+        if last_profile in profiles:
+            args.profile = last_profile
     if args.profile:
         profile = profiles.get(args.profile)
         if not profile:
@@ -2508,6 +2907,40 @@ def run_record_command(args: argparse.Namespace, *, launch_player: bool = False)
 def command_vision_scan(args: argparse.Namespace) -> int:
     config_path = args.config_file.expanduser()
     config = load_config(config_path)
+    vision_profiles = config.get("vision_profiles", {})
+
+    selected_vision_profile = args.vision_profile
+    if interactive_mode_enabled(args):
+        selected_vision_profile = choose_vision_profile(
+            config,
+            preferred_profile=args.vision_profile,
+            allow_manual=True,
+        )
+        if selected_vision_profile and selected_vision_profile != "__manual__":
+            apply_vision_profile(args, vision_profiles[selected_vision_profile])
+            config["last_vision_profile"] = selected_vision_profile
+            for line in vision_profile_summary_lines(
+                selected_vision_profile, vision_profiles[selected_vision_profile]
+            ):
+                print(line)
+            print()
+        else:
+            created_profile = configure_vision_profile_interactively(args, config)
+            if created_profile:
+                vision_profiles[created_profile] = vision_profile_from_args(args)
+                config["vision_profiles"] = vision_profiles
+                config["last_vision_profile"] = created_profile
+                save_config(config_path, config)
+                print(f"Saved vision profile: {created_profile}")
+                print()
+    elif selected_vision_profile:
+        profile = vision_profiles.get(selected_vision_profile)
+        if not profile:
+            print(f"vision profile not found: {selected_vision_profile}", file=sys.stderr)
+            return 1
+        apply_vision_profile(args, profile)
+        config["last_vision_profile"] = selected_vision_profile
+
     if not args.target and interactive_mode_enabled(args):
         selected_target = select_export_target(
             args,
@@ -2566,6 +2999,7 @@ def command_vision_scan(args: argparse.Namespace) -> int:
     print(f"Vision scan source: {source.source_path}")
     print(f"Vision output dir:  {output_root}")
     print(f"Vision model:       {args.model}")
+    print(f"Vision frame size:  {args.vision_size or 'native'}")
     print(f"Samples:            {len(sample_points)}")
     print(f"Repeat cooldown:    {args.repeat_cooldown:.0f}s")
     if args.dry_run:
@@ -2581,8 +3015,9 @@ def command_vision_scan(args: argparse.Namespace) -> int:
                 source.source_path,
                 offset_seconds,
                 runtime_paths["scratch_frame"],
+                vision_size=args.vision_size,
             )
-            process_vision_frame(
+            result = process_vision_frame(
                 runtime_paths=runtime_paths,
                 session_dir=source.session_dir,
                 frame_path=runtime_paths["scratch_frame"],
@@ -2597,6 +3032,19 @@ def command_vision_scan(args: argparse.Namespace) -> int:
                 repeat_cooldown_seconds=args.repeat_cooldown,
                 last_promoted_by_bib=last_promoted_by_bib,
             )
+            if result.error:
+                print(
+                    f"  sample {format_duration(offset_seconds)} error after {result.elapsed_ms} ms: {result.error}"
+                )
+            elif result.promoted:
+                print(
+                    f"  sample {format_duration(offset_seconds)} promoted {', '.join(payload['b'] for payload in result.promoted)} in {result.elapsed_ms} ms"
+                )
+            else:
+                detected = ", ".join(result.bibs) if result.bibs else "nothing"
+                print(
+                    f"  sample {format_duration(offset_seconds)} saw {detected} in {result.elapsed_ms} ms"
+                )
         except RuntimeError as exc:
             append_jsonl(
                 runtime_paths["debug_log"],
@@ -2618,6 +3066,40 @@ def command_vision_scan(args: argparse.Namespace) -> int:
 def command_vision_live(args: argparse.Namespace) -> int:
     config_path = args.config_file.expanduser()
     config = load_config(config_path)
+    vision_profiles = config.get("vision_profiles", {})
+
+    selected_vision_profile = args.vision_profile
+    if interactive_mode_enabled(args):
+        selected_vision_profile = choose_vision_profile(
+            config,
+            preferred_profile=args.vision_profile,
+            allow_manual=True,
+        )
+        if selected_vision_profile and selected_vision_profile != "__manual__":
+            apply_vision_profile(args, vision_profiles[selected_vision_profile])
+            config["last_vision_profile"] = selected_vision_profile
+            for line in vision_profile_summary_lines(
+                selected_vision_profile, vision_profiles[selected_vision_profile]
+            ):
+                print(line)
+            print()
+        else:
+            created_profile = configure_vision_profile_interactively(args, config)
+            if created_profile:
+                vision_profiles[created_profile] = vision_profile_from_args(args)
+                config["vision_profiles"] = vision_profiles
+                config["last_vision_profile"] = created_profile
+                save_config(config_path, config)
+                print(f"Saved vision profile: {created_profile}")
+                print()
+    elif selected_vision_profile:
+        profile = vision_profiles.get(selected_vision_profile)
+        if not profile:
+            print(f"vision profile not found: {selected_vision_profile}", file=sys.stderr)
+            return 1
+        apply_vision_profile(args, profile)
+        config["last_vision_profile"] = selected_vision_profile
+
     if not args.session_dir and interactive_mode_enabled(args):
         selected_target = select_session_target(
             args,
@@ -2671,6 +3153,7 @@ def command_vision_live(args: argparse.Namespace) -> int:
     print(f"Vision live session: {session_dir}")
     print(f"Vision output dir:   {output_root}")
     print(f"Vision model:        {args.model}")
+    print(f"Vision frame size:   {args.vision_size or 'native'}")
     print(f"Repeat cooldown:     {args.repeat_cooldown:.0f}s")
     print("Sampling is model-paced; press Ctrl+C to stop.")
 
@@ -2704,8 +3187,13 @@ def command_vision_live(args: argparse.Namespace) -> int:
                 timeshift_path,
                 offset_seconds,
                 runtime_paths["scratch_frame"],
+                vision_size=args.vision_size,
             )
-            promoted = process_vision_frame(
+            print(
+                f"[vision-live] analyzing {format_duration(offset_seconds)} with {args.model}...",
+                flush=True,
+            )
+            result = process_vision_frame(
                 runtime_paths=runtime_paths,
                 session_dir=session_dir,
                 frame_path=runtime_paths["scratch_frame"],
@@ -2720,7 +3208,23 @@ def command_vision_live(args: argparse.Namespace) -> int:
                 repeat_cooldown_seconds=args.repeat_cooldown,
                 last_promoted_by_bib=last_promoted_by_bib,
             )
-            for payload in promoted:
+            if result.error:
+                print(
+                    f"[vision-live] {format_duration(offset_seconds)} error after {result.elapsed_ms} ms: {result.error}",
+                    flush=True,
+                )
+            elif result.promoted:
+                print(
+                    f"[vision-live] {format_duration(offset_seconds)} promoted {', '.join(payload['b'] for payload in result.promoted)} in {result.elapsed_ms} ms",
+                    flush=True,
+                )
+            else:
+                detected = ", ".join(result.bibs) if result.bibs else "nothing"
+                print(
+                    f"[vision-live] {format_duration(offset_seconds)} saw {detected} in {result.elapsed_ms} ms",
+                    flush=True,
+                )
+            for payload in result.promoted:
                 print(vision_event_log_line(payload), flush=True)
             processed_offsets.add(rounded_offset)
             sample_count += 1
@@ -3192,7 +3696,7 @@ def command_export(args: argparse.Namespace) -> int:
     preset = EXPORT_PRESETS[preset_name]
     total_mbps = preset_total_mbps(preset_name)
     export_encoder, export_preset, export_encoder_reason = resolve_export_encoder(
-        supported_encoders, session_metadata
+        ffmpeg_path, supported_encoders, session_metadata
     )
     if not export_encoder:
         print("no supported export video encoder found for this ffmpeg build", file=sys.stderr)
@@ -3266,12 +3770,20 @@ def command_export(args: argparse.Namespace) -> int:
 
 def check_ffmpeg_support(ffmpeg_bin: str) -> tuple[str | None, bool]:
     ffmpeg_path, supported_encoders = detect_supported_encoders(ffmpeg_bin)
-    return ffmpeg_path, "h264_nvenc" in supported_encoders
+    return ffmpeg_path, bool(
+        ffmpeg_path
+        and "h264_nvenc" in supported_encoders
+        and encoder_smoke_test(ffmpeg_path, "h264_nvenc")
+    )
 
 
 def command_doctor(args: argparse.Namespace) -> int:
     ffmpeg_path, supported_encoders = detect_supported_encoders(args.ffmpeg_bin)
-    has_nvenc = "h264_nvenc" in supported_encoders
+    has_nvenc = bool(
+        ffmpeg_path
+        and "h264_nvenc" in supported_encoders
+        and encoder_smoke_test(ffmpeg_path, "h264_nvenc")
+    )
     resolved_encoder = resolve_encoder(ffmpeg_path, supported_encoders, args.encoder)
     player = choose_player(args.player)
     device_exists = Path(args.device).exists()
@@ -3334,8 +3846,8 @@ def add_record_arguments(
     parser.add_argument(
         "--audio-gain-db",
         type=float,
-        default=18.0,
-        help="Audio gain boost in dB. Default helps very quiet capture-card audio.",
+        default=DEFAULT_AUDIO_GAIN_DB,
+        help="Audio gain adjustment in dB. Default trims hot inputs to avoid clipping.",
     )
     parser.add_argument(
         "--audio-encoder",
@@ -3503,6 +4015,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Preferred audio input channel count to probe.",
     )
     setup.add_argument(
+        "--audio-gain-db",
+        type=float,
+        default=DEFAULT_AUDIO_GAIN_DB,
+        help="Saved audio gain adjustment in dB.",
+    )
+    setup.add_argument(
         "--framerate",
         type=int,
         default=30,
@@ -3639,6 +4157,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Ollama vision model to query.",
     )
     vision_scan.add_argument(
+        "--vision-profile",
+        help="Saved vision profile to use before any interactive edits.",
+    )
+    vision_scan.add_argument(
         "--ollama-host",
         default=DEFAULT_OLLAMA_HOST,
         help="Base URL for the local Ollama server.",
@@ -3665,6 +4187,10 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_VISION_REPEAT_COOLDOWN,
         help="Minimum seconds before the same bib is promoted again.",
+    )
+    vision_scan.add_argument(
+        "--vision-size",
+        help="Optional WIDTHxHEIGHT to downscale frames before sending them to the vision model.",
     )
     vision_scan.add_argument(
         "--keepalive",
@@ -3714,6 +4240,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Ollama vision model to query.",
     )
     vision_live.add_argument(
+        "--vision-profile",
+        help="Saved vision profile to use before any interactive edits.",
+    )
+    vision_live.add_argument(
         "--ollama-host",
         default=DEFAULT_OLLAMA_HOST,
         help="Base URL for the local Ollama server.",
@@ -3735,6 +4265,10 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_VISION_REPEAT_COOLDOWN,
         help="Minimum seconds before the same bib is promoted again.",
+    )
+    vision_live.add_argument(
+        "--vision-size",
+        help="Optional WIDTHxHEIGHT to downscale frames before sending them to the vision model.",
     )
     vision_live.add_argument(
         "--keepalive",
