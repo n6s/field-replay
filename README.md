@@ -177,9 +177,24 @@ Live follow:
 `vision-live` follows a growing session in a model-paced loop:
 
 - grab a frame a few seconds behind live
+- optionally run a cheap motion gate first
 - ask the local model for bib guesses or custom detections
 - promote only useful sightings
 - print promoted sightings to stdout
+
+Example with motion gating enabled:
+
+```bash
+./field-replay vision-live ~/recordings/run-20260408-181629 \
+  --motion-gate \
+  --motion-size 160x90 \
+  --motion-threshold 8 \
+  --motion-min-changed-pct 1.5 \
+  --motion-consecutive 2 \
+  --motion-hold 4
+```
+
+This keeps the normal rolling `timeshift.ts` recording, but skips most Ollama calls until the watched scene changes enough to be interesting.
 
 For custom prompt experiments, the vision parser now also accepts:
 
@@ -195,7 +210,7 @@ or
 
 The default bib-reading prompt still works unchanged with `{"bibs":[...]}`.
 
-### 6. Look up and review a bib
+### 6. Look up and review a bib or custom label
 
 ```bash
 ./field-replay find-bib 241
@@ -234,6 +249,8 @@ Vision output currently includes:
 - `vision-debug.jsonl`: raw model diagnostics, latency, promoted and suppressed detections
 - `frames/`: promoted evidence frames only
 
+When motion gating is enabled, `vision-debug.jsonl` also records the per-sample motion scores and whether the gate stayed closed or allowed a vision call.
+
 Promoted frames are annotated with the detected labels along the bottom beside the timestamp strip so they are easier to review in `eog`.
 
 By default, the same detection is only promoted once every 60 seconds. Sampled frames still go through the model and appear in diagnostics, but only promoted sightings are kept in `frames/` and surfaced in the operator-facing event log.
@@ -245,6 +262,7 @@ Current vision behavior is intentionally conservative:
 - default model: `gemma4:e2b`
 - strict JSON prompt by default, with prompt overrides for custom labels
 - model-paced live sampling
+- optional motion gate before model calls
 - repeat cooldown for calmer logs
 - promoted frames only, not every sampled frame
 

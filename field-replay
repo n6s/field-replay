@@ -41,6 +41,12 @@ DEFAULT_VISION_MODEL = "gemma4:e2b"
 DEFAULT_VISION_SAMPLE_INTERVAL = 10.0
 DEFAULT_VISION_TAIL_OFFSET = 4.0
 DEFAULT_VISION_REPEAT_COOLDOWN = 60.0
+DEFAULT_MOTION_SIZE = "160x90"
+DEFAULT_MOTION_THRESHOLD = 8.0
+DEFAULT_MOTION_MIN_CHANGED_PCT = 1.5
+DEFAULT_MOTION_CONSECUTIVE = 2
+DEFAULT_MOTION_HOLD = 4.0
+DEFAULT_MOTION_PIXEL_DELTA = 20
 DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
 DEFAULT_VISION_SWEEP_VARIANTS = (
     "source",
@@ -143,6 +149,16 @@ class VisionSweepVariant:
     label: str
     output_slug: str
     frame_filter: str | None
+
+
+@dataclass(frozen=True)
+class MotionSampleResult:
+    enabled: bool
+    mean_diff: float | None
+    changed_pct: float | None
+    triggered: bool
+    gate_open: bool
+    reason: str
 
 
 def source_type_value(args: argparse.Namespace | dict) -> str:
@@ -1346,7 +1362,7 @@ def known_recordings_roots(args: argparse.Namespace, config: dict) -> list[Path]
 
 
 def vision_profile_from_args(args: argparse.Namespace) -> dict:
-    return {
+    profile = {
         "model": args.model,
         "ollama_host": args.ollama_host,
         "timeout": args.timeout,
@@ -1355,11 +1371,25 @@ def vision_profile_from_args(args: argparse.Namespace) -> dict:
         "vision_size": args.vision_size,
         "prompt": args.prompt,
     }
+    if hasattr(args, "motion_gate"):
+        profile["motion_gate"] = args.motion_gate
+    if hasattr(args, "motion_size"):
+        profile["motion_size"] = args.motion_size
+    if hasattr(args, "motion_threshold"):
+        profile["motion_threshold"] = args.motion_threshold
+    if hasattr(args, "motion_min_changed_pct"):
+        profile["motion_min_changed_pct"] = args.motion_min_changed_pct
+    if hasattr(args, "motion_consecutive"):
+        profile["motion_consecutive"] = args.motion_consecutive
+    if hasattr(args, "motion_hold"):
+        profile["motion_hold"] = args.motion_hold
+    return profile
 
 
 def vision_profile_summary_lines(profile_name: str, profile: dict) -> list[str]:
     prompt_override = profile.get("prompt")
     prompt_label = "custom" if prompt_override else "default"
+    motion_gate = bool(profile.get("motion_gate", False))
     return [
         f"Vision profile: {profile_name}",
         f"  Model:    {profile.get('model', DEFAULT_VISION_MODEL)}",
@@ -1367,6 +1397,14 @@ def vision_profile_summary_lines(profile_name: str, profile: dict) -> list[str]:
         f"  Timeout:  {profile.get('timeout', 120.0):g}s",
         f"  Keepalive:{profile.get('keepalive', '5m')}",
         f"  Vision:   {profile.get('vision_size') or 'native resolution'}",
+        (
+            "  Motion:   "
+            f"{profile.get('motion_size', DEFAULT_MOTION_SIZE)} gate, "
+            f"mean>={profile.get('motion_threshold', DEFAULT_MOTION_THRESHOLD):g}, "
+            f"changed>={profile.get('motion_min_changed_pct', DEFAULT_MOTION_MIN_CHANGED_PCT):g}%"
+            if motion_gate
+            else "  Motion:   disabled"
+        ),
         f"  Prompt:   {prompt_label}",
     ]
 
@@ -1375,6 +1413,8 @@ def vision_profile_menu_label(profile_name: str, profile: dict) -> str:
     details = [profile.get("model", DEFAULT_VISION_MODEL)]
     if profile.get("vision_size"):
         details.append(str(profile["vision_size"]))
+    if profile.get("motion_gate"):
+        details.append("motion gate")
     if profile.get("prompt"):
         details.append("custom prompt")
     return f"{profile_name} ({'; '.join(details)})"
@@ -1388,6 +1428,22 @@ def apply_vision_profile(args: argparse.Namespace, profile: dict) -> None:
     args.repeat_cooldown = profile.get("repeat_cooldown", args.repeat_cooldown)
     args.vision_size = profile.get("vision_size", args.vision_size)
     args.prompt = profile.get("prompt", args.prompt)
+    if hasattr(args, "motion_gate"):
+        args.motion_gate = profile.get("motion_gate", args.motion_gate)
+    if hasattr(args, "motion_size"):
+        args.motion_size = profile.get("motion_size", args.motion_size)
+    if hasattr(args, "motion_threshold"):
+        args.motion_threshold = profile.get("motion_threshold", args.motion_threshold)
+    if hasattr(args, "motion_min_changed_pct"):
+        args.motion_min_changed_pct = profile.get(
+            "motion_min_changed_pct", args.motion_min_changed_pct
+        )
+    if hasattr(args, "motion_consecutive"):
+        args.motion_consecutive = int(
+            profile.get("motion_consecutive", args.motion_consecutive)
+        )
+    if hasattr(args, "motion_hold"):
+        args.motion_hold = profile.get("motion_hold", args.motion_hold)
 
 
 def choose_vision_profile(
@@ -1429,6 +1485,29 @@ def configure_vision_profile_interactively(
         "Vision frame size WIDTHxHEIGHT (leave blank for native)",
         args.vision_size,
     )
+    if hasattr(args, "motion_gate"):
+        args.motion_gate = prompt_yes_no(
+            "Enable motion gate before calling the model?", args.motion_gate
+        )
+        if args.motion_gate:
+            args.motion_size = prompt_text(
+                "Motion frame size WIDTHxHEIGHT", args.motion_size
+            )
+            args.motion_threshold = prompt_float(
+                "Motion mean-difference threshold", args.motion_threshold
+            )
+            args.motion_min_changed_pct = prompt_float(
+                "Motion minimum changed percent", args.motion_min_changed_pct
+            )
+            args.motion_consecutive = int(
+                prompt_float(
+                    "Consecutive motion hits required",
+                    float(args.motion_consecutive),
+                )
+            )
+            args.motion_hold = prompt_float(
+                "Motion hold-open seconds", args.motion_hold
+            )
     args.prompt = prompt_optional_text(
         "Prompt override (leave blank for default)", args.prompt
     )
@@ -1440,6 +1519,15 @@ def configure_vision_profile_interactively(
     print(f"  Timeout:  {args.timeout:g}s")
     print(f"  Keepalive:{args.keepalive}")
     print(f"  Vision:   {args.vision_size or 'native resolution'}")
+    if getattr(args, "motion_gate", False):
+        print(
+            "  Motion:   "
+            f"{args.motion_size} gate, mean>={args.motion_threshold:g}, "
+            f"changed>={args.motion_min_changed_pct:g}%, "
+            f"hits>={args.motion_consecutive}, hold={args.motion_hold:g}s"
+        )
+    else:
+        print("  Motion:   disabled")
     print(
         "  Prompt:   "
         f"{'custom override' if args.prompt else 'default bib prompt'}"
@@ -2750,6 +2838,136 @@ def extract_frame_at_time(
         raise RuntimeError(result.stderr.strip() or "ffmpeg timed frame extraction failed")
 
 
+def extract_motion_plane_at_time(
+    ffmpeg_bin: str,
+    source_path: Path,
+    offset_seconds: float,
+    *,
+    motion_size: str,
+) -> bytes:
+    dimensions = parse_scale_dimensions(motion_size)
+    if not dimensions:
+        raise ValueError(
+            f"invalid motion size: {motion_size!r}; expected WxH like 160x90"
+        )
+    width, height = dimensions
+    motion_filter = (
+        f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+        f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,"
+        "format=gray"
+    )
+    command = [
+        ffmpeg_bin,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-ss",
+        f"{max(0.0, offset_seconds):.3f}",
+        "-i",
+        str(source_path),
+        "-vf",
+        motion_filter,
+        "-frames:v",
+        "1",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "gray",
+        "-",
+    ]
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        stderr = result.stderr.decode("utf-8", errors="ignore").strip()
+        raise RuntimeError(stderr or "ffmpeg motion frame extraction failed")
+    expected_size = width * height
+    if len(result.stdout) != expected_size:
+        raise RuntimeError(
+            f"unexpected motion frame size: got {len(result.stdout)} bytes, expected {expected_size}"
+        )
+    return result.stdout
+
+
+def compute_motion_metrics(
+    previous_frame: bytes | None,
+    current_frame: bytes,
+    *,
+    pixel_delta_threshold: int = DEFAULT_MOTION_PIXEL_DELTA,
+) -> tuple[float | None, float | None]:
+    if previous_frame is None:
+        return None, None
+    if len(previous_frame) != len(current_frame):
+        raise ValueError("motion frames must have matching sizes")
+    if not current_frame:
+        return 0.0, 0.0
+
+    total_delta = 0
+    changed_pixels = 0
+    frame_length = len(current_frame)
+    for previous_value, current_value in zip(previous_frame, current_frame):
+        delta = abs(current_value - previous_value)
+        total_delta += delta
+        if delta >= pixel_delta_threshold:
+            changed_pixels += 1
+
+    mean_diff = total_delta / frame_length
+    changed_pct = (changed_pixels / frame_length) * 100.0
+    return mean_diff, changed_pct
+
+
+def evaluate_motion_gate(
+    *,
+    enabled: bool,
+    previous_frame: bytes | None,
+    current_frame: bytes,
+    mean_threshold: float,
+    min_changed_pct: float,
+) -> MotionSampleResult:
+    if not enabled:
+        return MotionSampleResult(
+            enabled=False,
+            mean_diff=None,
+            changed_pct=None,
+            triggered=True,
+            gate_open=True,
+            reason="disabled",
+        )
+
+    mean_diff, changed_pct = compute_motion_metrics(previous_frame, current_frame)
+    if mean_diff is None or changed_pct is None:
+        return MotionSampleResult(
+            enabled=True,
+            mean_diff=None,
+            changed_pct=None,
+            triggered=False,
+            gate_open=False,
+            reason="warming-up",
+        )
+
+    triggered = mean_diff >= mean_threshold and changed_pct >= min_changed_pct
+    if triggered:
+        reason = "triggered"
+    elif mean_diff < mean_threshold and changed_pct < min_changed_pct:
+        reason = "below-mean-and-change"
+    elif mean_diff < mean_threshold:
+        reason = "below-mean"
+    else:
+        reason = "below-change"
+
+    return MotionSampleResult(
+        enabled=True,
+        mean_diff=mean_diff,
+        changed_pct=changed_pct,
+        triggered=triggered,
+        gate_open=triggered,
+        reason=reason,
+    )
+
+
 def media_sample_points(duration_seconds: float, sample_interval: float) -> list[float]:
     sample_interval = max(sample_interval, 0.1)
     if duration_seconds <= 0:
@@ -3219,6 +3437,17 @@ def process_vision_frame(
             elapsed_ms=elapsed_ms,
             error=str(exc),
         )
+
+
+def motion_summary_text(result: MotionSampleResult) -> str:
+    if not result.enabled:
+        return "motion gate disabled"
+    if result.mean_diff is None or result.changed_pct is None:
+        return "motion warm-up"
+    return (
+        f"motion mean {result.mean_diff:.1f}, "
+        f"changed {result.changed_pct:.1f}% ({result.reason})"
+    )
 
 
 def print_session_summary(paths: SessionPaths) -> None:
@@ -3815,16 +4044,47 @@ def command_vision_live(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(exc, file=sys.stderr)
         return 1
+    if args.motion_gate:
+        if parse_scale_dimensions(args.motion_size) is None:
+            print(
+                f"invalid motion size: {args.motion_size!r}; expected WxH like 160x90",
+                file=sys.stderr,
+            )
+            return 1
+        if args.motion_consecutive < 1:
+            print("motion-consecutive must be at least 1", file=sys.stderr)
+            return 1
+        if args.motion_threshold < 0:
+            print("motion-threshold must be non-negative", file=sys.stderr)
+            return 1
+        if args.motion_min_changed_pct < 0:
+            print("motion-min-changed-pct must be non-negative", file=sys.stderr)
+            return 1
+        if args.motion_hold < 0:
+            print("motion-hold must be non-negative", file=sys.stderr)
+            return 1
     timeshift_path = session_dir / DEFAULT_TIMESHIFT_NAME
     processed_offsets: set[float] = set()
     sample_count = 0
     last_promoted_by_detection: dict[str, float] = {}
+    previous_motion_frame: bytes | None = None
+    consecutive_motion_hits = 0
+    gate_open_until: float | None = None
 
     print(f"Vision live session: {session_dir}")
     print(f"Vision output dir:   {output_root}")
     print(f"Vision model:        {args.model}")
     print(f"Vision frame size:   {args.vision_size or 'native'}")
     print(f"Repeat cooldown:     {args.repeat_cooldown:.0f}s")
+    if args.motion_gate:
+        print(
+            "Motion gate:        "
+            f"{args.motion_size}, mean>={args.motion_threshold:g}, "
+            f"changed>={args.motion_min_changed_pct:g}%, "
+            f"hits>={args.motion_consecutive}, hold={args.motion_hold:g}s"
+        )
+    else:
+        print("Motion gate:        disabled")
     print("Sampling is model-paced; press Ctrl+C to stop.")
 
     while True:
@@ -3852,6 +4112,92 @@ def command_vision_live(args: argparse.Namespace) -> int:
             continue
 
         try:
+            motion_result = MotionSampleResult(
+                enabled=False,
+                mean_diff=None,
+                changed_pct=None,
+                triggered=True,
+                gate_open=True,
+                reason="disabled",
+            )
+            motion_gate_open = True
+            if args.motion_gate:
+                current_motion_frame = extract_motion_plane_at_time(
+                    ffmpeg_path,
+                    timeshift_path,
+                    offset_seconds,
+                    motion_size=args.motion_size,
+                )
+                motion_result = evaluate_motion_gate(
+                    enabled=True,
+                    previous_frame=previous_motion_frame,
+                    current_frame=current_motion_frame,
+                    mean_threshold=args.motion_threshold,
+                    min_changed_pct=args.motion_min_changed_pct,
+                )
+                previous_motion_frame = current_motion_frame
+                if motion_result.triggered:
+                    consecutive_motion_hits += 1
+                else:
+                    consecutive_motion_hits = 0
+                if consecutive_motion_hits >= max(args.motion_consecutive, 1):
+                    gate_open_until = offset_seconds + max(args.motion_hold, 0.0)
+                motion_gate_open = (
+                    gate_open_until is not None
+                    and offset_seconds <= gate_open_until + 0.001
+                )
+                motion_result = MotionSampleResult(
+                    enabled=True,
+                    mean_diff=motion_result.mean_diff,
+                    changed_pct=motion_result.changed_pct,
+                    triggered=motion_result.triggered,
+                    gate_open=motion_gate_open,
+                    reason=motion_result.reason,
+                )
+
+            if args.motion_gate and not motion_gate_open:
+                append_jsonl(
+                    runtime_paths["debug_log"],
+                    {
+                        "w": event_wall_time(datetime.now().astimezone()),
+                        "t": round(offset_seconds, 1),
+                        "frame": None,
+                        "motion_gate": {
+                            "enabled": True,
+                            "size": args.motion_size,
+                            "mean_diff": (
+                                round(motion_result.mean_diff, 3)
+                                if motion_result.mean_diff is not None
+                                else None
+                            ),
+                            "changed_pct": (
+                                round(motion_result.changed_pct, 3)
+                                if motion_result.changed_pct is not None
+                                else None
+                            ),
+                            "triggered": motion_result.triggered,
+                            "gate_open": False,
+                            "reason": motion_result.reason,
+                            "consecutive_hits": consecutive_motion_hits,
+                            "hold_until": (
+                                round(gate_open_until, 3)
+                                if gate_open_until is not None
+                                else None
+                            ),
+                        },
+                        "skipped_reason": "motion-gate-closed",
+                    },
+                )
+                print(
+                    f"[vision-live] {format_duration(offset_seconds)} {motion_summary_text(motion_result)}, skipping vision",
+                    flush=True,
+                )
+                processed_offsets.add(rounded_offset)
+                sample_count += 1
+                if args.once:
+                    return 0
+                continue
+
             extract_frame_at_time(
                 ffmpeg_path,
                 timeshift_path,
@@ -3860,7 +4206,8 @@ def command_vision_live(args: argparse.Namespace) -> int:
                 frame_filter=frame_filter,
             )
             print(
-                f"[vision-live] analyzing {format_duration(offset_seconds)} with {args.model}...",
+                f"[vision-live] analyzing {format_duration(offset_seconds)} with {args.model} "
+                f"({motion_summary_text(motion_result)})...",
                 flush=True,
             )
             result = process_vision_frame(
@@ -3878,6 +4225,40 @@ def command_vision_live(args: argparse.Namespace) -> int:
                 repeat_cooldown_seconds=args.repeat_cooldown,
                 last_promoted_by_detection=last_promoted_by_detection,
             )
+            if args.motion_gate:
+                append_jsonl(
+                    runtime_paths["debug_log"],
+                    {
+                        "w": event_wall_time(datetime.now().astimezone()),
+                        "t": round(offset_seconds, 1),
+                        "frame": relative_to_session(
+                            runtime_paths["scratch_frame"], session_dir
+                        ),
+                        "motion_gate": {
+                            "enabled": True,
+                            "size": args.motion_size,
+                            "mean_diff": (
+                                round(motion_result.mean_diff, 3)
+                                if motion_result.mean_diff is not None
+                                else None
+                            ),
+                            "changed_pct": (
+                                round(motion_result.changed_pct, 3)
+                                if motion_result.changed_pct is not None
+                                else None
+                            ),
+                            "triggered": motion_result.triggered,
+                            "gate_open": motion_result.gate_open,
+                            "reason": motion_result.reason,
+                            "consecutive_hits": consecutive_motion_hits,
+                            "hold_until": (
+                                round(gate_open_until, 3)
+                                if gate_open_until is not None
+                                else None
+                            ),
+                        },
+                    },
+                )
             if result.error:
                 print(
                     f"[vision-live] {format_duration(offset_seconds)} error after {result.elapsed_ms} ms: {result.error}",
@@ -3901,6 +4282,8 @@ def command_vision_live(args: argparse.Namespace) -> int:
                 print(vision_event_log_line(payload), flush=True)
             processed_offsets.add(rounded_offset)
             sample_count += 1
+            if args.once:
+                return 0
         except RuntimeError as exc:
             append_jsonl(
                 runtime_paths["debug_log"],
@@ -5088,6 +5471,41 @@ def build_parser() -> argparse.ArgumentParser:
     vision_live.add_argument(
         "--vision-size",
         help="Optional WIDTHxHEIGHT to downscale frames before sending them to the vision model.",
+    )
+    vision_live.add_argument(
+        "--motion-gate",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use a cheap motion check before calling the vision model.",
+    )
+    vision_live.add_argument(
+        "--motion-size",
+        default=DEFAULT_MOTION_SIZE,
+        help="Motion gate frame size, as WIDTHxHEIGHT. Smaller is cheaper.",
+    )
+    vision_live.add_argument(
+        "--motion-threshold",
+        type=float,
+        default=DEFAULT_MOTION_THRESHOLD,
+        help="Minimum mean grayscale delta needed to count as motion.",
+    )
+    vision_live.add_argument(
+        "--motion-min-changed-pct",
+        type=float,
+        default=DEFAULT_MOTION_MIN_CHANGED_PCT,
+        help="Minimum percent of pixels with meaningful change to count as motion.",
+    )
+    vision_live.add_argument(
+        "--motion-consecutive",
+        type=int,
+        default=DEFAULT_MOTION_CONSECUTIVE,
+        help="How many consecutive motion hits are required to open the gate.",
+    )
+    vision_live.add_argument(
+        "--motion-hold",
+        type=float,
+        default=DEFAULT_MOTION_HOLD,
+        help="Seconds to keep the gate open after the last confirmed motion hit.",
     )
     vision_live.add_argument(
         "--keepalive",
