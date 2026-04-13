@@ -7,7 +7,7 @@ Its current sweet spot is:
 - record one growing near-live `timeshift.ts` file while the event is happening
 - watch that file in VLC a few seconds behind live so you can pause and rewind
 - burn a wall-clock timestamp into the video by default
-- run a local vision model against the session to log likely bib sightings
+- run a local vision model against the session to log likely bib sightings or custom detections
 - review saved evidence frames and jump back into video when something needs confirmation
 
 This is no longer just an experiment. The current workflow is stable and usable for real review work, especially when the goal is answering questions like "when did bib 241 arrive?" or "when was the last time we saw bib 573?"
@@ -20,9 +20,9 @@ What is working well right now:
 - interactive setup and saved profiles
 - timestamp overlay burned into the video
 - near-live VLC playback with practical rewind behavior
-- local Ollama vision support for bib detection
+- local Ollama vision support for bib detection and custom label prompts
 - promoted evidence logs plus saved frame grabs
-- `find-bib` and `review` for post-hoc lookup
+- `find-bib` and `review` for post-hoc lookup of bibs or custom labels
 
 What to treat as current assumptions:
 
@@ -177,9 +177,23 @@ Live follow:
 `vision-live` follows a growing session in a model-paced loop:
 
 - grab a frame a few seconds behind live
-- ask the local model for bib guesses
+- ask the local model for bib guesses or custom detections
 - promote only useful sightings
 - print promoted sightings to stdout
+
+For custom prompt experiments, the vision parser now also accepts:
+
+```json
+{"detections":["person","car"]}
+```
+
+or
+
+```json
+{"labels":["person","pet","car"]}
+```
+
+The default bib-reading prompt still works unchanged with `{"bibs":[...]}`.
 
 ### 6. Look up and review a bib
 
@@ -217,19 +231,19 @@ Vision output currently includes:
 
 - `events.log`: human-readable promoted sightings, good for `tail -f`
 - `events.jsonl`: promoted event records
-- `vision-debug.jsonl`: raw model diagnostics, latency, promoted and suppressed bibs
+- `vision-debug.jsonl`: raw model diagnostics, latency, promoted and suppressed detections
 - `frames/`: promoted evidence frames only
 
-Promoted frames are annotated with the detected bibs along the bottom beside the timestamp strip so they are easier to review in `eog`.
+Promoted frames are annotated with the detected labels along the bottom beside the timestamp strip so they are easier to review in `eog`.
 
-By default, the same bib is only promoted once every 60 seconds. Sampled frames still go through the model and appear in diagnostics, but only promoted sightings are kept in `frames/` and surfaced in the operator-facing event log.
+By default, the same detection is only promoted once every 60 seconds. Sampled frames still go through the model and appear in diagnostics, but only promoted sightings are kept in `frames/` and surfaced in the operator-facing event log.
 
 ## Vision Notes
 
 Current vision behavior is intentionally conservative:
 
 - default model: `gemma4:e2b`
-- strict JSON bib prompt
+- strict JSON prompt by default, with prompt overrides for custom labels
 - model-paced live sampling
 - repeat cooldown for calmer logs
 - promoted frames only, not every sampled frame
@@ -238,11 +252,11 @@ This makes the live terminal and saved frame folder much more useful during stre
 
 The vision commands are best treated as:
 
-- a live bib tail
+- a live detection tail
 - a source of saved evidence frames
 - a fast way to jump back into video
 
-They are not a guarantee of correctness. Some bibs will still be missed, partially read, or never promoted.
+They are not a guarantee of correctness. Some bibs or custom detections will still be missed, partially read, or never promoted.
 
 ## Player Behavior
 
