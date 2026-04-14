@@ -47,6 +47,8 @@ DEFAULT_MOTION_MIN_CHANGED_PCT = 1.5
 DEFAULT_MOTION_CONSECUTIVE = 2
 DEFAULT_MOTION_HOLD = 4.0
 DEFAULT_MOTION_PIXEL_DELTA = 20
+DEFAULT_MOTION_ZONE_GRID = 4
+DEFAULT_MOTION_PREVIEW_SIZE = "960x540"
 DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
 DEFAULT_VISION_SWEEP_VARIANTS = (
     "source",
@@ -1383,6 +1385,8 @@ def vision_profile_from_args(args: argparse.Namespace) -> dict:
         profile["motion_consecutive"] = args.motion_consecutive
     if hasattr(args, "motion_hold"):
         profile["motion_hold"] = args.motion_hold
+    if hasattr(args, "motion_zone"):
+        profile["motion_zone"] = args.motion_zone
     return profile
 
 
@@ -1400,6 +1404,7 @@ def vision_profile_summary_lines(profile_name: str, profile: dict) -> list[str]:
         (
             "  Motion:   "
             f"{profile.get('motion_size', DEFAULT_MOTION_SIZE)} gate, "
+            f"zone {motion_zone_label(profile.get('motion_zone'))}, "
             f"mean>={profile.get('motion_threshold', DEFAULT_MOTION_THRESHOLD):g}, "
             f"changed>={profile.get('motion_min_changed_pct', DEFAULT_MOTION_MIN_CHANGED_PCT):g}%"
             if motion_gate
@@ -1444,6 +1449,8 @@ def apply_vision_profile(args: argparse.Namespace, profile: dict) -> None:
         )
     if hasattr(args, "motion_hold"):
         args.motion_hold = profile.get("motion_hold", args.motion_hold)
+    if hasattr(args, "motion_zone"):
+        args.motion_zone = profile.get("motion_zone", args.motion_zone)
 
 
 def choose_vision_profile(
@@ -1520,9 +1527,15 @@ def configure_vision_profile_interactively(
     print(f"  Keepalive:{args.keepalive}")
     print(f"  Vision:   {args.vision_size or 'native resolution'}")
     if getattr(args, "motion_gate", False):
+        zone_summary = (
+            motion_zone_label(args.motion_zone)
+            if args.motion_zone is not None
+            else "choose from preview after selecting a session"
+        )
         print(
             "  Motion:   "
-            f"{args.motion_size} gate, mean>={args.motion_threshold:g}, "
+            f"{args.motion_size} gate, zone {zone_summary}, "
+            f"mean>={args.motion_threshold:g}, "
             f"changed>={args.motion_min_changed_pct:g}%, "
             f"hits>={args.motion_consecutive}, hold={args.motion_hold:g}s"
         )
@@ -2797,6 +2810,244 @@ def is_bib_detection_label(value: str) -> bool:
     return normalize_bib_text(value) == value
 
 
+def motion_zone_label(zone_spec: str | None) -> str:
+    return zone_spec or "full frame"
+
+
+def motion_grid_column_label(index: int) -> str:
+    if index < 0:
+        raise ValueError("grid column index must be non-negative")
+    label = ""
+    current = index
+    while True:
+        current, remainder = divmod(current, 26)
+        label = chr(ord("A") + remainder) + label
+        if current == 0:
+            return label
+        current -= 1
+
+
+def motion_grid_column_index(label: str) -> int | None:
+    if not label or not label.isalpha():
+        return None
+    value = 0
+    for char in label.upper():
+        value = (value * 26) + (ord(char) - ord("A") + 1)
+    return value - 1
+
+
+def motion_grid_boundaries(total: int, grid_size: int = DEFAULT_MOTION_ZONE_GRID) -> list[int]:
+    if grid_size < 1:
+        raise ValueError("grid size must be at least 1")
+    return [int(total * index / grid_size) for index in range(grid_size)] + [total]
+
+
+def canonical_motion_zone_spec(
+    start_col: int,
+    start_row: int,
+    end_col: int,
+    end_row: int,
+) -> str:
+    start_label = f"{motion_grid_column_label(start_col)}{start_row + 1}"
+    end_label = f"{motion_grid_column_label(end_col)}{end_row + 1}"
+    if start_col == end_col and start_row == end_row:
+        return start_label
+    return f"{start_label}:{end_label}"
+
+
+def parse_motion_zone_corner(
+    token: str,
+    grid_size: int = DEFAULT_MOTION_ZONE_GRID,
+) -> tuple[int, int] | None:
+    match = re.fullmatch(r"\s*([A-Za-z]+)\s*(\d+)\s*", token)
+    if not match:
+        return None
+    column_index = motion_grid_column_index(match.group(1))
+    row_index = int(match.group(2)) - 1
+    if column_index is None or row_index < 0:
+        return None
+    if column_index >= grid_size or row_index >= grid_size:
+        return None
+    return column_index, row_index
+
+
+def normalize_motion_zone_spec(
+    value: str | None,
+    grid_size: int = DEFAULT_MOTION_ZONE_GRID,
+) -> str | None:
+    if value is None:
+        return None
+    stripped = value.strip()
+    if not stripped or stripped.lower() in {"full", "all", "*", "none"}:
+        return None
+    tokens = re.split(r"\s*[:,-]\s*|\s+", stripped)
+    tokens = [token for token in tokens if token]
+    if len(tokens) == 1:
+        start = parse_motion_zone_corner(tokens[0], grid_size)
+        end = start
+    elif len(tokens) == 2:
+        start = parse_motion_zone_corner(tokens[0], grid_size)
+        end = parse_motion_zone_corner(tokens[1], grid_size)
+    else:
+        return None
+    if start is None or end is None:
+        return None
+    start_col = min(start[0], end[0])
+    start_row = min(start[1], end[1])
+    end_col = max(start[0], end[0])
+    end_row = max(start[1], end[1])
+    return canonical_motion_zone_spec(start_col, start_row, end_col, end_row)
+
+
+def motion_zone_pixel_rect(
+    zone_spec: str | None,
+    *,
+    width: int,
+    height: int,
+    grid_size: int = DEFAULT_MOTION_ZONE_GRID,
+) -> tuple[int, int, int, int]:
+    if not zone_spec:
+        return 0, 0, width, height
+    normalized = normalize_motion_zone_spec(zone_spec, grid_size)
+    if normalized is None:
+        return 0, 0, width, height
+    parts = normalized.split(":")
+    start = parse_motion_zone_corner(parts[0], grid_size)
+    end = parse_motion_zone_corner(parts[-1], grid_size)
+    if start is None or end is None:
+        return 0, 0, width, height
+
+    x_bounds = motion_grid_boundaries(width, grid_size)
+    y_bounds = motion_grid_boundaries(height, grid_size)
+    x = x_bounds[start[0]]
+    y = y_bounds[start[1]]
+    zone_width = max(1, x_bounds[end[0] + 1] - x)
+    zone_height = max(1, y_bounds[end[1] + 1] - y)
+    return x, y, zone_width, zone_height
+
+
+def build_motion_zone_preview_filter(
+    preview_size: str = DEFAULT_MOTION_PREVIEW_SIZE,
+    *,
+    zone_spec: str | None = None,
+    grid_size: int = DEFAULT_MOTION_ZONE_GRID,
+) -> str:
+    dimensions = parse_scale_dimensions(preview_size)
+    if not dimensions:
+        raise ValueError(
+            f"invalid motion preview size: {preview_size!r}; expected WxH like 960x540"
+        )
+    width, height = dimensions
+    x_bounds = motion_grid_boundaries(width, grid_size)
+    y_bounds = motion_grid_boundaries(height, grid_size)
+    filters = [scale_filter_for_dimensions(width, height)]
+    if zone_spec:
+        zone_x, zone_y, zone_width, zone_height = motion_zone_pixel_rect(
+            zone_spec,
+            width=width,
+            height=height,
+            grid_size=grid_size,
+        )
+        filters.append(
+            f"drawbox=x={zone_x}:y={zone_y}:w={zone_width}:h={zone_height}:color=0x00ff0099:t=fill"
+        )
+    for x in x_bounds[1:-1]:
+        filters.append(
+            f"drawbox=x={x}:y=0:w=2:h={height}:color=0xffff00cc:t=fill"
+        )
+    for y in y_bounds[1:-1]:
+        filters.append(
+            f"drawbox=x=0:y={y}:w={width}:h=2:color=0xffff00cc:t=fill"
+        )
+    for row in range(grid_size):
+        for col in range(grid_size):
+            label = f"{motion_grid_column_label(col)}{row + 1}"
+            label_x = x_bounds[col] + 12
+            label_y = y_bounds[row] + 10
+            filters.append(
+                "drawtext="
+                f"text='{ffmpeg_drawtext_escape(label)}':"
+                f"x={label_x}:y={label_y}:"
+                "box=1:boxcolor=0x00000099:boxborderw=8:"
+                "fontcolor=white:fontsize=24:borderw=2"
+            )
+    return ",".join(filters)
+
+
+def prompt_motion_zone_spec(
+    current_zone: str | None = None,
+    *,
+    grid_size: int = DEFAULT_MOTION_ZONE_GRID,
+) -> str | None:
+    default_value = current_zone or "full"
+    while True:
+        raw = prompt_text(
+            "Motion zone (one cell like C3, two corners like B3 D4, or full)",
+            default_value,
+        ).strip()
+        lowered = raw.lower()
+        if lowered in {"q", "quit"}:
+            return current_zone
+        normalized = normalize_motion_zone_spec(raw, grid_size)
+        if normalized is not None or lowered in {"full", "all", "*", "none"}:
+            return normalized
+        print("Enter one cell like C3, two corners like B3 D4, or full.")
+
+
+def maybe_select_motion_zone_interactively(
+    *,
+    args: argparse.Namespace,
+    session_dir: Path,
+    source_path: Path,
+    ffmpeg_path: str,
+    supported_filters: set[str],
+    output_root: Path,
+) -> str | None:
+    if not interactive_mode_enabled(args) or not args.motion_gate:
+        return args.motion_zone
+    default_select = args.motion_zone is None
+    prompt_text_value = (
+        "Select a motion zone from a preview frame now?"
+        if args.motion_zone is None
+        else f"Edit motion zone '{args.motion_zone}' from a preview frame now?"
+    )
+    if not prompt_yes_no(prompt_text_value, default=default_select):
+        return args.motion_zone
+    if "drawtext" not in supported_filters or "drawbox" not in supported_filters:
+        print(
+            "warning: ffmpeg drawtext/drawbox filters are unavailable; cannot render motion-zone preview",
+            file=sys.stderr,
+        )
+        return args.motion_zone
+
+    preview_path = output_root / "motion-zone-preview.jpg"
+    viewer = choose_image_viewer(None)
+    while True:
+        duration_seconds = ffprobe_duration_seconds(source_path) or 0.0
+        offset_seconds = max(duration_seconds - max(args.tail_offset, 0.0), 0.0)
+        preview_filter = build_motion_zone_preview_filter(
+            DEFAULT_MOTION_PREVIEW_SIZE,
+            zone_spec=args.motion_zone,
+            grid_size=DEFAULT_MOTION_ZONE_GRID,
+        )
+        extract_frame_at_time(
+            ffmpeg_path,
+            source_path,
+            offset_seconds,
+            preview_path,
+            frame_filter=preview_filter,
+        )
+        print(f"Motion zone preview: {preview_path}")
+        if viewer:
+            command = build_image_viewer_command(viewer, [preview_path])
+            print("Viewer:", shlex.join(command))
+            launch_background_viewer(command)
+        zone_spec = prompt_motion_zone_spec(args.motion_zone)
+        if zone_spec == args.motion_zone:
+            return zone_spec
+        args.motion_zone = zone_spec
+
+
 def extract_frame_at_time(
     ffmpeg_bin: str,
     source_path: Path,
@@ -2844,6 +3095,8 @@ def extract_motion_plane_at_time(
     offset_seconds: float,
     *,
     motion_size: str,
+    motion_zone: str | None = None,
+    motion_zone_grid: int = DEFAULT_MOTION_ZONE_GRID,
 ) -> bytes:
     dimensions = parse_scale_dimensions(motion_size)
     if not dimensions:
@@ -2851,11 +3104,22 @@ def extract_motion_plane_at_time(
             f"invalid motion size: {motion_size!r}; expected WxH like 160x90"
         )
     width, height = dimensions
-    motion_filter = (
+    motion_filter_parts = [
         f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
         f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,"
         "format=gray"
+    ]
+    crop_x, crop_y, crop_width, crop_height = motion_zone_pixel_rect(
+        motion_zone,
+        width=width,
+        height=height,
+        grid_size=motion_zone_grid,
     )
+    if motion_zone:
+        motion_filter_parts.append(
+            f"crop={crop_width}:{crop_height}:{crop_x}:{crop_y}"
+        )
+    motion_filter = ",".join(motion_filter_parts)
     command = [
         ffmpeg_bin,
         "-hide_banner",
@@ -2884,7 +3148,7 @@ def extract_motion_plane_at_time(
     if result.returncode != 0:
         stderr = result.stderr.decode("utf-8", errors="ignore").strip()
         raise RuntimeError(stderr or "ffmpeg motion frame extraction failed")
-    expected_size = width * height
+    expected_size = crop_width * crop_height
     if len(result.stdout) != expected_size:
         raise RuntimeError(
             f"unexpected motion frame size: got {len(result.stdout)} bytes, expected {expected_size}"
@@ -3961,6 +4225,7 @@ def command_vision_live(args: argparse.Namespace) -> int:
     config_path = args.config_file.expanduser()
     config = load_config(config_path)
     vision_profiles = config.get("vision_profiles", {})
+    active_vision_profile_name: str | None = None
 
     selected_vision_profile = args.vision_profile
     if interactive_mode_enabled(args):
@@ -3972,6 +4237,7 @@ def command_vision_live(args: argparse.Namespace) -> int:
         if selected_vision_profile and selected_vision_profile != "__manual__":
             apply_vision_profile(args, vision_profiles[selected_vision_profile])
             config["last_vision_profile"] = selected_vision_profile
+            active_vision_profile_name = selected_vision_profile
             for line in vision_profile_summary_lines(
                 selected_vision_profile, vision_profiles[selected_vision_profile]
             ):
@@ -3983,6 +4249,7 @@ def command_vision_live(args: argparse.Namespace) -> int:
                 vision_profiles[created_profile] = vision_profile_from_args(args)
                 config["vision_profiles"] = vision_profiles
                 config["last_vision_profile"] = created_profile
+                active_vision_profile_name = created_profile
                 save_config(config_path, config)
                 print(f"Saved vision profile: {created_profile}")
                 print()
@@ -3993,6 +4260,7 @@ def command_vision_live(args: argparse.Namespace) -> int:
             return 1
         apply_vision_profile(args, profile)
         config["last_vision_profile"] = selected_vision_profile
+        active_vision_profile_name = selected_vision_profile
 
     if not args.session_dir and interactive_mode_enabled(args):
         selected_target = select_session_target(
@@ -4045,6 +4313,20 @@ def command_vision_live(args: argparse.Namespace) -> int:
         print(exc, file=sys.stderr)
         return 1
     if args.motion_gate:
+        raw_motion_zone = args.motion_zone
+        args.motion_zone = normalize_motion_zone_spec(
+            raw_motion_zone, DEFAULT_MOTION_ZONE_GRID
+        )
+        if (
+            raw_motion_zone
+            and raw_motion_zone.strip().lower() not in {"full", "all", "*", "none"}
+            and args.motion_zone is None
+        ):
+            print(
+                f"invalid motion zone: {raw_motion_zone!r}; expected C3 or B3:D4",
+                file=sys.stderr,
+            )
+            return 1
         if parse_scale_dimensions(args.motion_size) is None:
             print(
                 f"invalid motion size: {args.motion_size!r}; expected WxH like 160x90",
@@ -4063,6 +4345,31 @@ def command_vision_live(args: argparse.Namespace) -> int:
         if args.motion_hold < 0:
             print("motion-hold must be non-negative", file=sys.stderr)
             return 1
+        source = export_source_for_session(session_dir)
+        if (
+            source
+            and interactive_mode_enabled(args)
+        ):
+            chosen_zone = maybe_select_motion_zone_interactively(
+                args=args,
+                session_dir=session_dir,
+                source_path=source.source_path,
+                ffmpeg_path=ffmpeg_path,
+                supported_filters=supported_filters,
+                output_root=output_root,
+            )
+            args.motion_zone = chosen_zone
+            if (
+                active_vision_profile_name
+                and active_vision_profile_name in vision_profiles
+                and prompt_yes_no(
+                    f"Update saved vision profile '{active_vision_profile_name}' with this motion zone?",
+                    default=True,
+                )
+            ):
+                vision_profiles[active_vision_profile_name]["motion_zone"] = args.motion_zone
+                config["vision_profiles"] = vision_profiles
+                save_config(config_path, config)
     timeshift_path = session_dir / DEFAULT_TIMESHIFT_NAME
     processed_offsets: set[float] = set()
     sample_count = 0
@@ -4079,7 +4386,8 @@ def command_vision_live(args: argparse.Namespace) -> int:
     if args.motion_gate:
         print(
             "Motion gate:        "
-            f"{args.motion_size}, mean>={args.motion_threshold:g}, "
+            f"{args.motion_size}, zone={motion_zone_label(args.motion_zone)}, "
+            f"mean>={args.motion_threshold:g}, "
             f"changed>={args.motion_min_changed_pct:g}%, "
             f"hits>={args.motion_consecutive}, hold={args.motion_hold:g}s"
         )
@@ -4127,6 +4435,8 @@ def command_vision_live(args: argparse.Namespace) -> int:
                     timeshift_path,
                     offset_seconds,
                     motion_size=args.motion_size,
+                    motion_zone=args.motion_zone,
+                    motion_zone_grid=DEFAULT_MOTION_ZONE_GRID,
                 )
                 motion_result = evaluate_motion_gate(
                     enabled=True,
@@ -4165,6 +4475,7 @@ def command_vision_live(args: argparse.Namespace) -> int:
                         "motion_gate": {
                             "enabled": True,
                             "size": args.motion_size,
+                            "zone": args.motion_zone,
                             "mean_diff": (
                                 round(motion_result.mean_diff, 3)
                                 if motion_result.mean_diff is not None
@@ -4237,6 +4548,7 @@ def command_vision_live(args: argparse.Namespace) -> int:
                         "motion_gate": {
                             "enabled": True,
                             "size": args.motion_size,
+                            "zone": args.motion_zone,
                             "mean_diff": (
                                 round(motion_result.mean_diff, 3)
                                 if motion_result.mean_diff is not None
@@ -5506,6 +5818,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_MOTION_HOLD,
         help="Seconds to keep the gate open after the last confirmed motion hit.",
+    )
+    vision_live.add_argument(
+        "--motion-zone",
+        help="Optional 4x4 motion zone like C3 or B3:D4. Leave unset for the full frame.",
+    )
+    vision_live.add_argument(
+        "--motion-select-zone",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Show an interactive preview grid and prompt for a motion zone before starting.",
     )
     vision_live.add_argument(
         "--keepalive",
