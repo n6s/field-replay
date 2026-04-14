@@ -219,6 +219,14 @@ For a running session, the simplest operator path is the standalone zone editor:
 
 That command lets you pick the active recording session, shows a real preview frame with the grid overlay, and writes the new zone to the session's live runtime control so a running `vision-live` loop can pick it up without restarting.
 
+For tuning motion sensitivity after a live test, use:
+
+```bash
+./field-replay motion-tune
+```
+
+That command can run a short tail calibration, open triggered or near-miss clips with a `2s` preroll, record `good` / `false-positive` / `missed` feedback, and suggest updated motion settings for the current vision profile.
+
 For custom prompt experiments, the vision parser now also accepts:
 
 ```json

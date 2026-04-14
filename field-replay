@@ -2747,6 +2747,7 @@ def vision_output_paths(vision_root: Path) -> dict[str, Path]:
         "debug_log": vision_root / "vision-debug.jsonl",
         "events_jsonl": vision_root / "events.jsonl",
         "events_log": vision_root / "events.log",
+        "motion_feedback": vision_root / "motion-feedback.jsonl",
         "runtime_control": vision_root / "runtime-control.json",
         "runtime_state": vision_root / "runtime-state.json",
     }
@@ -3076,6 +3077,10 @@ def write_vision_runtime_state(
     motion_gate: bool,
     motion_size: str | None,
     motion_zone: str | None,
+    motion_threshold: float | None = None,
+    motion_min_changed_pct: float | None = None,
+    motion_consecutive: int | None = None,
+    motion_hold: float | None = None,
 ) -> bool:
     payload = {
         "updated_at": event_wall_time(datetime.now().astimezone()),
@@ -3084,6 +3089,12 @@ def write_vision_runtime_state(
         "motion_size": motion_size if motion_gate else None,
         "motion_zone": motion_zone,
         "motion_zone_label": motion_zone_label(motion_zone) if motion_gate else None,
+        "motion_threshold": motion_threshold if motion_gate else None,
+        "motion_min_changed_pct": (
+            motion_min_changed_pct if motion_gate else None
+        ),
+        "motion_consecutive": motion_consecutive if motion_gate else None,
+        "motion_hold": motion_hold if motion_gate else None,
     }
     return save_json_file(
         runtime_paths["runtime_state"],
@@ -3349,6 +3360,702 @@ def event_sort_key(event: dict) -> tuple[float, str]:
         rel_time = 0.0
     wall_time = str(event.get("w") or "")
     return rel_time, wall_time
+
+
+def parse_seek_time_text(value: str) -> float | None:
+    stripped = value.strip()
+    if not stripped:
+        return None
+    try:
+        seconds = float(stripped)
+    except ValueError:
+        parts = stripped.split(":")
+        if len(parts) not in {2, 3}:
+            return None
+        try:
+            numbers = [int(part) for part in parts]
+        except ValueError:
+            return None
+        if len(numbers) == 2:
+            minutes, seconds_value = numbers
+            hours = 0
+        else:
+            hours, minutes, seconds_value = numbers
+        if minutes < 0 or seconds_value < 0 or hours < 0:
+            return None
+        seconds = (hours * 3600) + (minutes * 60) + seconds_value
+    return max(seconds, 0.0)
+
+
+def percentile_value(values: Sequence[float], percentile: float) -> float | None:
+    if not values:
+        return None
+    if len(values) == 1:
+        return float(values[0])
+    sorted_values = sorted(float(value) for value in values)
+    position = max(0.0, min(1.0, percentile)) * (len(sorted_values) - 1)
+    lower_index = int(position)
+    upper_index = min(lower_index + 1, len(sorted_values) - 1)
+    lower_value = sorted_values[lower_index]
+    upper_value = sorted_values[upper_index]
+    if upper_index == lower_index:
+        return lower_value
+    fraction = position - lower_index
+    return lower_value + ((upper_value - lower_value) * fraction)
+
+
+def load_motion_tune_context(
+    session_dir: Path,
+    config: dict,
+) -> dict:
+    runtime_paths = vision_output_paths(session_dir / "vision-live")
+    runtime_state = load_json_file(runtime_paths["runtime_state"])
+    vision_profiles = config.get("vision_profiles", {})
+    profile_name = runtime_state.get("vision_profile")
+    profile: dict = {}
+    if isinstance(profile_name, str) and profile_name in vision_profiles:
+        profile = vision_profiles[profile_name]
+
+    def pick(key: str, default):
+        value = runtime_state.get(key)
+        if value is None:
+            value = profile.get(key, default)
+        return value
+
+    motion_zone, _ = parse_motion_zone_value(pick("motion_zone", None))
+    return {
+        "runtime_paths": runtime_paths,
+        "runtime_state": runtime_state,
+        "profile_name": profile_name if isinstance(profile_name, str) else None,
+        "motion_gate": bool(pick("motion_gate", DEFAULT_MOTION_GATE)),
+        "motion_size": str(pick("motion_size", DEFAULT_MOTION_SIZE)),
+        "motion_zone": motion_zone,
+        "motion_threshold": float(pick("motion_threshold", DEFAULT_MOTION_THRESHOLD)),
+        "motion_min_changed_pct": float(
+            pick("motion_min_changed_pct", DEFAULT_MOTION_MIN_CHANGED_PCT)
+        ),
+        "motion_consecutive": int(
+            pick("motion_consecutive", DEFAULT_MOTION_CONSECUTIVE)
+        ),
+        "motion_hold": float(pick("motion_hold", DEFAULT_MOTION_HOLD)),
+    }
+
+
+def motion_tune_summary_lines(session_dir: Path, context: dict) -> list[str]:
+    return [
+        f"Session:   {session_dir}",
+        (
+            "Profile:   "
+            f"{context.get('profile_name') or 'none'}"
+        ),
+        (
+            "Motion:    "
+            f"{context['motion_size']}, zone={motion_zone_label(context['motion_zone'])}, "
+            f"mean>={context['motion_threshold']:g}, "
+            f"changed>={context['motion_min_changed_pct']:g}%, "
+            f"hits>={context['motion_consecutive']}, hold={context['motion_hold']:g}s"
+        ),
+    ]
+
+
+def motion_tune_legend_lines() -> list[str]:
+    return [
+        "Legend:",
+        "  mean     average motion strength across the watched zone",
+        "  changed  percent of watched pixels that changed noticeably",
+        "  hits     consecutive triggered samples needed to open the gate",
+        "  hold     seconds to keep the gate open after a hit",
+        "  feedback g=good catch, f=false positive, m=missed event nearby, s=skip, q=quit",
+    ]
+
+
+def calibrate_motion_window(
+    *,
+    ffmpeg_bin: str,
+    source_path: Path,
+    duration_seconds: float,
+    sample_interval: float,
+    motion_size: str,
+    motion_zone: str | None,
+) -> list[dict]:
+    total_duration = ffprobe_duration_seconds(source_path) or 0.0
+    if total_duration <= 0:
+        return []
+    window_duration = max(duration_seconds, sample_interval)
+    start_seconds = max(total_duration - window_duration, 0.0)
+    previous_frame: bytes | None = None
+    samples: list[dict] = []
+    current = start_seconds
+    while current <= total_duration + 0.001:
+        try:
+            frame = extract_motion_plane_at_time(
+                ffmpeg_bin,
+                source_path,
+                current,
+                motion_size=motion_size,
+                motion_zone=motion_zone,
+                motion_zone_grid=DEFAULT_MOTION_ZONE_GRID,
+            )
+        except RuntimeError:
+            current += max(sample_interval, 0.1)
+            continue
+        mean_diff, changed_pct = compute_motion_metrics(previous_frame, frame)
+        previous_frame = frame
+        if mean_diff is not None and changed_pct is not None:
+            samples.append(
+                {
+                    "t": round(current, 1),
+                    "mean_diff": mean_diff,
+                    "changed_pct": changed_pct,
+                }
+            )
+        current += max(sample_interval, 0.1)
+    return samples
+
+
+def summarize_motion_calibration(samples: Sequence[dict]) -> dict:
+    mean_values = [
+        float(sample["mean_diff"])
+        for sample in samples
+        if sample.get("mean_diff") is not None
+    ]
+    changed_values = [
+        float(sample["changed_pct"])
+        for sample in samples
+        if sample.get("changed_pct") is not None
+    ]
+    return {
+        "samples": len(samples),
+        "mean_median": statistics.median(mean_values) if mean_values else None,
+        "mean_p95": percentile_value(mean_values, 0.95),
+        "mean_p99": percentile_value(mean_values, 0.99),
+        "changed_median": (
+            statistics.median(changed_values) if changed_values else None
+        ),
+        "changed_p95": percentile_value(changed_values, 0.95),
+        "changed_p99": percentile_value(changed_values, 0.99),
+    }
+
+
+def motion_calibration_summary_lines(summary: dict) -> list[str]:
+    if not summary.get("samples"):
+        return ["Calibration: no usable motion samples"]
+    return [
+        "Calibration baseline:",
+        f"  Samples:          {summary['samples']}",
+        f"  Mean median:      {summary['mean_median']:.2f}",
+        f"  Mean p95:         {summary['mean_p95']:.2f}",
+        f"  Changed median:   {summary['changed_median']:.2f}%",
+        f"  Changed p95:      {summary['changed_p95']:.2f}%",
+    ]
+
+
+def motion_candidate_score(
+    mean_diff: float | None,
+    changed_pct: float | None,
+    *,
+    current_threshold: float,
+    min_changed_pct: float,
+) -> float:
+    mean_part = (
+        float(mean_diff) / max(current_threshold, 0.1)
+        if mean_diff is not None
+        else 0.0
+    )
+    change_part = (
+        float(changed_pct) / max(min_changed_pct, 0.1)
+        if changed_pct is not None
+        else 0.0
+    )
+    return mean_part + change_part
+
+
+def build_motion_candidate(
+    records: Sequence[dict],
+    *,
+    kind: str,
+    current_threshold: float,
+    min_changed_pct: float,
+) -> dict:
+    peak_record = max(
+        records,
+        key=lambda record: motion_candidate_score(
+            (record.get("motion_gate") or {}).get("mean_diff"),
+            (record.get("motion_gate") or {}).get("changed_pct"),
+            current_threshold=current_threshold,
+            min_changed_pct=min_changed_pct,
+        ),
+    )
+    motion_gate = peak_record.get("motion_gate") or {}
+    first_record = records[0]
+    last_record = records[-1]
+    return {
+        "kind": kind,
+        "t": float(peak_record.get("t") or 0.0),
+        "t_start": float(first_record.get("t") or 0.0),
+        "t_end": float(last_record.get("t") or 0.0),
+        "w": peak_record.get("w"),
+        "zone": motion_gate.get("zone"),
+        "mean_diff": motion_gate.get("mean_diff"),
+        "changed_pct": motion_gate.get("changed_pct"),
+        "reason": motion_gate.get("reason"),
+        "sample_count": len(records),
+        "score": motion_candidate_score(
+            motion_gate.get("mean_diff"),
+            motion_gate.get("changed_pct"),
+            current_threshold=current_threshold,
+            min_changed_pct=min_changed_pct,
+        ),
+    }
+
+
+def group_motion_records_into_candidates(
+    records: Sequence[dict],
+    *,
+    kind: str,
+    current_threshold: float,
+    min_changed_pct: float,
+    group_gap_seconds: float = 4.0,
+) -> list[dict]:
+    sorted_records = sorted(records, key=event_sort_key)
+    if not sorted_records:
+        return []
+    groups: list[list[dict]] = []
+    current_group: list[dict] = [sorted_records[0]]
+    for record in sorted_records[1:]:
+        previous_time = float(current_group[-1].get("t") or 0.0)
+        current_time = float(record.get("t") or 0.0)
+        if (current_time - previous_time) <= group_gap_seconds:
+            current_group.append(record)
+        else:
+            groups.append(current_group)
+            current_group = [record]
+    groups.append(current_group)
+    return [
+        build_motion_candidate(
+            group,
+            kind=kind,
+            current_threshold=current_threshold,
+            min_changed_pct=min_changed_pct,
+        )
+        for group in groups
+    ]
+
+
+def load_motion_candidates(
+    session_dir: Path,
+    *,
+    current_threshold: float,
+    min_changed_pct: float,
+    limit: int,
+) -> dict[str, list[dict]]:
+    runtime_paths = vision_output_paths(session_dir / "vision-live")
+    debug_records = load_jsonl_records(runtime_paths["debug_log"])
+    triggered_records: list[dict] = []
+    near_miss_records: list[dict] = []
+    for record in debug_records:
+        motion_gate = record.get("motion_gate")
+        if not isinstance(motion_gate, dict):
+            continue
+        if motion_gate.get("triggered"):
+            triggered_records.append(record)
+            continue
+        mean_diff = motion_gate.get("mean_diff")
+        changed_pct = motion_gate.get("changed_pct")
+        if mean_diff is None or changed_pct is None:
+            continue
+        if (
+            changed_pct >= min_changed_pct
+            or mean_diff >= max(current_threshold * 0.5, 1.0)
+        ):
+            near_miss_records.append(record)
+    triggered_candidates = group_motion_records_into_candidates(
+        triggered_records,
+        kind="triggered",
+        current_threshold=current_threshold,
+        min_changed_pct=min_changed_pct,
+    )
+    triggered_candidates.sort(key=event_sort_key)
+    near_miss_candidates = group_motion_records_into_candidates(
+        near_miss_records,
+        kind="near-miss",
+        current_threshold=current_threshold,
+        min_changed_pct=min_changed_pct,
+    )
+    near_miss_candidates.sort(key=lambda item: item.get("score", 0.0), reverse=True)
+    return {
+        "triggered": triggered_candidates[:limit],
+        "near_miss": near_miss_candidates[:limit],
+    }
+
+
+def motion_candidate_summary_line(candidate: dict) -> str:
+    return (
+        f"{candidate['kind']} at {format_duration(candidate.get('t'))} "
+        f"(mean {float(candidate.get('mean_diff') or 0.0):.2f}, "
+        f"changed {float(candidate.get('changed_pct') or 0.0):.2f}%, "
+        f"zone {motion_zone_label(candidate.get('zone'))})"
+    )
+
+
+def choose_motion_candidate(
+    title: str,
+    candidates: Sequence[dict],
+) -> dict | None:
+    if not candidates:
+        return None
+    options = [
+        (str(index), motion_candidate_summary_line(candidate))
+        for index, candidate in enumerate(candidates, start=1)
+    ]
+    choice = prompt_menu(title, options, default_value="1", allow_cancel=True)
+    if choice is None:
+        return None
+    return candidates[int(choice) - 1]
+
+
+def prompt_motion_feedback() -> str | None:
+    choices = {
+        "g": "good catch",
+        "f": "false positive",
+        "m": "missed event nearby",
+        "s": "skip",
+        "q": "quit",
+    }
+    choice = prompt_choice("Feedback", choices, default="g")
+    if choice == "q":
+        return None
+    labels = {
+        "g": "good",
+        "f": "false-positive",
+        "m": "missed",
+        "s": "skip",
+    }
+    return labels[choice]
+
+
+def record_motion_feedback(
+    runtime_paths: dict[str, Path],
+    *,
+    candidate: dict,
+    feedback: str,
+    profile_name: str | None,
+    session_dir: Path,
+) -> None:
+    append_jsonl(
+        runtime_paths["motion_feedback"],
+        {
+            "w": event_wall_time(datetime.now().astimezone()),
+            "session_dir": str(session_dir),
+            "profile": profile_name,
+            "candidate_kind": candidate.get("kind"),
+            "t": round(float(candidate.get("t") or 0.0), 1),
+            "zone": candidate.get("zone"),
+            "mean_diff": candidate.get("mean_diff"),
+            "changed_pct": candidate.get("changed_pct"),
+            "feedback": feedback,
+        },
+    )
+
+
+def suggest_motion_setting_updates(
+    feedback_records: Sequence[dict],
+    *,
+    current_threshold: float,
+    current_consecutive: int,
+    calibration_summary: dict | None = None,
+) -> dict:
+    suggested_threshold = float(current_threshold)
+    suggested_consecutive = int(current_consecutive)
+    reasons: list[str] = []
+    good_count = sum(1 for item in feedback_records if item.get("feedback") == "good")
+    false_positive_count = sum(
+        1 for item in feedback_records if item.get("feedback") == "false-positive"
+    )
+    missed_count = sum(1 for item in feedback_records if item.get("feedback") == "missed")
+
+    if missed_count > false_positive_count:
+        if suggested_consecutive > 1:
+            suggested_consecutive -= 1
+            reasons.append("Lower consecutive hits because missed events outweighed false positives.")
+        else:
+            floor_threshold = 1.0
+            if calibration_summary:
+                p95_mean = calibration_summary.get("mean_p95")
+                if p95_mean is not None:
+                    floor_threshold = max(float(p95_mean) + 0.5, 1.0)
+            lowered_threshold = max(floor_threshold, suggested_threshold - 1.0)
+            if lowered_threshold < suggested_threshold:
+                suggested_threshold = round(lowered_threshold, 1)
+                reasons.append("Lower mean threshold because missed events outweighed false positives.")
+
+    if false_positive_count > missed_count:
+        suggested_threshold = round(suggested_threshold + 1.0, 1)
+        reasons.append("Raise mean threshold because false positives outweighed misses.")
+        if false_positive_count >= 2 and suggested_consecutive < 2:
+            suggested_consecutive = 2
+            reasons.append("Require two hits again because multiple false positives were flagged.")
+
+    if not reasons and good_count:
+        reasons.append("Keep the current settings for now; the reviewed events looked useful.")
+
+    return {
+        "good": good_count,
+        "false_positive": false_positive_count,
+        "missed": missed_count,
+        "suggested_threshold": suggested_threshold,
+        "suggested_consecutive": suggested_consecutive,
+        "reasons": reasons,
+    }
+
+
+def run_motion_tune_candidate_review(
+    *,
+    args: argparse.Namespace,
+    session_dir: Path,
+    runtime_paths: dict[str, Path],
+    profile_name: str | None,
+    candidate: dict,
+) -> str | None:
+    player = choose_player(args.player)
+    if not player:
+        requested = args.player or "vlc/mpv/ffplay"
+        print(f"player not found: {requested}", file=sys.stderr)
+        return None
+    try:
+        target_path = resolve_watch_target(
+            args.recordings_dir.expanduser(),
+            str(session_dir),
+        )
+    except FileNotFoundError as exc:
+        print(exc, file=sys.stderr)
+        return None
+
+    start_seconds = max(float(candidate.get("t") or 0.0) - args.pre_roll, 0.0)
+    command = build_player_command(
+        player,
+        target_path,
+        args.file_caching_ms,
+        start_seconds=start_seconds,
+    )
+    print()
+    print("Motion candidate")
+    print(f"  Kind:     {candidate.get('kind')}")
+    print(f"  Time:     {format_duration(candidate.get('t'))}")
+    print(f"  Zone:     {motion_zone_label(candidate.get('zone'))}")
+    print(f"  Mean:     {float(candidate.get('mean_diff') or 0.0):.2f}")
+    print(f"  Changed:  {float(candidate.get('changed_pct') or 0.0):.2f}%")
+    print("  Feedback: g=good, f=false positive, m=missed nearby, s=skip, q=quit")
+    print("Player:", shlex.join(command))
+    if not args.dry_run:
+        subprocess.call(command)
+    feedback = prompt_motion_feedback()
+    if feedback is None:
+        return None
+    if feedback != "skip":
+        record_motion_feedback(
+            runtime_paths,
+            candidate=candidate,
+            feedback=feedback,
+            profile_name=profile_name,
+            session_dir=session_dir,
+        )
+    return feedback
+
+
+def command_motion_tune(args: argparse.Namespace) -> int:
+    config_path = args.config_file.expanduser()
+    config = load_config(config_path)
+    vision_profiles = config.get("vision_profiles", {})
+    if not getattr(args, "target", None) and interactive_mode_enabled(args):
+        selected_target = select_session_target(
+            args,
+            config,
+            title="Choose a session to tune motion settings",
+        )
+        if not selected_target:
+            print("no sessions found for motion tuning", file=sys.stderr)
+            return 1
+        args.target = Path(selected_target)
+
+    try:
+        session_dir = resolve_session_dir(
+            args.recordings_dir.expanduser(),
+            str(args.target) if getattr(args, "target", None) else None,
+        )
+    except FileNotFoundError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+
+    context = load_motion_tune_context(session_dir, config)
+    runtime_paths = context["runtime_paths"]
+    for line in motion_tune_summary_lines(session_dir, context):
+        print(line)
+    print()
+    for line in motion_tune_legend_lines():
+        print(line)
+    print()
+
+    source = export_source_for_session(session_dir)
+    calibration_summary: dict | None = None
+    if (
+        source
+        and context["motion_gate"]
+        and (
+            not interactive_mode_enabled(args)
+            or prompt_yes_no(
+                f"Run a {args.calibrate_seconds:g}s tail calibration at {args.motion_sample_interval:g}s?",
+                default=True,
+            )
+        )
+    ):
+        calibration_samples = calibrate_motion_window(
+            ffmpeg_bin=args.ffmpeg_bin,
+            source_path=source.source_path,
+            duration_seconds=args.calibrate_seconds,
+            sample_interval=args.motion_sample_interval,
+            motion_size=context["motion_size"],
+            motion_zone=context["motion_zone"],
+        )
+        calibration_summary = summarize_motion_calibration(calibration_samples)
+        for line in motion_calibration_summary_lines(calibration_summary):
+            print(line)
+        print()
+
+    feedback_records: list[dict] = []
+    candidate_groups = load_motion_candidates(
+        session_dir,
+        current_threshold=context["motion_threshold"],
+        min_changed_pct=context["motion_min_changed_pct"],
+        limit=max(args.limit, 1),
+    )
+    if not interactive_mode_enabled(args):
+        print("Motion candidates")
+        for heading, group_name in (
+            ("Triggered", "triggered"),
+            ("Near misses", "near_miss"),
+        ):
+            candidates = candidate_groups[group_name]
+            if not candidates:
+                continue
+            print(f"{heading}:")
+            for candidate in candidates:
+                print(f"  {motion_candidate_summary_line(candidate)}")
+        print()
+        print("Run `field-replay motion-tune` interactively to review clips and record feedback.")
+        return 0
+
+    review_groups = [
+        ("triggered", "Review triggered motion events?"),
+        ("near_miss", "Review near-miss motion candidates?"),
+    ]
+    for group_name, prompt_text_value in review_groups:
+        candidates = candidate_groups[group_name]
+        if not candidates:
+            continue
+        if interactive_mode_enabled(args):
+            if not prompt_yes_no(prompt_text_value, default=True):
+                continue
+            chosen_candidates = candidates
+        else:
+            chosen_candidates = candidates
+        for candidate in chosen_candidates:
+            feedback = run_motion_tune_candidate_review(
+                args=args,
+                session_dir=session_dir,
+                runtime_paths=runtime_paths,
+                profile_name=context.get("profile_name"),
+                candidate=candidate,
+            )
+            if feedback is None:
+                break
+            if feedback != "skip":
+                feedback_records.append(
+                    {
+                        "feedback": feedback,
+                        "candidate": candidate,
+                    }
+                )
+        print()
+
+    if interactive_mode_enabled(args):
+        while prompt_yes_no("Review a manual missed timestamp?", default=False):
+            raw_time = prompt_text(
+                "Missed timestamp (seconds or HH:MM:SS)",
+            ).strip()
+            missed_time = parse_seek_time_text(raw_time)
+            if missed_time is None:
+                print("Enter seconds like 5880.7 or HH:MM:SS like 01:38:01.")
+                continue
+            candidate = {
+                "kind": "manual-missed",
+                "t": missed_time,
+                "zone": context["motion_zone"],
+                "mean_diff": None,
+                "changed_pct": None,
+            }
+            feedback = run_motion_tune_candidate_review(
+                args=args,
+                session_dir=session_dir,
+                runtime_paths=runtime_paths,
+                profile_name=context.get("profile_name"),
+                candidate=candidate,
+            )
+            if feedback is None:
+                break
+            if feedback != "skip":
+                feedback_records.append(
+                    {
+                        "feedback": feedback,
+                        "candidate": candidate,
+                    }
+                )
+        print()
+
+    if not feedback_records:
+        print("No motion feedback recorded in this tuning pass.")
+        return 0
+
+    suggestion = suggest_motion_setting_updates(
+        feedback_records,
+        current_threshold=context["motion_threshold"],
+        current_consecutive=context["motion_consecutive"],
+        calibration_summary=calibration_summary,
+    )
+    print("Motion feedback summary")
+    print(f"  Good catches:     {suggestion['good']}")
+    print(f"  False positives:  {suggestion['false_positive']}")
+    print(f"  Missed events:    {suggestion['missed']}")
+    print(
+        "Suggested settings"
+        f"\n  mean threshold:   {context['motion_threshold']:g} -> {suggestion['suggested_threshold']:g}"
+        f"\n  consecutive hits: {context['motion_consecutive']} -> {suggestion['suggested_consecutive']}"
+    )
+    if suggestion["reasons"]:
+        print("Why")
+        for reason in suggestion["reasons"]:
+            print(f"  {reason}")
+
+    profile_name = context.get("profile_name")
+    if (
+        profile_name
+        and profile_name in vision_profiles
+        and interactive_mode_enabled(args)
+        and prompt_yes_no(
+            f"Apply these suggested settings to vision profile '{profile_name}'?",
+            default=False,
+        )
+    ):
+        vision_profiles[profile_name]["motion_threshold"] = suggestion[
+            "suggested_threshold"
+        ]
+        vision_profiles[profile_name]["motion_consecutive"] = suggestion[
+            "suggested_consecutive"
+        ]
+        config["vision_profiles"] = vision_profiles
+        save_config(config_path, config)
+        print(f"Updated vision profile: {profile_name}")
+    return 0
 
 
 def default_vision_prompt() -> str:
@@ -4459,6 +5166,10 @@ def command_vision_live(args: argparse.Namespace) -> int:
         motion_gate=args.motion_gate,
         motion_size=args.motion_size,
         motion_zone=args.motion_zone,
+        motion_threshold=args.motion_threshold,
+        motion_min_changed_pct=args.motion_min_changed_pct,
+        motion_consecutive=args.motion_consecutive,
+        motion_hold=args.motion_hold,
     )
     timeshift_path = session_dir / DEFAULT_TIMESHIFT_NAME
     processed_offsets: set[float] = set()
@@ -4559,6 +5270,10 @@ def command_vision_live(args: argparse.Namespace) -> int:
                             motion_gate=args.motion_gate,
                             motion_size=args.motion_size,
                             motion_zone=args.motion_zone,
+                            motion_threshold=args.motion_threshold,
+                            motion_min_changed_pct=args.motion_min_changed_pct,
+                            motion_consecutive=args.motion_consecutive,
+                            motion_hold=args.motion_hold,
                         )
                         print(
                             "[vision-live] "
@@ -6146,6 +6861,68 @@ def build_parser() -> argparse.ArgumentParser:
         help="Prompt to choose a recent session and zone when the target is omitted.",
     )
     motion_zone.set_defaults(func=command_motion_zone)
+
+    motion_tune = subparsers.add_parser(
+        "motion-tune",
+        help="Review motion candidates, record feedback, and suggest motion-gate settings.",
+    )
+    motion_tune.add_argument(
+        "target",
+        nargs="?",
+        type=Path,
+        help="Optional session directory. Defaults to an interactive picker or the latest session.",
+    )
+    motion_tune.add_argument(
+        "--ffmpeg-bin",
+        default="ffmpeg",
+        help="FFmpeg binary to use for motion calibration.",
+    )
+    motion_tune.add_argument(
+        "--player",
+        help="Preferred player for clip review. Defaults to vlc, then mpv, ffplay, cvlc.",
+    )
+    motion_tune.add_argument(
+        "--pre-roll",
+        type=float,
+        default=2.0,
+        help="Seconds to rewind before opening a motion candidate clip.",
+    )
+    motion_tune.add_argument(
+        "--file-caching-ms",
+        type=int,
+        default=300,
+        help="Player file cache in milliseconds for motion clip review.",
+    )
+    motion_tune.add_argument(
+        "--limit",
+        type=int,
+        default=6,
+        help="Maximum number of triggered and near-miss candidates to review per group.",
+    )
+    motion_tune.add_argument(
+        "--calibrate-seconds",
+        type=float,
+        default=30.0,
+        help="Seconds of session tail to sample during motion calibration.",
+    )
+    motion_tune.add_argument(
+        "--motion-sample-interval",
+        type=float,
+        default=0.5,
+        help="Seconds between samples during motion calibration.",
+    )
+    motion_tune.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the planned player commands without launching them.",
+    )
+    motion_tune.add_argument(
+        "--interactive",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Prompt to choose a recent session and collect feedback interactively.",
+    )
+    motion_tune.set_defaults(func=command_motion_tune)
 
     find_bib = subparsers.add_parser(
         "find-bib",
