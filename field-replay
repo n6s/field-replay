@@ -30,11 +30,13 @@ DEFAULT_SOURCE_TYPE = "v4l2"
 SOURCE_TYPES = ("v4l2", "rtsp")
 DEFAULT_RTSP_TRANSPORT = "tcp"
 DEFAULT_ENCODER = "h264_nvenc"
+DEFAULT_VIDEO_CODEC_MODE = "encode"
+VIDEO_CODEC_MODES = ("encode", "copy")
 DEFAULT_VIDEO_INPUT_FORMAT = "auto"
 DEFAULT_AUDIO_GAIN_DB = -6.0
 COMMON_VIDEO_SIZES = ("1920x1080", "1280x720", "1024x576", "640x480")
 COMMON_FRAME_RATES = (30, 25, 15, 10, 5)
-COMMON_VIDEO_INPUT_FORMATS = ("auto", "mjpeg", "yuyv422", "uyvy422", "nv12")
+COMMON_VIDEO_INPUT_FORMATS = ("auto", "h264", "mjpeg", "yuyv422", "uyvy422", "nv12")
 COMMON_AUDIO_INPUTS = ((48000, 2), (48000, 1), (44100, 2), (44100, 1), (32000, 1))
 DEFAULT_VIDEO_TIMESTAMP_ENABLED = True
 DEFAULT_VISION_MODEL = "gemma4:e2b"
@@ -197,6 +199,28 @@ def uses_alsa_audio_input(args: argparse.Namespace | dict) -> bool:
     else:
         audio_enabled = bool(getattr(args, "audio", True))
     return audio_enabled and not is_rtsp_source(args)
+
+
+def uses_video_passthrough(args: argparse.Namespace | dict) -> bool:
+    if isinstance(args, dict):
+        mode = args.get("video_codec_mode", DEFAULT_VIDEO_CODEC_MODE)
+    else:
+        mode = getattr(args, "video_codec_mode", DEFAULT_VIDEO_CODEC_MODE)
+    return mode == "copy"
+
+
+def auto_select_video_codec_mode(args: argparse.Namespace) -> list[str]:
+    warnings: list[str] = []
+    if (
+        not is_rtsp_source(args)
+        and args.video_input_format == "h264"
+        and args.video_codec_mode != "copy"
+    ):
+        args.video_codec_mode = "copy"
+        warnings.append(
+            "h264 V4L2 input now defaults to passthrough mode; switching video codec mode to copy"
+        )
+    return warnings
 
 
 def default_session_name(prefix: str) -> str:
@@ -548,31 +572,34 @@ def build_ffmpeg_command(paths: SessionPaths, args: argparse.Namespace) -> list[
         else:
             command.extend(["-map", "1:a:0"])
 
-    command.extend(
-        [
-            "-vf",
-            build_video_filter(args),
-            "-fps_mode",
-            "cfr",
-            "-c:v",
-            args.encoder,
-            "-preset",
-            args.preset,
-            "-pix_fmt",
-            "yuv420p",
-            "-g",
-            str(gop),
-            "-keyint_min",
-            str(gop),
-        ]
-    )
+    if uses_video_passthrough(args):
+        command.extend(["-c:v", "copy"])
+    else:
+        command.extend(
+            [
+                "-vf",
+                build_video_filter(args),
+                "-fps_mode",
+                "cfr",
+                "-c:v",
+                args.encoder,
+                "-preset",
+                args.preset,
+                "-pix_fmt",
+                "yuv420p",
+                "-g",
+                str(gop),
+                "-keyint_min",
+                str(gop),
+            ]
+        )
 
-    if args.video_bitrate:
-        command.extend(["-b:v", args.video_bitrate])
-    if args.maxrate:
-        command.extend(["-maxrate", args.maxrate])
-    if args.bufsize:
-        command.extend(["-bufsize", args.bufsize])
+        if args.video_bitrate:
+            command.extend(["-b:v", args.video_bitrate])
+        if args.maxrate:
+            command.extend(["-maxrate", args.maxrate])
+        if args.bufsize:
+            command.extend(["-bufsize", args.bufsize])
 
     if args.audio:
         command.extend(
@@ -820,6 +847,28 @@ def resolve_encoder(
         if candidate in supported_encoders and encoder_smoke_test(ffmpeg_path, candidate):
             return candidate
     return None
+
+
+def normalize_video_settings(
+    args: argparse.Namespace,
+    *,
+    supported_filters: set[str] | None = None,
+) -> list[str]:
+    warnings: list[str] = []
+    if uses_video_passthrough(args):
+        if args.video_timestamp:
+            args.video_timestamp = False
+            warnings.append(
+                "video passthrough mode cannot burn a wall-clock timestamp; disabling video timestamp overlay"
+            )
+        return warnings
+
+    if supported_filters is not None and args.video_timestamp and "drawtext" not in supported_filters:
+        args.video_timestamp = False
+        warnings.append(
+            "ffmpeg drawtext filter is unavailable; disabling video timestamp overlay"
+        )
+    return warnings
 
 
 def v4l2ctl_pixel_format_alias(code: str) -> str:
@@ -1559,6 +1608,7 @@ def profile_from_args(args: argparse.Namespace) -> dict:
         "device": args.device,
         "rtsp_url": args.rtsp_url,
         "rtsp_transport": args.rtsp_transport,
+        "video_codec_mode": args.video_codec_mode,
         "video_input_format": args.video_input_format,
         "audio": args.audio,
         "audio_device": args.audio_device,
@@ -1596,6 +1646,7 @@ def profile_summary_lines(profile_name: str, profile: dict) -> list[str]:
         f"Quick start: {profile_name}",
         f"  Source:  {source_label}",
         f"  Type:    {source_type_value(profile)}",
+        f"  Video path: {profile.get('video_codec_mode', DEFAULT_VIDEO_CODEC_MODE)}",
         f"  Format:  {profile.get('video_input_format', DEFAULT_VIDEO_INPUT_FORMAT)}",
         f"  Mode:    {mode_label}",
         f"  Audio:   {audio_label}",
@@ -1606,6 +1657,8 @@ def profile_summary_lines(profile_name: str, profile: dict) -> list[str]:
 
 def profile_menu_label(profile_name: str, profile: dict) -> str:
     details = [source_display_label(profile)]
+    if profile.get("video_codec_mode", DEFAULT_VIDEO_CODEC_MODE) != DEFAULT_VIDEO_CODEC_MODE:
+        details.append(str(profile["video_codec_mode"]))
     if (
         not is_rtsp_source(profile)
         and profile.get("video_size")
@@ -1626,6 +1679,9 @@ def apply_profile(args: argparse.Namespace, profile: dict) -> None:
     args.rtsp_url = profile.get("rtsp_url", getattr(args, "rtsp_url", ""))
     args.rtsp_transport = profile.get(
         "rtsp_transport", getattr(args, "rtsp_transport", DEFAULT_RTSP_TRANSPORT)
+    )
+    args.video_codec_mode = profile.get(
+        "video_codec_mode", getattr(args, "video_codec_mode", DEFAULT_VIDEO_CODEC_MODE)
     )
     args.video_input_format = profile.get(
         "video_input_format", args.video_input_format
@@ -1713,6 +1769,7 @@ def configure_record_interactively(
     print(
         f"  Format:  {args.video_input_format if args.video_input_format != DEFAULT_VIDEO_INPUT_FORMAT else 'auto'}"
     )
+    print(f"  Video path: {args.video_codec_mode}")
     if uses_alsa_audio_input(args):
         print(f"  Audio:   {args.audio_device}")
     else:
@@ -1804,10 +1861,14 @@ def command_setup(args: argparse.Namespace) -> int:
         print(source_error, file=sys.stderr)
         return 1
 
+    for warning in auto_select_video_codec_mode(args):
+        print(f"warning: {warning}", file=sys.stderr)
+
     ffmpeg_path, supported_encoders = detect_supported_encoders(args.ffmpeg_bin)
-    resolved_encoder = resolve_encoder(ffmpeg_path, supported_encoders, args.encoder)
-    if resolved_encoder:
-        args.encoder = resolved_encoder
+    if not uses_video_passthrough(args):
+        resolved_encoder = resolve_encoder(ffmpeg_path, supported_encoders, args.encoder)
+        if resolved_encoder:
+            args.encoder = resolved_encoder
 
     if args.probe:
         if not ffmpeg_path:
@@ -1871,6 +1932,9 @@ def command_setup(args: argparse.Namespace) -> int:
 
         print()
 
+    for warning in normalize_video_settings(args):
+        print(f"warning: {warning}", file=sys.stderr)
+
     print("Setup summary")
     print(f"  Source type:       {args.source_type}")
     print(f"  Video source:      {source_display_label(args)}")
@@ -1879,10 +1943,11 @@ def command_setup(args: argparse.Namespace) -> int:
     print(
         f"  Video input fmt:   {args.video_input_format if args.video_input_format != DEFAULT_VIDEO_INPUT_FORMAT else 'auto'}"
     )
+    print(f"  Video path:        {args.video_codec_mode}")
     if is_rtsp_source(args):
         print(f"  Output pacing:     target {args.framerate} fps")
     else:
-        print(f"  Video mode:        {args.video_size} @ {args.framerate} fps")
+        print(f"  Capture mode:      {args.video_size} @ {args.framerate} fps")
     if uses_alsa_audio_input(args):
         print(f"  Audio device:      {args.audio_device}")
         print(
@@ -1897,7 +1962,9 @@ def command_setup(args: argparse.Namespace) -> int:
         if args.audio:
             print(f"  Audio gain:        {args.audio_gain_db:g} dB")
     print(f"  Storage:           {storage_summary(args.recordings_dir)}")
-    print(f"  Video encoder:     {args.encoder}")
+    print(
+        f"  Video encoder:     {'copy (passthrough)' if uses_video_passthrough(args) else args.encoder}"
+    )
     print(
         "  Video timestamp:   "
         f"{'wall-clock overlay' if args.video_timestamp else 'disabled'}"
@@ -2306,6 +2373,7 @@ def write_metadata(
         "device": args.device,
         "rtsp_url": args.rtsp_url,
         "rtsp_transport": args.rtsp_transport,
+        "video_codec_mode": args.video_codec_mode,
         "audio_enabled": args.audio,
         "audio_device": args.audio_device,
         "audio_channels": args.audio_channels,
@@ -2314,7 +2382,7 @@ def write_metadata(
         "audio_gain_db": args.audio_gain_db,
         "framerate": args.framerate,
         "video_size": args.video_size,
-        "encoder": args.encoder,
+        "encoder": "copy" if uses_video_passthrough(args) else args.encoder,
         "video_timestamp": args.video_timestamp,
         "preset": args.preset,
         "archive_format": args.archive_format,
@@ -4567,29 +4635,29 @@ def run_record_command(args: argparse.Namespace, *, launch_player: bool = False)
         print(source_error, file=sys.stderr)
         return 1
 
+    for warning in auto_select_video_codec_mode(args):
+        print(f"warning: {warning}", file=sys.stderr)
+
     ffmpeg_path, supported_encoders = detect_supported_encoders(args.ffmpeg_bin)
     if not ffmpeg_path:
         print(f"ffmpeg binary not found: {args.ffmpeg_bin}", file=sys.stderr)
         return 1
 
-    resolved_encoder = resolve_encoder(ffmpeg_path, supported_encoders, args.encoder)
-    if not resolved_encoder:
-        print("no supported video encoder found for this ffmpeg build", file=sys.stderr)
-        return 1
-    if resolved_encoder != args.encoder:
-        print(
-            f"warning: encoder '{args.encoder}' is unavailable; using '{resolved_encoder}' instead",
-            file=sys.stderr,
-        )
-        args.encoder = resolved_encoder
+    if not uses_video_passthrough(args):
+        resolved_encoder = resolve_encoder(ffmpeg_path, supported_encoders, args.encoder)
+        if not resolved_encoder:
+            print("no supported video encoder found for this ffmpeg build", file=sys.stderr)
+            return 1
+        if resolved_encoder != args.encoder:
+            print(
+                f"warning: encoder '{args.encoder}' is unavailable; using '{resolved_encoder}' instead",
+                file=sys.stderr,
+            )
+            args.encoder = resolved_encoder
 
     _, supported_filters = detect_supported_filters(args.ffmpeg_bin)
-    if args.video_timestamp and "drawtext" not in supported_filters:
-        print(
-            "warning: ffmpeg drawtext filter is unavailable; disabling video timestamp overlay",
-            file=sys.stderr,
-        )
-        args.video_timestamp = False
+    for warning in normalize_video_settings(args, supported_filters=supported_filters):
+        print(f"warning: {warning}", file=sys.stderr)
     player = None
     if launch_player:
         player = choose_player(args.player)
@@ -6136,13 +6204,20 @@ def source_readiness(args: argparse.Namespace) -> tuple[bool, str]:
 
 
 def command_doctor(args: argparse.Namespace) -> int:
+    for warning in auto_select_video_codec_mode(args):
+        print(f"warning: {warning}", file=sys.stderr)
+
     ffmpeg_path, supported_encoders = detect_supported_encoders(args.ffmpeg_bin)
     has_nvenc = bool(
         ffmpeg_path
         and "h264_nvenc" in supported_encoders
         and encoder_smoke_test(ffmpeg_path, "h264_nvenc")
     )
-    resolved_encoder = resolve_encoder(ffmpeg_path, supported_encoders, args.encoder)
+    resolved_encoder = (
+        "copy (passthrough)"
+        if uses_video_passthrough(args)
+        else resolve_encoder(ffmpeg_path, supported_encoders, args.encoder)
+    )
     player = choose_player(args.player)
     source_ok, source_status = source_readiness(args)
     if uses_alsa_audio_input(args):
@@ -6154,6 +6229,7 @@ def command_doctor(args: argparse.Namespace) -> int:
 
     print(f"ffmpeg:   {ffmpeg_path or 'missing'}")
     print(f"nvenc:    {'yes' if has_nvenc else 'no'}")
+    print(f"video:    {args.video_codec_mode}")
     print(f"encoder:  {resolved_encoder or 'missing'}")
     print(f"player:   {player or 'missing'}")
     print(f"type:     {args.source_type}")
@@ -6193,6 +6269,12 @@ def add_record_arguments(
         "--video-input-format",
         default=DEFAULT_VIDEO_INPUT_FORMAT,
         help="Preferred V4L2 input format, such as mjpeg or yuyv422.",
+    )
+    parser.add_argument(
+        "--video-codec-mode",
+        choices=VIDEO_CODEC_MODES,
+        default=DEFAULT_VIDEO_CODEC_MODE,
+        help="Encode video normally or pass through an already-encoded stream.",
     )
     parser.add_argument(
         "--audio",
@@ -6387,6 +6469,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--video-input-format",
         default=DEFAULT_VIDEO_INPUT_FORMAT,
         help="Preferred V4L2 input format to probe, such as mjpeg or yuyv422.",
+    )
+    setup.add_argument(
+        "--video-codec-mode",
+        choices=VIDEO_CODEC_MODES,
+        default=DEFAULT_VIDEO_CODEC_MODE,
+        help="Encode video normally or pass through an already-encoded stream.",
     )
     setup.add_argument(
         "--audio",
@@ -7048,6 +7136,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--encoder",
         default=DEFAULT_ENCODER,
         help="Preferred video encoder to validate, with automatic fallback.",
+    )
+    doctor.add_argument(
+        "--video-codec-mode",
+        choices=VIDEO_CODEC_MODES,
+        default=DEFAULT_VIDEO_CODEC_MODE,
+        help="Check encoder readiness or passthrough mode compatibility.",
     )
     doctor.set_defaults(func=command_doctor)
 

@@ -110,8 +110,9 @@ If you want live vision features, also install and run Ollama separately.
 
 - video device
 - or an RTSP URL plus transport preference
-- V4L2 input format such as `mjpeg` or `yuyv422`
+- V4L2 input format such as `h264`, `mjpeg`, or `yuyv422`
 - video size and framerate
+- whether video should be re-encoded or passed through with `-c:v copy`
 - audio input mode
 - encoder choice
 - storage destination
@@ -330,6 +331,7 @@ Profiles are stored in `~/.config/field-replay/config.json` by default.
 A profile currently remembers:
 
 - video device
+- video codec mode
 - video input format
 - audio enabled or disabled
 - audio device
@@ -354,6 +356,16 @@ Useful current defaults:
 - archive format after stop: `mkv`
 
 If `h264_nvenc` is unavailable, the tool falls back to another available encoder such as `libx264`.
+
+For cameras that already expose H.264 on a dedicated V4L2 node, you can save a profile with:
+
+- `--device /dev/video4`
+- `--video-input-format h264`
+- `--video-codec-mode copy`
+
+That keeps the incoming H.264 bitstream and writes it straight into the rolling `timeshift.ts`, which can significantly reduce CPU load compared with decode-and-re-encode. The main tradeoff is that passthrough mode cannot burn the wall-clock timestamp overlay into the video.
+
+When a V4L2 profile selects `--video-input-format h264`, the tool now defaults that profile to passthrough mode automatically.
 
 ## Useful Commands
 
