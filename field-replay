@@ -41,6 +41,7 @@ DEFAULT_VISION_MODEL = "gemma4:e2b"
 DEFAULT_VISION_SAMPLE_INTERVAL = 10.0
 DEFAULT_VISION_TAIL_OFFSET = 4.0
 DEFAULT_VISION_REPEAT_COOLDOWN = 60.0
+DEFAULT_MOTION_GATE = True
 DEFAULT_MOTION_SIZE = "160x90"
 DEFAULT_MOTION_THRESHOLD = 8.0
 DEFAULT_MOTION_MIN_CHANGED_PCT = 1.5
@@ -259,6 +260,17 @@ def load_json_file(path: Path) -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
+def save_json_file(path: Path, payload: dict, *, description: str | None = None) -> bool:
+    try:
+        ensure_directory(path.parent)
+        path.write_text(json.dumps(payload, indent=2) + "\n")
+    except OSError as exc:
+        label = description or str(path)
+        print(f"warning: could not save {label}: {exc}", file=sys.stderr)
+        return False
+    return True
+
+
 def load_jsonl_records(path: Path) -> list[dict]:
     if not path.exists():
         return []
@@ -281,13 +293,7 @@ def load_jsonl_records(path: Path) -> list[dict]:
 
 
 def save_config(config_path: Path, payload: dict) -> bool:
-    try:
-        ensure_directory(config_path.parent)
-        config_path.write_text(json.dumps(payload, indent=2) + "\n")
-    except OSError as exc:
-        print(f"warning: could not save config: {exc}", file=sys.stderr)
-        return False
-    return True
+    return save_json_file(config_path, payload, description="config")
 
 
 def slugify(value: str) -> str:
@@ -1393,7 +1399,7 @@ def vision_profile_from_args(args: argparse.Namespace) -> dict:
 def vision_profile_summary_lines(profile_name: str, profile: dict) -> list[str]:
     prompt_override = profile.get("prompt")
     prompt_label = "custom" if prompt_override else "default"
-    motion_gate = bool(profile.get("motion_gate", False))
+    motion_gate = bool(profile.get("motion_gate", DEFAULT_MOTION_GATE))
     return [
         f"Vision profile: {profile_name}",
         f"  Model:    {profile.get('model', DEFAULT_VISION_MODEL)}",
@@ -1418,7 +1424,7 @@ def vision_profile_menu_label(profile_name: str, profile: dict) -> str:
     details = [profile.get("model", DEFAULT_VISION_MODEL)]
     if profile.get("vision_size"):
         details.append(str(profile["vision_size"]))
-    if profile.get("motion_gate"):
+    if profile.get("motion_gate", DEFAULT_MOTION_GATE):
         details.append("motion gate")
     if profile.get("prompt"):
         details.append("custom prompt")
@@ -1527,11 +1533,7 @@ def configure_vision_profile_interactively(
     print(f"  Keepalive:{args.keepalive}")
     print(f"  Vision:   {args.vision_size or 'native resolution'}")
     if getattr(args, "motion_gate", False):
-        zone_summary = (
-            motion_zone_label(args.motion_zone)
-            if args.motion_zone is not None
-            else "choose from preview after selecting a session"
-        )
+        zone_summary = motion_zone_label(args.motion_zone)
         print(
             "  Motion:   "
             f"{args.motion_size} gate, zone {zone_summary}, "
@@ -2745,6 +2747,8 @@ def vision_output_paths(vision_root: Path) -> dict[str, Path]:
         "debug_log": vision_root / "vision-debug.jsonl",
         "events_jsonl": vision_root / "events.jsonl",
         "events_log": vision_root / "events.log",
+        "runtime_control": vision_root / "runtime-control.json",
+        "runtime_state": vision_root / "runtime-state.json",
     }
 
 
@@ -2812,6 +2816,21 @@ def is_bib_detection_label(value: str) -> bool:
 
 def motion_zone_label(zone_spec: str | None) -> str:
     return zone_spec or "full frame"
+
+
+def parse_motion_zone_value(
+    raw_zone: str | None,
+    *,
+    grid_size: int = DEFAULT_MOTION_ZONE_GRID,
+) -> tuple[str | None, str | None]:
+    normalized = normalize_motion_zone_spec(raw_zone, grid_size)
+    if (
+        raw_zone
+        and raw_zone.strip().lower() not in {"full", "all", "*", "none"}
+        and normalized is None
+    ):
+        return None, f"invalid motion zone: {raw_zone!r}; expected C3 or B3:D4"
+    return normalized, None
 
 
 def motion_grid_column_label(index: int) -> str:
@@ -3002,16 +3021,9 @@ def maybe_select_motion_zone_interactively(
     ffmpeg_path: str,
     supported_filters: set[str],
     output_root: Path,
+    force: bool = False,
 ) -> str | None:
     if not interactive_mode_enabled(args) or not args.motion_gate:
-        return args.motion_zone
-    default_select = args.motion_zone is None
-    prompt_text_value = (
-        "Select a motion zone from a preview frame now?"
-        if args.motion_zone is None
-        else f"Edit motion zone '{args.motion_zone}' from a preview frame now?"
-    )
-    if not prompt_yes_no(prompt_text_value, default=default_select):
         return args.motion_zone
     if "drawtext" not in supported_filters or "drawbox" not in supported_filters:
         print(
@@ -3019,6 +3031,15 @@ def maybe_select_motion_zone_interactively(
             file=sys.stderr,
         )
         return args.motion_zone
+    if not force:
+        default_select = args.motion_zone is None
+        prompt_text_value = (
+            "Select a motion zone from a preview frame now?"
+            if args.motion_zone is None
+            else f"Edit motion zone '{args.motion_zone}' from a preview frame now?"
+        )
+        if not prompt_yes_no(prompt_text_value, default=default_select):
+            return args.motion_zone
 
     preview_path = output_root / "motion-zone-preview.jpg"
     viewer = choose_image_viewer(None)
@@ -3046,6 +3067,70 @@ def maybe_select_motion_zone_interactively(
         if zone_spec == args.motion_zone:
             return zone_spec
         args.motion_zone = zone_spec
+
+
+def write_vision_runtime_state(
+    runtime_paths: dict[str, Path],
+    *,
+    vision_profile: str | None,
+    motion_gate: bool,
+    motion_size: str | None,
+    motion_zone: str | None,
+) -> bool:
+    payload = {
+        "updated_at": event_wall_time(datetime.now().astimezone()),
+        "vision_profile": vision_profile,
+        "motion_gate": motion_gate,
+        "motion_size": motion_size if motion_gate else None,
+        "motion_zone": motion_zone,
+        "motion_zone_label": motion_zone_label(motion_zone) if motion_gate else None,
+    }
+    return save_json_file(
+        runtime_paths["runtime_state"],
+        payload,
+        description="vision runtime state",
+    )
+
+
+def write_vision_runtime_control(
+    runtime_paths: dict[str, Path],
+    *,
+    motion_zone: str | None,
+) -> bool:
+    payload = {
+        "updated_at": event_wall_time(datetime.now().astimezone()),
+        "motion_zone": motion_zone,
+        "motion_zone_label": motion_zone_label(motion_zone),
+    }
+    return save_json_file(
+        runtime_paths["runtime_control"],
+        payload,
+        description="vision runtime control",
+    )
+
+
+def apply_runtime_motion_zone_update(
+    runtime_paths: dict[str, Path],
+    *,
+    current_zone: str | None,
+) -> tuple[bool, str | None]:
+    payload = load_json_file(runtime_paths["runtime_control"])
+    if "motion_zone" not in payload:
+        return False, current_zone
+    raw_zone = payload.get("motion_zone")
+    if raw_zone is not None and not isinstance(raw_zone, str):
+        print(
+            f"warning: ignoring invalid runtime motion zone payload in {runtime_paths['runtime_control']}",
+            file=sys.stderr,
+        )
+        return False, current_zone
+    normalized_zone, error = parse_motion_zone_value(raw_zone)
+    if error:
+        print(f"warning: ignoring runtime motion zone update: {error}", file=sys.stderr)
+        return False, current_zone
+    if normalized_zone == current_zone:
+        return False, current_zone
+    return True, normalized_zone
 
 
 def extract_frame_at_time(
@@ -4313,19 +4398,9 @@ def command_vision_live(args: argparse.Namespace) -> int:
         print(exc, file=sys.stderr)
         return 1
     if args.motion_gate:
-        raw_motion_zone = args.motion_zone
-        args.motion_zone = normalize_motion_zone_spec(
-            raw_motion_zone, DEFAULT_MOTION_ZONE_GRID
-        )
-        if (
-            raw_motion_zone
-            and raw_motion_zone.strip().lower() not in {"full", "all", "*", "none"}
-            and args.motion_zone is None
-        ):
-            print(
-                f"invalid motion zone: {raw_motion_zone!r}; expected C3 or B3:D4",
-                file=sys.stderr,
-            )
+        args.motion_zone, zone_error = parse_motion_zone_value(args.motion_zone)
+        if zone_error:
+            print(zone_error, file=sys.stderr)
             return 1
         if parse_scale_dimensions(args.motion_size) is None:
             print(
@@ -4349,6 +4424,7 @@ def command_vision_live(args: argparse.Namespace) -> int:
         if (
             source
             and interactive_mode_enabled(args)
+            and args.motion_select_zone
         ):
             chosen_zone = maybe_select_motion_zone_interactively(
                 args=args,
@@ -4357,6 +4433,7 @@ def command_vision_live(args: argparse.Namespace) -> int:
                 ffmpeg_path=ffmpeg_path,
                 supported_filters=supported_filters,
                 output_root=output_root,
+                force=True,
             )
             args.motion_zone = chosen_zone
             if (
@@ -4370,6 +4447,19 @@ def command_vision_live(args: argparse.Namespace) -> int:
                 vision_profiles[active_vision_profile_name]["motion_zone"] = args.motion_zone
                 config["vision_profiles"] = vision_profiles
                 save_config(config_path, config)
+        applied_update, updated_zone = apply_runtime_motion_zone_update(
+            runtime_paths,
+            current_zone=args.motion_zone,
+        )
+        if applied_update:
+            args.motion_zone = updated_zone
+    write_vision_runtime_state(
+        runtime_paths,
+        vision_profile=active_vision_profile_name,
+        motion_gate=args.motion_gate,
+        motion_size=args.motion_size,
+        motion_zone=args.motion_zone,
+    )
     timeshift_path = session_dir / DEFAULT_TIMESHIFT_NAME
     processed_offsets: set[float] = set()
     sample_count = 0
@@ -4377,6 +4467,11 @@ def command_vision_live(args: argparse.Namespace) -> int:
     previous_motion_frame: bytes | None = None
     consecutive_motion_hits = 0
     gate_open_until: float | None = None
+    last_runtime_control_mtime = (
+        runtime_paths["runtime_control"].stat().st_mtime
+        if runtime_paths["runtime_control"].exists()
+        else None
+    )
 
     print(f"Vision live session: {session_dir}")
     print(f"Vision output dir:   {output_root}")
@@ -4391,6 +4486,10 @@ def command_vision_live(args: argparse.Namespace) -> int:
             f"changed>={args.motion_min_changed_pct:g}%, "
             f"hits>={args.motion_consecutive}, hold={args.motion_hold:g}s"
         )
+        if args.motion_zone is None:
+            print(
+                "Hint: use `field-replay motion-zone` to save a tighter motion zone later. Running full-frame for now."
+            )
     else:
         print("Motion gate:        disabled")
     print("Sampling is model-paced; press Ctrl+C to stop.")
@@ -4430,6 +4529,34 @@ def command_vision_live(args: argparse.Namespace) -> int:
             )
             motion_gate_open = True
             if args.motion_gate:
+                control_mtime = (
+                    runtime_paths["runtime_control"].stat().st_mtime
+                    if runtime_paths["runtime_control"].exists()
+                    else None
+                )
+                if control_mtime != last_runtime_control_mtime:
+                    last_runtime_control_mtime = control_mtime
+                    applied_update, updated_zone = apply_runtime_motion_zone_update(
+                        runtime_paths,
+                        current_zone=args.motion_zone,
+                    )
+                    if applied_update:
+                        args.motion_zone = updated_zone
+                        previous_motion_frame = None
+                        consecutive_motion_hits = 0
+                        gate_open_until = None
+                        write_vision_runtime_state(
+                            runtime_paths,
+                            vision_profile=active_vision_profile_name,
+                            motion_gate=args.motion_gate,
+                            motion_size=args.motion_size,
+                            motion_zone=args.motion_zone,
+                        )
+                        print(
+                            "[vision-live] "
+                            f"updated motion zone to {motion_zone_label(args.motion_zone)}",
+                            flush=True,
+                        )
                 current_motion_frame = extract_motion_plane_at_time(
                     ffmpeg_path,
                     timeshift_path,
@@ -4608,6 +4735,115 @@ def command_vision_live(args: argparse.Namespace) -> int:
             )
             if args.once:
                 return 1
+
+
+def command_motion_zone(args: argparse.Namespace) -> int:
+    config_path = args.config_file.expanduser()
+    config = load_config(config_path)
+    vision_profiles = config.get("vision_profiles", {})
+
+    if not args.session_dir and interactive_mode_enabled(args):
+        selected_target = select_session_target(
+            args,
+            config,
+            title="Choose a session to tune motion zone",
+        )
+        if not selected_target:
+            print("no sessions found for motion zone tuning", file=sys.stderr)
+            return 1
+        args.session_dir = Path(selected_target)
+
+    try:
+        session_dir = resolve_session_dir(
+            args.recordings_dir.expanduser(),
+            str(args.session_dir) if args.session_dir else None,
+        )
+    except FileNotFoundError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+
+    source = export_source_for_session(session_dir)
+    if not source:
+        print(f"no exportable media found under {session_dir}", file=sys.stderr)
+        return 1
+
+    ffmpeg_path = shutil.which(args.ffmpeg_bin)
+    if not ffmpeg_path:
+        print(f"ffmpeg binary not found: {args.ffmpeg_bin}", file=sys.stderr)
+        return 1
+    _, supported_filters = detect_supported_filters(args.ffmpeg_bin)
+
+    output_root = session_dir / "vision-live"
+    runtime_paths = vision_output_paths(output_root)
+    ensure_directory(runtime_paths["root"])
+
+    runtime_state = load_json_file(runtime_paths["runtime_state"])
+    current_zone = None
+    if "motion_zone" in runtime_state:
+        current_zone, _ = parse_motion_zone_value(runtime_state.get("motion_zone"))
+    if runtime_paths["runtime_control"].exists():
+        _, current_zone = apply_runtime_motion_zone_update(
+            runtime_paths,
+            current_zone=current_zone,
+        )
+
+    if args.motion_zone is not None:
+        current_zone, zone_error = parse_motion_zone_value(args.motion_zone)
+        if zone_error:
+            print(zone_error, file=sys.stderr)
+            return 1
+    elif interactive_mode_enabled(args):
+        selector_args = argparse.Namespace(
+            interactive=args.interactive,
+            motion_gate=True,
+            motion_zone=current_zone,
+            tail_offset=args.tail_offset,
+        )
+        current_zone = maybe_select_motion_zone_interactively(
+            args=selector_args,
+            session_dir=session_dir,
+            source_path=source.source_path,
+            ffmpeg_path=ffmpeg_path,
+            supported_filters=supported_filters,
+            output_root=output_root,
+            force=True,
+        )
+    else:
+        print(
+            "motion-zone requires --motion-zone when interactive prompts are disabled",
+            file=sys.stderr,
+        )
+        return 1
+
+    if not write_vision_runtime_control(runtime_paths, motion_zone=current_zone):
+        return 1
+
+    config["last_session_dir"] = str(session_dir)
+    save_config(config_path, config)
+
+    print(f"Session:            {session_dir}")
+    print(f"Motion zone:        {motion_zone_label(current_zone)}")
+    print(f"Runtime control:    {runtime_paths['runtime_control']}")
+
+    active_profile_name = runtime_state.get("vision_profile")
+    if (
+        isinstance(active_profile_name, str)
+        and active_profile_name in vision_profiles
+        and interactive_mode_enabled(args)
+        and prompt_yes_no(
+            f"Update saved vision profile '{active_profile_name}' with this motion zone?",
+            default=True,
+        )
+    ):
+        vision_profiles[active_profile_name]["motion_zone"] = current_zone
+        config["vision_profiles"] = vision_profiles
+        save_config(config_path, config)
+        print(f"Updated vision profile: {active_profile_name}")
+
+    print(
+        "If `vision-live` is already running for this session, it will pick up the new zone on its next sample."
+    )
+    return 0
 
 
 def command_find_bib(args: argparse.Namespace) -> int:
@@ -5787,7 +6023,7 @@ def build_parser() -> argparse.ArgumentParser:
     vision_live.add_argument(
         "--motion-gate",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=DEFAULT_MOTION_GATE,
         help="Use a cheap motion check before calling the vision model.",
     )
     vision_live.add_argument(
@@ -5861,6 +6097,39 @@ def build_parser() -> argparse.ArgumentParser:
         help="Prompt to choose a recent session when the target is omitted.",
     )
     vision_live.set_defaults(func=command_vision_live)
+
+    motion_zone = subparsers.add_parser(
+        "motion-zone",
+        help="Pick or update the motion zone for a session, including a running vision-live loop.",
+    )
+    motion_zone.add_argument(
+        "session_dir",
+        nargs="?",
+        type=Path,
+        help="Session directory to tune. Defaults to an interactive picker or the latest session.",
+    )
+    motion_zone.add_argument(
+        "--ffmpeg-bin",
+        default="ffmpeg",
+        help="FFmpeg binary to use for preview extraction.",
+    )
+    motion_zone.add_argument(
+        "--tail-offset",
+        type=float,
+        default=DEFAULT_VISION_TAIL_OFFSET,
+        help="Seconds behind the live tail to sample for the preview frame.",
+    )
+    motion_zone.add_argument(
+        "--motion-zone",
+        help="Optional 4x4 motion zone like C3 or B3:D4. Leave unset to choose interactively.",
+    )
+    motion_zone.add_argument(
+        "--interactive",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Prompt to choose a recent session and zone when the target is omitted.",
+    )
+    motion_zone.set_defaults(func=command_motion_zone)
 
     find_bib = subparsers.add_parser(
         "find-bib",

@@ -177,16 +177,15 @@ Live follow:
 `vision-live` follows a growing session in a model-paced loop:
 
 - grab a frame a few seconds behind live
-- optionally run a cheap motion gate first
+- run a cheap motion gate first by default
 - ask the local model for bib guesses or custom detections
 - promote only useful sightings
 - print promoted sightings to stdout
 
-Example with motion gating enabled:
+Example with the default motion gate:
 
 ```bash
 ./field-replay vision-live ~/recordings/run-20260408-181629 \
-  --motion-gate \
   --motion-size 160x90 \
   --motion-threshold 8 \
   --motion-min-changed-pct 1.5 \
@@ -194,28 +193,31 @@ Example with motion gating enabled:
   --motion-hold 4
 ```
 
-This keeps the normal rolling `timeshift.ts` recording, but skips most Ollama calls until the watched scene changes enough to be interesting.
+This keeps the normal rolling `timeshift.ts` recording, but skips most Ollama calls until the watched scene changes enough to be interesting. If no motion zone is saved yet, `vision-live` runs full-frame and prints a hint about tightening the zone later.
 
 If you want to watch only part of the scene, you can either pass a zone directly:
 
 ```bash
 ./field-replay vision-live ~/recordings/run-20260408-181629 \
-  --motion-gate \
   --motion-zone B3:D4
 ```
 
-or ask for an interactive preview:
+or ask for an interactive preview at startup:
 
 ```bash
 ./field-replay vision-live ~/recordings/run-20260408-181629 \
-  --motion-gate \
   --motion-select-zone
 ```
 
 The selector uses a labeled `4x4` grid over a real frame from the session. Enter one cell like `C3`, two corners like `B3 D4`, or `full` to watch the whole frame.
 
-In the interactive flow, the zone preview appears after you choose the session, so the grid is rendered from the actual live view instead of being asked for blindly during profile setup.
-If the chosen profile already has a saved motion zone, `vision-live` now offers to edit that zone from the preview before the run starts.
+For a running session, the simplest operator path is the standalone zone editor:
+
+```bash
+./field-replay motion-zone
+```
+
+That command lets you pick the active recording session, shows a real preview frame with the grid overlay, and writes the new zone to the session's live runtime control so a running `vision-live` loop can pick it up without restarting.
 
 For custom prompt experiments, the vision parser now also accepts:
 
