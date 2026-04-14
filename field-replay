@@ -4467,11 +4467,18 @@ def command_vision_live(args: argparse.Namespace) -> int:
     previous_motion_frame: bytes | None = None
     consecutive_motion_hits = 0
     gate_open_until: float | None = None
+    pending_skip_markers = 0
     last_runtime_control_mtime = (
         runtime_paths["runtime_control"].stat().st_mtime
         if runtime_paths["runtime_control"].exists()
         else None
     )
+
+    def flush_skip_markers() -> None:
+        nonlocal pending_skip_markers
+        if pending_skip_markers:
+            print()
+            pending_skip_markers = 0
 
     print(f"Vision live session: {session_dir}")
     print(f"Vision output dir:   {output_root}")
@@ -4541,6 +4548,7 @@ def command_vision_live(args: argparse.Namespace) -> int:
                         current_zone=args.motion_zone,
                     )
                     if applied_update:
+                        flush_skip_markers()
                         args.motion_zone = updated_zone
                         previous_motion_frame = None
                         consecutive_motion_hits = 0
@@ -4626,13 +4634,15 @@ def command_vision_live(args: argparse.Namespace) -> int:
                         "skipped_reason": "motion-gate-closed",
                     },
                 )
-                print(
-                    f"[vision-live] {format_duration(offset_seconds)} {motion_summary_text(motion_result)}, skipping vision",
-                    flush=True,
-                )
+                print(".", end="", flush=True)
+                pending_skip_markers += 1
+                if pending_skip_markers >= 80:
+                    print()
+                    pending_skip_markers = 0
                 processed_offsets.add(rounded_offset)
                 sample_count += 1
                 if args.once:
+                    flush_skip_markers()
                     return 0
                 continue
 
@@ -4643,6 +4653,7 @@ def command_vision_live(args: argparse.Namespace) -> int:
                 runtime_paths["scratch_frame"],
                 frame_filter=frame_filter,
             )
+            flush_skip_markers()
             print(
                 f"[vision-live] analyzing {format_duration(offset_seconds)} with {args.model} "
                 f"({motion_summary_text(motion_result)})...",
@@ -4699,11 +4710,13 @@ def command_vision_live(args: argparse.Namespace) -> int:
                     },
                 )
             if result.error:
+                flush_skip_markers()
                 print(
                     f"[vision-live] {format_duration(offset_seconds)} error after {result.elapsed_ms} ms: {result.error}",
                     flush=True,
                 )
             elif result.promoted:
+                flush_skip_markers()
                 print(
                     "[vision-live] "
                     f"{format_duration(offset_seconds)} promoted "
@@ -4712,6 +4725,7 @@ def command_vision_live(args: argparse.Namespace) -> int:
                     flush=True,
                 )
             else:
+                flush_skip_markers()
                 detected = ", ".join(result.detections) if result.detections else "nothing"
                 print(
                     f"[vision-live] {format_duration(offset_seconds)} saw {detected} in {result.elapsed_ms} ms",
@@ -4722,6 +4736,7 @@ def command_vision_live(args: argparse.Namespace) -> int:
             processed_offsets.add(rounded_offset)
             sample_count += 1
             if args.once:
+                flush_skip_markers()
                 return 0
         except RuntimeError as exc:
             append_jsonl(
@@ -4733,6 +4748,7 @@ def command_vision_live(args: argparse.Namespace) -> int:
                     "error": str(exc),
                 },
             )
+            flush_skip_markers()
             if args.once:
                 return 1
 
