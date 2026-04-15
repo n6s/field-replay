@@ -212,10 +212,12 @@ def uses_video_passthrough(args: argparse.Namespace | dict) -> bool:
 
 def auto_select_video_codec_mode(args: argparse.Namespace) -> list[str]:
     warnings: list[str] = []
+    video_input_format = getattr(args, "video_input_format", DEFAULT_VIDEO_INPUT_FORMAT)
+    video_codec_mode = getattr(args, "video_codec_mode", DEFAULT_VIDEO_CODEC_MODE)
     if (
         not is_rtsp_source(args)
-        and args.video_input_format == "h264"
-        and args.video_codec_mode != "copy"
+        and video_input_format == "h264"
+        and video_codec_mode != "copy"
     ):
         args.video_codec_mode = "copy"
         warnings.append(
@@ -7163,6 +7165,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("tcp", "udp", "auto"),
         default=DEFAULT_RTSP_TRANSPORT,
         help="Preferred RTSP transport when --source-type=rtsp.",
+    )
+    doctor.add_argument(
+        "--video-input-format",
+        default=DEFAULT_VIDEO_INPUT_FORMAT,
+        help="Preferred V4L2 input format, such as mjpeg or yuyv422.",
     )
     doctor.add_argument(
         "--audio",
