@@ -663,7 +663,7 @@ def choose_player(preferred: str | None) -> str | None:
         if preferred_path.is_file():
             return str(preferred_path)
         return shutil.which(preferred)
-    for name in ("vlc", "mpv", "ffplay", "cvlc"):
+    for name in ("mpv", "vlc", "ffplay", "cvlc"):
         resolved = shutil.which(name)
         if resolved:
             return resolved
@@ -6405,7 +6405,7 @@ def add_record_arguments(
     if include_player_options:
         parser.add_argument(
             "--player",
-            help="Preferred player for go mode. Defaults to vlc, then mpv, ffplay, cvlc.",
+            help="Preferred player for go mode. Defaults to mpv, then vlc, ffplay, cvlc.",
         )
         parser.add_argument(
             "--file-caching-ms",
@@ -6438,7 +6438,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--player",
-        help="Preferred player for watch mode. Defaults to vlc, then mpv, ffplay, cvlc.",
+        help="Preferred player for watch mode. Defaults to mpv, then vlc, ffplay, cvlc.",
     )
 
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -6571,7 +6571,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     watch.add_argument(
         "--player",
-        help="Preferred player for watch mode. Defaults to vlc, then mpv, ffplay, cvlc.",
+        help="Preferred player for watch mode. Defaults to mpv, then vlc, ffplay, cvlc.",
     )
     watch.add_argument(
         "--dry-run", action="store_true", help="Print the player command and exit."
@@ -6967,7 +6967,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     motion_tune.add_argument(
         "--player",
-        help="Preferred player for clip review. Defaults to vlc, then mpv, ffplay, cvlc.",
+        help="Preferred player for clip review. Defaults to mpv, then vlc, ffplay, cvlc.",
     )
     motion_tune.add_argument(
         "--pre-roll",
@@ -7059,7 +7059,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     review_bib.add_argument(
         "--player",
-        help="Preferred player for video review. Defaults to vlc, then mpv, ffplay, cvlc.",
+        help="Preferred player for video review. Defaults to mpv, then vlc, ffplay, cvlc.",
     )
     review_bib.add_argument(
         "--image-viewer",
@@ -7130,7 +7130,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     doctor.add_argument(
         "--player",
-        help="Preferred player to check. Defaults to vlc, then mpv, ffplay, cvlc.",
+        help="Preferred player to check. Defaults to mpv, then vlc, ffplay, cvlc.",
     )
     doctor.add_argument(
         "--encoder",
