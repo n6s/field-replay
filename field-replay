@@ -53,6 +53,7 @@ DEFAULT_MOTION_PIXEL_DELTA = 20
 DEFAULT_MOTION_ZONE_GRID = 4
 DEFAULT_MOTION_PREVIEW_SIZE = "960x540"
 DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
+DEFAULT_MPV_CONFIG_DIR = Path("~/.config/mpv").expanduser()
 DEFAULT_VISION_SWEEP_VARIANTS = (
     "source",
     "1280x720",
@@ -256,6 +257,18 @@ def interactive_mode_enabled(args: argparse.Namespace) -> bool:
 
 def ensure_directory(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
+
+
+def bundled_mpv_files() -> list[tuple[Path, Path]]:
+    repo_root = Path(__file__).resolve().parent
+    bundled_root = repo_root / "extras" / "mpv"
+    return [
+        (bundled_root / "input.conf", Path("input.conf")),
+        (
+            bundled_root / "scripts" / "live_minus.lua",
+            Path("scripts") / "live_minus.lua",
+        ),
+    ]
 
 
 def load_config(config_path: Path) -> dict:
@@ -6244,6 +6257,40 @@ def command_doctor(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_install_mpv_shortcuts(args: argparse.Namespace) -> int:
+    target_root = args.mpv_config_dir.expanduser()
+    planned_copies: list[tuple[Path, Path]] = []
+    missing_sources: list[Path] = []
+
+    for source, relative_target in bundled_mpv_files():
+        if not source.exists():
+            missing_sources.append(source)
+            continue
+        planned_copies.append((source, target_root / relative_target))
+
+    if missing_sources:
+        print("missing bundled mpv files:", file=sys.stderr)
+        for path in missing_sources:
+            print(f"  {path}", file=sys.stderr)
+        return 1
+
+    print("Installing bundled mpv shortcuts")
+    print(f"  Target: {target_root}")
+    for source, destination in planned_copies:
+        print(f"  Copy:   {source} -> {destination}")
+
+    if args.dry_run:
+        return 0
+
+    for source, destination in planned_copies:
+        ensure_directory(destination.parent)
+        shutil.copy2(source, destination)
+
+    print("mpv shortcuts installed")
+    print("  Shortcut: End -> live minus 2 seconds")
+    return 0
+
+
 def add_record_arguments(
     parser: argparse.ArgumentParser, *, include_player_options: bool = False
 ) -> None:
@@ -7144,6 +7191,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Check encoder readiness or passthrough mode compatibility.",
     )
     doctor.set_defaults(func=command_doctor)
+
+    install_mpv = subparsers.add_parser(
+        "install-mpv-shortcuts",
+        help="Install the bundled mpv input.conf and live-minus Lua script into ~/.config/mpv.",
+    )
+    install_mpv.add_argument(
+        "--mpv-config-dir",
+        type=Path,
+        default=DEFAULT_MPV_CONFIG_DIR,
+        help="Target mpv config directory. Default: %(default)s",
+    )
+    install_mpv.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the planned file copies without writing anything.",
+    )
+    install_mpv.set_defaults(func=command_install_mpv_shortcuts)
 
     return parser
 

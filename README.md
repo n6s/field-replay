@@ -90,6 +90,21 @@ What they are for:
 - `vainfo`: checking video acceleration support
 - `usbutils`: identifying USB capture hardware with `lsusb`
 
+If you want the repo's `mpv` near-live shortcut too, install the bundled config with:
+
+```bash
+./field-replay install-mpv-shortcuts
+```
+
+That installs:
+
+- `~/.config/mpv/input.conf`
+- `~/.config/mpv/scripts/live_minus.lua`
+
+The current binding is:
+
+- `End`: jump to about 2 seconds behind the live edge
+
 If you want live vision features, also install and run Ollama separately.
 
 ## Core Workflow
