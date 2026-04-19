@@ -62,7 +62,7 @@ These notes are not commitments. They are the current product leanings and backl
 
 ## Suggested Implementation Order
 
-1. Shift live vision toward fixed-cadence sampling, leaving motion as optional priority/acceleration.
+1. Shift live vision toward fixed-cadence sampling, leaving motion as optional priority/acceleration. (DONE)
 2. Add a simple event-dense tail/dashboard over existing evidence logs.
 3. Add minute-level candidate grouping and partial-bib context.
 4. Add reconciliation summaries for first seen, last seen, hit count, sources, and frames.
