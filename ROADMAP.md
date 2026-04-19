@@ -1,72 +1,72 @@
 # Roadmap
 
-This project started as a practical DVR-first recorder for aid stations, finish lines, and other race-adjacent review workflows.
+`field_replay` started as a practical DVR-first recorder for aid stations, finish lines, and other race-adjacent review workflows.
 
-These notes are not commitments. They are a backlog of ideas that seem useful in the field, especially when the goal is to answer questions like "what happened to bib 241?" quickly and with confidence.
+These notes are not commitments. They are the current product leanings and backlog for helping an operator answer questions like "what happened to bib 241?" quickly, calmly, and with recoverable evidence.
 
-## High-value next steps
+## Current Direction
 
-- Session event log: write timestamped `events.jsonl` data beside each session so bib sightings, spoken callouts, manual notes, and later RFID reads all share one timeline.
-- Manual marks and notes: fast operator shortcuts for `arrived`, `left aid`, `medical`, `unknown bib`, or free-text notes.
-- Frame grabs per event: save a full frame for each logged detection so operators can verify without rewinding video.
-- Clock overlay: stamp wall-clock time and session-relative time into video and frame grabs so review stays easy under stress.
-- Bib lookup: support queries like `find-bib 241` that show all evidence for a runner, including first seen, last seen, source, and confidence when available.
+- Keep the continuous DVR recording as the trusted backbone. AI, audio, motion, and future sensors should make review faster, not decide what gets preserved.
+- Favor simple, predictable live behavior over clever trigger chains. A missed heuristic should not cause missed evidence.
+- Treat detections as candidates until a human confirms them. Partial bib reads like `1`, `12`, or `23` can still be useful context before the full `123` is visible.
+- Preserve raw detail in diagnostics while keeping the live operator view calm through cooldowns, grouping, and promoted evidence frames.
+- Build toward a live evidence dashboard: recent promoted events, saved frames, and quick jumps into the near-live video.
 
-## Live review ideas
+## High-Value Next Steps
 
-- Live log tail: a TUI or text view that shows recent bib detections as they happen.
-- Jump-to-review: selecting a bib opens the player a couple seconds before the sighting.
-- Annotated review overlay: draw green bounding boxes around detected bibs during playback or clip export.
-- Bottom-bar labels: list detected bibs near the timestamp area and draw pointer lines back to their bounding boxes for easier multi-runner review.
-- Annotated evidence frames: export promoted stills with the timestamp strip plus detected bib numbers burned into the bottom row for quick `eog` review.
-- Group clustering: treat nearby detections as one departure pack so volunteers can compare "what I wrote down" versus "what the system saw."
-- Verification states: mark detections as `unreviewed`, `confirmed`, `rejected`, or `manual-only`.
-- Contact-sheet style review: browse saved frame grabs for one bib or one group without opening full video.
+- Live event dashboard: show event-dense minute buckets that skip quiet minutes, so a 30-line screen can cover the last 30 active minutes or more.
+- Fixed-cadence live vision: make predictable sampling the default path, with motion or audio used only to increase priority or cadence rather than suppress scanning.
+- Candidate grouping: cluster nearby detections by minute and show related partials beside stronger candidates without rewriting the underlying event log.
+- Reconciliation view: list bibs with first seen, last seen, hit count, sources, and saved frames so the operator can review possible in-station or one-hit runners during a lull.
+- VOX evidence lane: log speech or radio activity as jumpable events, even before reliable transcription exists.
+- Audio hints: optionally extract bib-like numbers, race callsigns, and radio keywords from speech segments as tentative events.
 
-## Detection and evidence sources
+## Evidence Sources
 
-- AI vision sidecar: continue developing the model-paced Ollama loop that grabs one frame behind live, asks a local image-capable model like `gemma4:e2b` to return bib guesses as strict JSON, then grabs the next frame only after the model responds.
-- Promotion controls: keep every sampled frame and raw response in diagnostics, but only promote first sightings or cooldown-expired repeats into the operator-facing event log and review frame folder.
-- Vision prompt and preprocessing experiments: tune prompts, frame scaling, contrast, and region-of-interest sampling to improve small or low-contrast bib reads.
-- Audio callouts: optional speech-to-text for bib numbers called out by volunteers or radio operators.
-- RFID ingest: if a reader and tag-to-bib lookup table exist, log RFID detections into the same event timeline.
-- Evidence correlation: merge nearby vision, audio, RFID, and manual entries into stronger combined evidence for one bib.
-- Pacer handling: treat `PACER` bibs and related tags as useful, distinct events rather than noise.
+- Vision remains a second set of eyes. Promoted frames with detected labels are central because human review can quickly explain model mistakes.
+- Audio should start with reliable activity markers, then add tentative speech-to-text hints for bib numbers and callsigns rather than full transcripts.
+- Motion should be a hint, not a gate. Outdoors it is too finicky to decide whether the system is allowed to look.
+- RFID ingest remains useful if a reader and tag-to-bib lookup table exist, but it should land in the same timeline rather than becoming a separate workflow.
+- Manual marks can be useful for unusual events, but the normal operator path should not require duplicate logging inside `field-replay`.
 
-## Busy aid station realities
+## Review Ideas
 
-- Motion is only a hint. Crew, visitors, radio operators, and pacers create movement that should not automatically become runner events.
-- Prefer zone-based or text-based detection over pure motion-triggered logging.
-- Keep crew noise suppressible in the review UI, while still allowing special events like `PACER` to stand out.
-- Store uncertainty instead of hiding it. A tentative detection can still help during a welfare check or search decision.
+- Minute-bucket tail: show active minutes only, with sources such as vision, audio, radio/VOX, RFID, and manual notes.
+- Bib review summary: show exact hits plus nearby partial candidates from the same minute or activity cluster.
+- Jump-to-review: open the player a few seconds before the first, last, or selected evidence event.
+- Contact-sheet or frame-browser review: browse promoted frames for one bib, one minute bucket, or one activity cluster.
+- Activity-only export: generate a derived clip or reel from event windows while keeping the full DVR recording intact.
+- Verification states may be useful later, but they should not become required live workflow.
 
-## Low-spec hardware guidance
+## Two-Camera Direction
 
-- Cheap enough to try early:
-  timestamp overlay, manual event log, event frame grabs, simple TUI views.
-- Probably fine with careful tuning:
-  motion-gated frame sampling and model-paced vision scans.
-- Potentially too heavy unless the machine is stronger:
-  continuous speech-to-text and more advanced vision models.
+- Treat cameras as independent evidence lanes with shared timing, not as a complex tracking system.
+- Store camera/source labels on events and frames so review can jump to the same minute on another angle.
+- Keep per-camera recording reliable first; merge or compare evidence after capture.
 
-The safest pattern on weak hardware is to keep recording reliable, then layer selective vision and review helpers on top.
+## Hardware Guidance
 
-## Possible command ideas
+- On old laptops, prefer continuous DVR, fixed-cadence vision, cooldowns, promoted frames, and event-dense review.
+- Use motion and VOX to prioritize extra samples, not to hide quiet-looking intervals entirely.
+- On stronger future hardware, improve cadence, resolution, and camera count without changing the basic evidence model.
+- More advanced object tracking, OCR, or multi-camera correlation can come later, after the operator dashboard is useful with humble hardware.
 
-- `field-replay events`
+## Possible Command Ideas
+
 - `field-replay tail`
-- `field-replay find-bib 241`
+- `field-replay events`
+- `field-replay reconcile`
+- `field-replay audio-live`
 - `field-replay clip-at 00:27:54`
-- `field-replay review`
 - `field-replay ingest-rfid`
 
-## Suggested implementation order
+## Suggested Implementation Order
 
-1. Add a per-session event log format.
-2. Add manual marks and notes.
-3. Add clock overlay and frame grabs.
-4. Add bib lookup and simple review tooling.
-5. Tune vision detection on saved frames and live samples.
-6. Add annotated vision review exports or playback overlays.
-7. Add live TUI review flows.
-8. Add optional audio and RFID correlation.
+1. Shift live vision toward fixed-cadence sampling, leaving motion as optional priority/acceleration.
+2. Add a simple event-dense tail/dashboard over existing evidence logs.
+3. Add minute-level candidate grouping and partial-bib context.
+4. Add reconciliation summaries for first seen, last seen, hit count, sources, and frames.
+5. Add VOX/radio activity logging as jumpable evidence.
+6. Add tentative audio bib/callsign extraction.
+7. Add multi-camera evidence labels and same-minute review jumps.
+8. Add activity-only exports, contact sheets, and richer review flows.
