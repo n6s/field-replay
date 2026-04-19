@@ -2789,9 +2789,10 @@ def build_export_command(
         "-hide_banner",
         "-stats",
         "-y",
-        "-i",
-        str(source_path),
     ]
+    if timelapse_spec:
+        command.extend(["-fflags", "+genpts"])
+    command.extend(["-i", str(source_path)])
     video_filters = []
     if timelapse_spec:
         video_filters.extend(
@@ -2799,6 +2800,7 @@ def build_export_command(
                 f"select='not(mod(n\\,{timelapse_spec.frame_skip}))'",
                 "settb=AVTB",
                 f"setpts=N/({timelapse_spec.output_fps:g}*TB)",
+                f"fps={timelapse_spec.output_fps:g}",
             ]
         )
     if preset["scale"]:
@@ -2822,7 +2824,7 @@ def build_export_command(
         ]
     )
     if timelapse_spec:
-        command.extend(["-an", "-fps_mode", "passthrough"])
+        command.extend(["-an", "-fps_mode", "cfr", "-avoid_negative_ts", "make_zero"])
     else:
         command.extend(
             [
