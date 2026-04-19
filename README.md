@@ -408,7 +408,11 @@ A few common variations:
 ./field-replay vision-sweep ~/recordings/run-20260408-181629 --variant source --variant 1280x720 --variant 640x360 --variant 320x180
 ./field-replay watch --player mpv
 ./field-replay export --preset share-small
+./field-replay export --timelapse 60
+./field-replay export --timelapse 120 --timelapse-output-fps 60 --preset share-small
 ```
+
+`export` can create either a normal-speed share copy or a timelapse. In interactive mode it asks for the export type, then offers common timelapse speeds and playback frame rates before showing the final `ffmpeg` command.
 
 `vision-sweep` writes one scan directory per tested rung plus `summary.json` and `summary.txt` under `vision-scan-sweep/`. The first rung is treated as the reference baseline for comparison, so the default ladder starts with `source`. In the sweeps so far, `720p` matched source reliably, while `640x360` and below were more likely to drop or misread harder bibs.
 

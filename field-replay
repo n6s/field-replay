@@ -62,6 +62,10 @@ DEFAULT_VISION_SWEEP_VARIANTS = (
     "426x240",
     "320x180",
 )
+DEFAULT_TIMELAPSE_SPEED = 60.0
+DEFAULT_TIMELAPSE_OUTPUT_FPS = 60.0
+TIMELAPSE_SPEED_CHOICES = (30.0, 60.0, 120.0)
+TIMELAPSE_OUTPUT_FPS_CHOICES = (60.0, 30.0)
 VISION_RESOLUTION_ALIASES = {
     "1080p": "1920x1080",
     "720p": "1280x720",
@@ -147,6 +151,14 @@ class ExportSource:
     session_dir: Path
     source_path: Path
     source_label: str
+
+
+@dataclass(frozen=True)
+class TimelapseSpec:
+    speed: float
+    output_fps: float
+    input_fps: float
+    frame_skip: int
 
 
 @dataclass(frozen=True)
@@ -2495,7 +2507,9 @@ def probe_media_duration(ffmpeg_bin: str, source_path: Path) -> float | None:
     ffmpeg_path = shutil.which(ffmpeg_bin)
     if ffmpeg_path:
         ffprobe_bin = str(Path(ffmpeg_path).with_name("ffprobe"))
-    ffprobe_path = shutil.which(ffprobe_bin) or (ffprobe_bin if Path(ffprobe_bin).exists() else None)
+    ffprobe_path = shutil.which(ffprobe_bin) or (
+        ffprobe_bin if Path(ffprobe_bin).exists() else None
+    )
     if not ffprobe_path:
         return None
 
@@ -2520,6 +2534,69 @@ def probe_media_duration(ffmpeg_bin: str, source_path: Path) -> float | None:
         return float(result.stdout.strip())
     except ValueError:
         return None
+
+
+def parse_frame_rate(value: str | None) -> float | None:
+    if not value:
+        return None
+    text = value.strip()
+    if "/" in text:
+        numerator_text, denominator_text = text.split("/", 1)
+        try:
+            numerator = float(numerator_text)
+            denominator = float(denominator_text)
+        except ValueError:
+            return None
+        if denominator == 0:
+            return None
+        return numerator / denominator
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def probe_media_frame_rate(ffmpeg_bin: str, source_path: Path) -> float | None:
+    ffprobe_bin = "ffprobe"
+    ffmpeg_path = shutil.which(ffmpeg_bin)
+    if ffmpeg_path:
+        ffprobe_bin = str(Path(ffmpeg_path).with_name("ffprobe"))
+    ffprobe_path = shutil.which(ffprobe_bin) or (ffprobe_bin if Path(ffprobe_bin).exists() else None)
+    if not ffprobe_path:
+        return None
+
+    result = subprocess.run(
+        [
+            ffprobe_path,
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=avg_frame_rate,r_frame_rate",
+            "-of",
+            "json",
+            str(source_path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    streams = payload.get("streams")
+    if not streams:
+        return None
+    stream = streams[0]
+    for key in ("avg_frame_rate", "r_frame_rate"):
+        fps = parse_frame_rate(stream.get(key))
+        if fps and fps > 0:
+            return fps
+    return None
 
 
 def load_session_metadata(session_dir: Path) -> dict:
@@ -2623,17 +2700,36 @@ def export_resolution_label(preset_name: str, session_metadata: dict) -> str:
     return video_size_label(str(session_metadata.get("video_size") or ""))
 
 
+def timelapse_slug(value: float) -> str:
+    if float(value).is_integer():
+        return str(int(value))
+    return f"{value:g}".replace(".", "p")
+
+
+def timelapse_label(spec: TimelapseSpec | None) -> str:
+    if not spec:
+        return "Normal speed"
+    return f"Timelapse, {spec.speed:g}x at {spec.output_fps:g} fps"
+
+
 def export_output_path(
     session_dir: Path,
     preset_name: str,
     explicit_output: Path | None,
     session_metadata: dict,
+    timelapse_spec: TimelapseSpec | None = None,
 ) -> Path:
     if explicit_output:
         return explicit_output.expanduser()
     suffix = EXPORT_PRESETS[preset_name]["output_suffix"]
     resolution = export_resolution_label(preset_name, session_metadata)
     session_stamp = session_dir.name
+    if timelapse_spec:
+        speed_slug = timelapse_slug(timelapse_spec.speed)
+        fps_slug = timelapse_slug(timelapse_spec.output_fps)
+        return session_dir / (
+            f"{session_stamp}-timelapse-{resolution}-{suffix}-{speed_slug}x-{fps_slug}fps.mp4"
+        )
     return session_dir / f"{session_stamp}-export-{resolution}-{suffix}.mp4"
 
 
@@ -2681,6 +2777,7 @@ def build_export_command(
     preset_name: str,
     video_encoder: str,
     encoder_preset: str,
+    timelapse_spec: TimelapseSpec | None = None,
 ) -> list[str]:
     preset = EXPORT_PRESETS[preset_name]
     video_bitrate_mbps = preset["video_bitrate_mbps"]
@@ -2695,8 +2792,19 @@ def build_export_command(
         "-i",
         str(source_path),
     ]
+    video_filters = []
+    if timelapse_spec:
+        video_filters.extend(
+            [
+                f"select='not(mod(n\\,{timelapse_spec.frame_skip}))'",
+                "settb=AVTB",
+                f"setpts=N/({timelapse_spec.output_fps:g}*TB)",
+            ]
+        )
     if preset["scale"]:
-        command.extend(["-vf", f"scale={preset['scale']}"])
+        video_filters.append(f"scale={preset['scale']}")
+    if video_filters:
+        command.extend(["-vf", ",".join(video_filters)])
     command.extend(
         [
             "-c:v",
@@ -2711,46 +2819,143 @@ def build_export_command(
             f"{bufsize_mbps:g}M",
             "-pix_fmt",
             "yuv420p",
-            "-c:a",
-            "aac",
-            "-b:a",
-            f"{audio_bitrate_kbps}k",
-            "-movflags",
-            "+faststart",
-            str(output_path),
         ]
     )
+    if timelapse_spec:
+        command.extend(["-an", "-fps_mode", "passthrough"])
+    else:
+        command.extend(
+            [
+                "-c:a",
+                "aac",
+                "-b:a",
+                f"{audio_bitrate_kbps}k",
+            ]
+        )
+    command.extend(["-movflags", "+faststart", str(output_path)])
     return command
 
 
-def preset_total_mbps(preset_name: str) -> float:
+def preset_total_mbps(
+    preset_name: str, timelapse_spec: TimelapseSpec | None = None
+) -> float:
     preset = EXPORT_PRESETS[preset_name]
+    if timelapse_spec:
+        return preset["video_bitrate_mbps"]
     return preset["video_bitrate_mbps"] + (preset["audio_bitrate_kbps"] / 1000.0)
 
 
-def export_preset_label(preset_name: str, duration_seconds: float | None) -> str:
+def export_preset_label(
+    preset_name: str,
+    duration_seconds: float | None,
+    timelapse_spec: TimelapseSpec | None = None,
+) -> str:
     preset = EXPORT_PRESETS[preset_name]
-    estimated_size = estimate_size_bytes(duration_seconds, preset_total_mbps(preset_name))
+    total_mbps = preset_total_mbps(preset_name, timelapse_spec)
+    estimated_size = estimate_size_bytes(duration_seconds, total_mbps)
     estimate_label = (
         format_bytes(estimated_size)
         if estimated_size is not None
-        else f"~{preset_total_mbps(preset_name):.2f} Mbps"
+        else f"~{total_mbps:.2f} Mbps"
     )
     return f"{preset['label']} - {preset['quality_hint']}, about {estimate_label}"
 
 
 def choose_export_preset(
-    duration_seconds: float | None, default_preset: str | None = None
+    duration_seconds: float | None,
+    default_preset: str | None = None,
+    timelapse_spec: TimelapseSpec | None = None,
 ) -> str:
     options = [
         (
             name,
-            export_preset_label(name, duration_seconds),
+            export_preset_label(name, duration_seconds, timelapse_spec),
         )
         for name in EXPORT_PRESETS
     ]
     chosen_default = default_preset if default_preset in EXPORT_PRESETS else "share-medium"
     return prompt_menu("Export preset", options, default_value=chosen_default)
+
+
+def choose_export_type(default_type: str = "normal") -> str:
+    return (
+        prompt_menu(
+            "Export type",
+            [
+                ("normal", "Normal speed"),
+                ("timelapse", "Timelapse"),
+            ],
+            default_value=default_type,
+        )
+        or "normal"
+    )
+
+
+def choose_timelapse_speed(default_speed: float = DEFAULT_TIMELAPSE_SPEED) -> float:
+    options = [(str(value), f"{value:g}x") for value in TIMELAPSE_SPEED_CHOICES]
+    options.append(("custom", "Custom"))
+    choice = prompt_menu(
+        "Timelapse speed",
+        options,
+        default_value=str(default_speed) if default_speed in TIMELAPSE_SPEED_CHOICES else "60.0",
+    )
+    if choice == "custom":
+        return prompt_float("Speed multiplier", default_speed)
+    return float(choice or default_speed)
+
+
+def choose_timelapse_output_fps(
+    default_output_fps: float = DEFAULT_TIMELAPSE_OUTPUT_FPS,
+) -> float:
+    options = [(str(value), f"{value:g} fps") for value in TIMELAPSE_OUTPUT_FPS_CHOICES]
+    options.append(("custom", "Custom"))
+    choice = prompt_menu(
+        "Playback FPS",
+        options,
+        default_value=(
+            str(default_output_fps)
+            if default_output_fps in TIMELAPSE_OUTPUT_FPS_CHOICES
+            else "60.0"
+        ),
+    )
+    if choice == "custom":
+        return prompt_float("Playback FPS", default_output_fps)
+    return float(choice or default_output_fps)
+
+
+def resolve_timelapse_spec(
+    args: argparse.Namespace, session_metadata: dict, source_path: Path
+) -> TimelapseSpec | None:
+    if args.timelapse_speed is None:
+        return None
+    speed = args.timelapse_speed
+    output_fps = args.timelapse_output_fps
+    input_fps = args.timelapse_input_fps
+    if input_fps is None:
+        metadata_fps = session_metadata.get("framerate")
+        if isinstance(metadata_fps, (int, float)) and metadata_fps > 0:
+            input_fps = float(metadata_fps)
+    if input_fps is None:
+        input_fps = probe_media_frame_rate(args.ffmpeg_bin, source_path)
+    if input_fps is None:
+        input_fps = output_fps
+    frame_skip = max(1, int(input_fps * speed / output_fps))
+    return TimelapseSpec(
+        speed=speed,
+        output_fps=output_fps,
+        input_fps=input_fps,
+        frame_skip=frame_skip,
+    )
+
+
+def validate_timelapse_args(args: argparse.Namespace) -> str | None:
+    if args.timelapse_speed is not None and args.timelapse_speed <= 0:
+        return "--timelapse speed must be greater than zero"
+    if args.timelapse_output_fps <= 0:
+        return "--timelapse-output-fps must be greater than zero"
+    if args.timelapse_input_fps is not None and args.timelapse_input_fps <= 0:
+        return "--timelapse-input-fps must be greater than zero"
+    return None
 
 
 def build_player_command(
@@ -6080,6 +6285,11 @@ def command_watch(args: argparse.Namespace) -> int:
 
 
 def command_export(args: argparse.Namespace) -> int:
+    timelapse_error = validate_timelapse_args(args)
+    if timelapse_error:
+        print(timelapse_error, file=sys.stderr)
+        return 1
+
     config_path = args.config_file.expanduser()
     config = load_config(config_path)
     if not args.target and interactive_mode_enabled(args):
@@ -6107,9 +6317,35 @@ def command_export(args: argparse.Namespace) -> int:
     duration_seconds = probe_media_duration(args.ffmpeg_bin, source.source_path)
     session_metadata = load_session_metadata(source.session_dir)
 
+    if interactive_mode_enabled(args) and args.timelapse_speed is None:
+        export_type = choose_export_type(default_type=config.get("last_export_type", "normal"))
+        if export_type == "timelapse":
+            args.timelapse_speed = choose_timelapse_speed(
+                float(config.get("last_timelapse_speed") or DEFAULT_TIMELAPSE_SPEED)
+            )
+            args.timelapse_output_fps = choose_timelapse_output_fps(
+                float(
+                    config.get("last_timelapse_output_fps")
+                    or DEFAULT_TIMELAPSE_OUTPUT_FPS
+                )
+            )
+
+    timelapse_error = validate_timelapse_args(args)
+    if timelapse_error:
+        print(timelapse_error, file=sys.stderr)
+        return 1
+
+    timelapse_spec = resolve_timelapse_spec(args, session_metadata, source.source_path)
+
     if interactive_mode_enabled(args) and not args.preset:
         args.preset = choose_export_preset(
-            duration_seconds, default_preset=config.get("last_export_preset")
+            (
+                duration_seconds / timelapse_spec.speed
+                if duration_seconds is not None and timelapse_spec
+                else duration_seconds
+            ),
+            default_preset=config.get("last_export_preset"),
+            timelapse_spec=timelapse_spec,
         )
 
     preset_name = args.preset or "share-medium"
@@ -6118,17 +6354,22 @@ def command_export(args: argparse.Namespace) -> int:
         return 1
 
     output_path = export_output_path(
-        source.session_dir, preset_name, args.output, session_metadata
+        source.session_dir, preset_name, args.output, session_metadata, timelapse_spec
     )
     preset = EXPORT_PRESETS[preset_name]
-    total_mbps = preset_total_mbps(preset_name)
+    output_duration_seconds = (
+        duration_seconds / timelapse_spec.speed
+        if duration_seconds is not None and timelapse_spec
+        else duration_seconds
+    )
+    total_mbps = preset_total_mbps(preset_name, timelapse_spec)
     export_encoder, export_preset, export_encoder_reason = resolve_export_encoder(
         ffmpeg_path, supported_encoders, session_metadata
     )
     if not export_encoder:
         print("no supported export video encoder found for this ffmpeg build", file=sys.stderr)
         return 1
-    estimated_size = estimate_size_bytes(duration_seconds, total_mbps)
+    estimated_size = estimate_size_bytes(output_duration_seconds, total_mbps)
     export_command = build_export_command(
         ffmpeg_path,
         source.source_path,
@@ -6136,14 +6377,29 @@ def command_export(args: argparse.Namespace) -> int:
         preset_name,
         export_encoder,
         export_preset,
+        timelapse_spec,
     )
 
     print("Export summary")
     print(f"  Source:      {source.source_path}")
+    print(f"  Type:        {timelapse_label(timelapse_spec)}")
+    if timelapse_spec:
+        print(
+            "  Sampling:    "
+            f"every {timelapse_spec.frame_skip} frames from "
+            f"{timelapse_spec.input_fps:g} fps source"
+        )
     print(f"  Preset:      {preset['label']}")
     print(f"  Encoder:     {export_encoder} ({export_encoder_reason})")
     print(f"  Output:      {output_path}")
-    print(f"  Duration:    {format_duration(duration_seconds)}")
+    if timelapse_spec:
+        print(
+            "  Duration:    "
+            f"{format_duration(duration_seconds)} source -> "
+            f"about {format_duration(output_duration_seconds)} output"
+        )
+    else:
+        print(f"  Duration:    {format_duration(duration_seconds)}")
     print(
         "  Est. size:   "
         f"{format_bytes(estimated_size) if estimated_size is not None else 'unknown'}"
@@ -6168,21 +6424,36 @@ def command_export(args: argparse.Namespace) -> int:
 
     config["last_session_dir"] = str(source.session_dir)
     config["last_export_preset"] = preset_name
+    config["last_export_type"] = "timelapse" if timelapse_spec else "normal"
+    if timelapse_spec:
+        config["last_timelapse_speed"] = timelapse_spec.speed
+        config["last_timelapse_output_fps"] = timelapse_spec.output_fps
     save_config(config_path, config)
     export_metadata = {
         "created_at": datetime.now().astimezone().isoformat(),
         "source_path": str(source.source_path),
         "source_label": source.source_label,
+        "export_type": "timelapse" if timelapse_spec else "normal",
         "preset": preset_name,
         "encoder": export_encoder,
         "encoder_preset": export_preset,
         "encoder_reason": export_encoder_reason,
         "duration_seconds": duration_seconds,
+        "output_duration_seconds": output_duration_seconds,
         "estimated_size_bytes": estimated_size,
         "output_path": str(output_path),
         "output_size_bytes": output_path.stat().st_size,
         "ffmpeg_command": export_command,
     }
+    if timelapse_spec:
+        export_metadata.update(
+            {
+                "timelapse_speed": timelapse_spec.speed,
+                "timelapse_input_fps": timelapse_spec.input_fps,
+                "timelapse_output_fps": timelapse_spec.output_fps,
+                "timelapse_frame_skip": timelapse_spec.frame_skip,
+            }
+        )
     try:
         export_metadata_path(output_path).write_text(
             json.dumps(export_metadata, indent=2) + "\n"
@@ -6655,7 +6926,24 @@ def build_parser() -> argparse.ArgumentParser:
     export.add_argument(
         "--output",
         type=Path,
-        help="Explicit output file path. Defaults to export-<preset>.mp4 in the session directory.",
+        help="Explicit output file path. Defaults to a descriptive MP4 name in the session directory.",
+    )
+    export.add_argument(
+        "--timelapse",
+        dest="timelapse_speed",
+        type=float,
+        help="Create a timelapse export at this speed multiplier, like 60 for 60x.",
+    )
+    export.add_argument(
+        "--timelapse-output-fps",
+        type=float,
+        default=DEFAULT_TIMELAPSE_OUTPUT_FPS,
+        help="Playback FPS for timelapse exports. Defaults to 60.",
+    )
+    export.add_argument(
+        "--timelapse-input-fps",
+        type=float,
+        help="Override detected source FPS for timelapse frame sampling.",
     )
     export.add_argument(
         "--dry-run",
