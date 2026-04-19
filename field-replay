@@ -43,7 +43,7 @@ DEFAULT_VISION_MODEL = "gemma4:e2b"
 DEFAULT_VISION_SAMPLE_INTERVAL = 10.0
 DEFAULT_VISION_TAIL_OFFSET = 4.0
 DEFAULT_VISION_REPEAT_COOLDOWN = 60.0
-DEFAULT_MOTION_GATE = True
+DEFAULT_MOTION_GATE = False
 DEFAULT_MOTION_SIZE = "160x90"
 DEFAULT_MOTION_THRESHOLD = 8.0
 DEFAULT_MOTION_MIN_CHANGED_PCT = 1.5
@@ -1455,6 +1455,8 @@ def vision_profile_from_args(args: argparse.Namespace) -> dict:
         "vision_size": args.vision_size,
         "prompt": args.prompt,
     }
+    if hasattr(args, "sample_interval"):
+        profile["sample_interval"] = args.sample_interval
     if hasattr(args, "motion_gate"):
         profile["motion_gate"] = args.motion_gate
     if hasattr(args, "motion_size"):
@@ -1482,6 +1484,7 @@ def vision_profile_summary_lines(profile_name: str, profile: dict) -> list[str]:
         f"  Host:     {profile.get('ollama_host', DEFAULT_OLLAMA_HOST)}",
         f"  Timeout:  {profile.get('timeout', 120.0):g}s",
         f"  Keepalive:{profile.get('keepalive', '5m')}",
+        f"  Cadence:  {profile.get('sample_interval') or DEFAULT_VISION_SAMPLE_INTERVAL:g}s",
         f"  Vision:   {profile.get('vision_size') or 'native resolution'}",
         (
             "  Motion:   "
@@ -1500,6 +1503,8 @@ def vision_profile_menu_label(profile_name: str, profile: dict) -> str:
     details = [profile.get("model", DEFAULT_VISION_MODEL)]
     if profile.get("vision_size"):
         details.append(str(profile["vision_size"]))
+    if profile.get("sample_interval"):
+        details.append(f"{profile['sample_interval']:g}s cadence")
     if profile.get("motion_gate", DEFAULT_MOTION_GATE):
         details.append("motion gate")
     if profile.get("prompt"):
@@ -1515,6 +1520,8 @@ def apply_vision_profile(args: argparse.Namespace, profile: dict) -> None:
     args.repeat_cooldown = profile.get("repeat_cooldown", args.repeat_cooldown)
     args.vision_size = profile.get("vision_size", args.vision_size)
     args.prompt = profile.get("prompt", args.prompt)
+    if hasattr(args, "sample_interval"):
+        args.sample_interval = profile.get("sample_interval") or args.sample_interval
     if hasattr(args, "motion_gate"):
         args.motion_gate = profile.get("motion_gate", args.motion_gate)
     if hasattr(args, "motion_size"):
@@ -1570,6 +1577,10 @@ def configure_vision_profile_interactively(
     args.repeat_cooldown = prompt_float(
         "Repeat cooldown (seconds)", args.repeat_cooldown
     )
+    if hasattr(args, "sample_interval"):
+        args.sample_interval = prompt_float(
+            "Sample cadence (seconds)", args.sample_interval
+        )
     args.vision_size = prompt_optional_text(
         "Vision frame size WIDTHxHEIGHT (leave blank for native)",
         args.vision_size,
@@ -1607,6 +1618,8 @@ def configure_vision_profile_interactively(
     print(f"  Host:     {args.ollama_host}")
     print(f"  Timeout:  {args.timeout:g}s")
     print(f"  Keepalive:{args.keepalive}")
+    if hasattr(args, "sample_interval"):
+        print(f"  Cadence:  {args.sample_interval:g}s")
     print(f"  Vision:   {args.vision_size or 'native resolution'}")
     if getattr(args, "motion_gate", False):
         zone_summary = motion_zone_label(args.motion_zone)
@@ -3364,6 +3377,7 @@ def write_vision_runtime_state(
     runtime_paths: dict[str, Path],
     *,
     vision_profile: str | None,
+    sample_interval: float | None,
     motion_gate: bool,
     motion_size: str | None,
     motion_zone: str | None,
@@ -3375,6 +3389,7 @@ def write_vision_runtime_state(
     payload = {
         "updated_at": event_wall_time(datetime.now().astimezone()),
         "vision_profile": vision_profile,
+        "sample_interval": sample_interval,
         "motion_gate": motion_gate,
         "motion_size": motion_size if motion_gate else None,
         "motion_zone": motion_zone,
@@ -3473,6 +3488,8 @@ def extract_frame_at_time(
     )
     if result.returncode != 0:
         raise RuntimeError(result.stderr.strip() or "ffmpeg timed frame extraction failed")
+    if not output_path.exists() or output_path.stat().st_size == 0:
+        raise RuntimeError("ffmpeg did not produce a frame at the requested offset")
 
 
 def extract_motion_plane_at_time(
@@ -3628,6 +3645,17 @@ def media_sample_points(duration_seconds: float, sample_interval: float) -> list
         sample_points.append(round(current, 3))
         current += sample_interval
     return sample_points
+
+
+def live_sample_offset(
+    duration_seconds: float,
+    *,
+    tail_offset: float,
+    sample_interval: float,
+) -> float:
+    available_offset = max(duration_seconds - max(tail_offset, 0.0), 0.0)
+    interval = max(sample_interval, 0.1)
+    return int(available_offset / interval) * interval
 
 
 def event_wall_time(now: datetime) -> str:
@@ -5394,6 +5422,9 @@ def command_vision_live(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(exc, file=sys.stderr)
         return 1
+    if args.sample_interval <= 0:
+        print("sample-interval must be greater than 0", file=sys.stderr)
+        return 1
     if args.motion_gate:
         args.motion_zone, zone_error = parse_motion_zone_value(args.motion_zone)
         if zone_error:
@@ -5453,6 +5484,7 @@ def command_vision_live(args: argparse.Namespace) -> int:
     write_vision_runtime_state(
         runtime_paths,
         vision_profile=active_vision_profile_name,
+        sample_interval=args.sample_interval,
         motion_gate=args.motion_gate,
         motion_size=args.motion_size,
         motion_zone=args.motion_zone,
@@ -5485,6 +5517,7 @@ def command_vision_live(args: argparse.Namespace) -> int:
     print(f"Vision output dir:   {output_root}")
     print(f"Vision model:        {args.model}")
     print(f"Vision frame size:   {args.vision_size or 'native'}")
+    print(f"Sample cadence:      {args.sample_interval:g}s")
     print(f"Repeat cooldown:     {args.repeat_cooldown:.0f}s")
     if args.motion_gate:
         print(
@@ -5500,7 +5533,7 @@ def command_vision_live(args: argparse.Namespace) -> int:
             )
     else:
         print("Motion gate:        disabled")
-    print("Sampling is model-paced; press Ctrl+C to stop.")
+    print("Sampling follows fixed media-time cadence points; press Ctrl+C to stop.")
 
     while True:
         if args.max_samples is not None and sample_count >= args.max_samples:
@@ -5518,7 +5551,11 @@ def command_vision_live(args: argparse.Namespace) -> int:
             time.sleep(args.idle_sleep)
             continue
 
-        offset_seconds = max(duration_seconds - max(args.tail_offset, 0.0), 0.0)
+        offset_seconds = live_sample_offset(
+            duration_seconds,
+            tail_offset=args.tail_offset,
+            sample_interval=args.sample_interval,
+        )
         rounded_offset = round(offset_seconds, 1)
         if rounded_offset in processed_offsets:
             if args.once:
@@ -5557,6 +5594,7 @@ def command_vision_live(args: argparse.Namespace) -> int:
                         write_vision_runtime_state(
                             runtime_paths,
                             vision_profile=active_vision_profile_name,
+                            sample_interval=args.sample_interval,
                             motion_gate=args.motion_gate,
                             motion_size=args.motion_size,
                             motion_zone=args.motion_zone,
@@ -7129,7 +7167,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     vision_live = subparsers.add_parser(
         "vision-live",
-        help="Experimentally follow a live session with a model-paced Ollama vision loop.",
+        help="Experimentally follow a live session with a fixed-cadence Ollama vision loop.",
     )
     vision_live.add_argument(
         "session_dir",
@@ -7157,6 +7195,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Base URL for the local Ollama server.",
     )
     vision_live.add_argument(
+        "--sample-interval",
+        type=float,
+        default=DEFAULT_VISION_SAMPLE_INTERVAL,
+        help="Seconds between live vision samples.",
+    )
+    vision_live.add_argument(
         "--tail-offset",
         type=float,
         default=DEFAULT_VISION_TAIL_OFFSET,
@@ -7182,7 +7226,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--motion-gate",
         action=argparse.BooleanOptionalAction,
         default=DEFAULT_MOTION_GATE,
-        help="Use a cheap motion check before calling the vision model.",
+        help="Use a cheap motion check before calling the vision model. Disabled by default.",
     )
     vision_live.add_argument(
         "--motion-size",
@@ -7237,7 +7281,7 @@ def build_parser() -> argparse.ArgumentParser:
     vision_live.add_argument(
         "--max-samples",
         type=int,
-        help="Stop after this many model-paced samples.",
+        help="Stop after this many sampled cadence points.",
     )
     vision_live.add_argument(
         "--prompt",

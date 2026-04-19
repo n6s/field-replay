@@ -190,18 +190,29 @@ Live follow:
 ./field-replay vision-live ~/recordings/run-20260408-181629
 ```
 
-`vision-live` follows a growing session in a model-paced loop:
+`vision-live` follows a growing session at a predictable fixed cadence:
 
-- grab a frame a few seconds behind live
-- run a cheap motion gate first by default
+- grab a frame a few seconds behind live at each cadence point
 - ask the local model for bib guesses or custom detections
 - promote only useful sightings
 - print promoted sightings to stdout
 
-Example with the default motion gate:
+By default, live vision samples every `10s` and does not let motion suppress model calls.
+This keeps the normal rolling `timeshift.ts` recording unchanged while making live
+sampling behavior easier to reason about during field work.
+
+To change the cadence:
 
 ```bash
 ./field-replay vision-live ~/recordings/run-20260408-181629 \
+  --sample-interval 5
+```
+
+Motion gating is still available as an explicit opt-in diagnostic or load-shedding path:
+
+```bash
+./field-replay vision-live ~/recordings/run-20260408-181629 \
+  --motion-gate \
   --motion-size 160x90 \
   --motion-threshold 8 \
   --motion-min-changed-pct 1.5 \
@@ -209,12 +220,16 @@ Example with the default motion gate:
   --motion-hold 4
 ```
 
-This keeps the normal rolling `timeshift.ts` recording, but skips most Ollama calls until the watched scene changes enough to be interesting. If no motion zone is saved yet, `vision-live` runs full-frame and prints a hint about tightening the zone later.
+When motion gating is enabled, it skips Ollama calls until the watched scene changes
+enough to be interesting. If no motion zone is saved yet, `vision-live` runs full-frame
+and prints a hint about tightening the zone later.
 
-If you want to watch only part of the scene, you can either pass a zone directly:
+If you enable motion gating and want to watch only part of the scene, you can either
+pass a zone directly:
 
 ```bash
 ./field-replay vision-live ~/recordings/run-20260408-181629 \
+  --motion-gate \
   --motion-zone B3:D4
 ```
 
@@ -222,6 +237,7 @@ or ask for an interactive preview at startup:
 
 ```bash
 ./field-replay vision-live ~/recordings/run-20260408-181629 \
+  --motion-gate \
   --motion-select-zone
 ```
 
@@ -308,7 +324,7 @@ Current vision behavior is intentionally conservative:
 
 - default model: `gemma4:e2b`
 - strict JSON prompt by default, with prompt overrides for custom labels
-- model-paced live sampling
+- fixed-cadence live sampling
 - optional motion gate before model calls
 - repeat cooldown for calmer logs
 - promoted frames only, not every sampled frame
