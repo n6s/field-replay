@@ -197,12 +197,13 @@ Live follow:
 - promote only useful sightings
 - print promoted sightings to stdout without per-sample chatter
 
-By default, live vision samples every `10s` and does not let motion suppress model calls.
-This keeps the normal rolling `timeshift.ts` recording unchanged while making live
-sampling behavior easier to reason about during field work. The default terminal
-view is intentionally calm: promoted sightings and errors are visible, while
-per-sample latency, "saw nothing" messages, and motion-gate skip markers stay out
-of the operator's way.
+By default, live vision samples every `10s`, compares each sampled frame with the
+previous sampled frame, and does not let motion suppress model calls. This keeps
+the normal rolling `timeshift.ts` recording unchanged while making live sampling
+behavior easier to reason about during field work. The default terminal view is
+intentionally calm: promoted sightings and errors are visible, while per-sample
+latency, "saw nothing" messages, and motion-gate skip markers stay out of the
+operator's way.
 
 To change the cadence:
 
@@ -217,6 +218,22 @@ stream while still writing the normal evidence logs:
 ```bash
 ./field-replay vision-live ~/recordings/run-20260408-181629 --verbose
 ```
+
+For custom detection prompts, describe what to look for and let `vision-live`
+handle the comparison JSON:
+
+```bash
+./field-replay vision-live ~/recordings/run-20260408-181629 \
+  --prompt 'Find clearly visible people, pets, and cars in the main scene.'
+```
+
+With frame comparison enabled, the first sample uses the normal one-frame prompt.
+After that, each model call receives the previous sampled frame and the current
+frame, asks whether each current detection is `new`, `moved`, `unchanged`, or
+`unclear`, and suppresses detections marked `unchanged`. The normal repeat
+cooldown still applies as a fallback. Suppressed comparison decisions are
+recorded in `vision-debug.jsonl`. Use `--no-compare-frames` to go back to the
+older one-frame behavior.
 
 Motion gating is still available as an explicit opt-in diagnostic or load-shedding path:
 
@@ -269,7 +286,8 @@ For tuning motion sensitivity after a live test, use:
 
 That command can run a short tail calibration, open triggered or near-miss clips with a `2s` preroll, record `good` / `false-positive` / `missed` feedback, and suggest updated motion settings for the current vision profile.
 
-For custom prompt experiments, the vision parser now also accepts:
+For custom prompt experiments, the vision parser accepts classic one-frame
+responses:
 
 ```json
 {"detections":["person","car"]}
@@ -281,7 +299,12 @@ or
 {"labels":["person","pet","car"]}
 ```
 
-The default bib-reading prompt still works unchanged with `{"bibs":[...]}`.
+The parser still accepts older bib responses with `{"bibs":[...]}`.
+In live comparison mode, it also accepts comparison responses like:
+
+```json
+{"detections":[{"label":"person","status":"new"},{"label":"car","status":"unchanged"}]}
+```
 
 ### 6. Look up and review a bib or custom label
 
@@ -333,9 +356,10 @@ By default, the same detection is only promoted once every 60 seconds. Sampled f
 Current vision behavior is intentionally conservative:
 
 - default model: `gemma4:e2b`
-- strict JSON prompt by default, with prompt overrides for custom labels
+- detection-task prompts wrapped into strict JSON requests
 - fixed-cadence live sampling
 - calm live terminal output by default, with per-sample diagnostics behind `--verbose`
+- two-frame comparison by default for suppressing unchanged live detections
 - optional motion gate before model calls
 - repeat cooldown for calmer logs
 - promoted frames only, not every sampled frame

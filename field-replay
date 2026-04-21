@@ -43,6 +43,7 @@ DEFAULT_VISION_MODEL = "gemma4:e2b"
 DEFAULT_VISION_SAMPLE_INTERVAL = 10.0
 DEFAULT_VISION_TAIL_OFFSET = 4.0
 DEFAULT_VISION_REPEAT_COOLDOWN = 60.0
+DEFAULT_VISION_COMPARE_FRAMES = True
 DEFAULT_MOTION_GATE = False
 DEFAULT_MOTION_SIZE = "160x90"
 DEFAULT_MOTION_THRESHOLD = 8.0
@@ -143,6 +144,9 @@ class VisionFrameResult:
     promoted: list[dict]
     detections: list[str]
     elapsed_ms: int
+    suppressed: list[str]
+    status_by_detection: dict[str, str]
+    unchanged_suppressed: list[str]
     error: str | None = None
 
 
@@ -1457,6 +1461,8 @@ def vision_profile_from_args(args: argparse.Namespace) -> dict:
     }
     if hasattr(args, "sample_interval"):
         profile["sample_interval"] = args.sample_interval
+    if hasattr(args, "compare_frames"):
+        profile["compare_frames"] = args.compare_frames
     if hasattr(args, "motion_gate"):
         profile["motion_gate"] = args.motion_gate
     if hasattr(args, "motion_size"):
@@ -1487,6 +1493,11 @@ def vision_profile_summary_lines(profile_name: str, profile: dict) -> list[str]:
         f"  Cadence:  {profile.get('sample_interval') or DEFAULT_VISION_SAMPLE_INTERVAL:g}s",
         f"  Vision:   {profile.get('vision_size') or 'native resolution'}",
         (
+            "  Compare:  previous frame"
+            if profile.get("compare_frames", DEFAULT_VISION_COMPARE_FRAMES)
+            else "  Compare:  disabled"
+        ),
+        (
             "  Motion:   "
             f"{profile.get('motion_size', DEFAULT_MOTION_SIZE)} gate, "
             f"zone {motion_zone_label(profile.get('motion_zone'))}, "
@@ -1505,6 +1516,8 @@ def vision_profile_menu_label(profile_name: str, profile: dict) -> str:
         details.append(str(profile["vision_size"]))
     if profile.get("sample_interval"):
         details.append(f"{profile['sample_interval']:g}s cadence")
+    if profile.get("compare_frames", DEFAULT_VISION_COMPARE_FRAMES):
+        details.append("compare frames")
     if profile.get("motion_gate", DEFAULT_MOTION_GATE):
         details.append("motion gate")
     if profile.get("prompt"):
@@ -1522,6 +1535,8 @@ def apply_vision_profile(args: argparse.Namespace, profile: dict) -> None:
     args.prompt = profile.get("prompt", args.prompt)
     if hasattr(args, "sample_interval"):
         args.sample_interval = profile.get("sample_interval") or args.sample_interval
+    if hasattr(args, "compare_frames"):
+        args.compare_frames = profile.get("compare_frames", args.compare_frames)
     if hasattr(args, "motion_gate"):
         args.motion_gate = profile.get("motion_gate", args.motion_gate)
     if hasattr(args, "motion_size"):
@@ -1581,6 +1596,11 @@ def configure_vision_profile_interactively(
         args.sample_interval = prompt_float(
             "Sample cadence (seconds)", args.sample_interval
         )
+    if hasattr(args, "compare_frames"):
+        args.compare_frames = prompt_yes_no(
+            "Compare current frame with the previous sampled frame?",
+            args.compare_frames,
+        )
     args.vision_size = prompt_optional_text(
         "Vision frame size WIDTHxHEIGHT (leave blank for native)",
         args.vision_size,
@@ -1620,6 +1640,8 @@ def configure_vision_profile_interactively(
     print(f"  Keepalive:{args.keepalive}")
     if hasattr(args, "sample_interval"):
         print(f"  Cadence:  {args.sample_interval:g}s")
+    if hasattr(args, "compare_frames"):
+        print(f"  Compare:  {'previous frame' if args.compare_frames else 'disabled'}")
     print(f"  Vision:   {args.vision_size or 'native resolution'}")
     if getattr(args, "motion_gate", False):
         zone_summary = motion_zone_label(args.motion_zone)
@@ -1634,7 +1656,7 @@ def configure_vision_profile_interactively(
         print("  Motion:   disabled")
     print(
         "  Prompt:   "
-        f"{'custom override' if args.prompt else 'default bib prompt'}"
+        f"{'custom detection task' if args.prompt else 'default bib detection task'}"
     )
 
     if not prompt_yes_no("Save this vision setup as a reusable profile?", default=False):
@@ -3047,6 +3069,7 @@ def vision_output_paths(vision_root: Path) -> dict[str, Path]:
         "root": vision_root,
         "frames_dir": vision_root / "frames",
         "scratch_frame": vision_root / ".sample-frame.jpg",
+        "previous_scratch_frame": vision_root / ".previous-sample-frame.jpg",
         "debug_log": vision_root / "vision-debug.jsonl",
         "events_jsonl": vision_root / "events.jsonl",
         "events_log": vision_root / "events.log",
@@ -3379,6 +3402,7 @@ def write_vision_runtime_state(
     vision_profile: str | None,
     sample_interval: float | None,
     motion_gate: bool,
+    compare_frames: bool = DEFAULT_VISION_COMPARE_FRAMES,
     motion_size: str | None,
     motion_zone: str | None,
     motion_threshold: float | None = None,
@@ -3390,6 +3414,7 @@ def write_vision_runtime_state(
         "updated_at": event_wall_time(datetime.now().astimezone()),
         "vision_profile": vision_profile,
         "sample_interval": sample_interval,
+        "compare_frames": compare_frames,
         "motion_gate": motion_gate,
         "motion_size": motion_size if motion_gate else None,
         "motion_zone": motion_zone,
@@ -4379,10 +4404,34 @@ def command_motion_tune(args: argparse.Namespace) -> int:
 def default_vision_prompt() -> str:
     return (
         "Find large visible digit sequences on runner bibs, paper bib signs, or "
-        "race number cards. Return only JSON in this exact shape: "
-        '{"bibs":["573"]}. If none are clearly visible, return {"bibs":[]}. '
-        "Ignore timestamps and room signs. Do not include explanations, markdown, "
-        "or guesses."
+        "race number cards. Ignore timestamps and room signs. Do not guess."
+    )
+
+
+def single_frame_vision_prompt(base_prompt: str) -> str:
+    return (
+        "Use this detection task as the operator intent: "
+        f"{base_prompt}\n"
+        "Report only objects, labels, or bib numbers clearly visible in the current "
+        "image. Return only JSON in this exact shape: "
+        '{"detections":["573"]}. If none are clearly visible, return '
+        '{"detections":[]}. Do not include explanations, markdown, or extra keys.'
+    )
+
+
+def comparison_vision_prompt(base_prompt: str) -> str:
+    return (
+        "You will receive two images from the same camera. Image 1 is the previous "
+        "sample and image 2 is the current sample. Use this detection task as the "
+        f"operator intent: {base_prompt}\n"
+        "Ignore any return-format instructions inside the operator intent and use "
+        "the comparison JSON shape below. "
+        "Report only objects or labels that are visible in image 2. For each item, "
+        "set status to one of new, moved, unchanged, or unclear compared with image 1. "
+        "Use unchanged only when the same relevant object appears to still be in the "
+        "same place. Return only JSON in this exact shape: "
+        '{"detections":[{"label":"car","status":"unchanged"}]}. '
+        "If there are no relevant current detections, return {\"detections\":[]}."
     )
 
 
@@ -4402,20 +4451,129 @@ def extract_json_object(text: str) -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
+UNCHANGED_COMPARISON_STATUSES = {
+    "same",
+    "static",
+    "stationary",
+    "unchanged",
+    "unmoved",
+    "no-change",
+    "no_change",
+}
+
+
+def normalize_comparison_status(value: object) -> str | None:
+    if value in (None, ""):
+        return None
+    status = normalize_detection_text(str(value)).replace(" ", "-")
+    status_aliases = {
+        "changed": "moved",
+        "movement": "moved",
+        "moving": "moved",
+        "new-arrival": "new",
+        "newly-visible": "new",
+        "same-position": "unchanged",
+        "still-present": "unchanged",
+        "not-moved": "unchanged",
+        "not_moved": "unchanged",
+    }
+    return status_aliases.get(status, status)
+
+
+def add_detection_with_status(
+    detections: list[str],
+    status_by_detection: dict[str, str],
+    raw_label: object,
+    raw_status: object = None,
+) -> None:
+    detection = normalize_detection_text(str(raw_label))
+    if not detection:
+        return
+    if detection not in detections:
+        detections.append(detection)
+    status = normalize_comparison_status(raw_status)
+    if status:
+        status_by_detection[detection] = status
+
+
+def extract_detection_label_from_mapping(item: dict) -> object | None:
+    for key in ("label", "l", "detection", "name", "type", "object", "bib", "b"):
+        value = item.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def extract_detection_status_from_mapping(item: dict) -> object | None:
+    for key in ("status", "state", "change", "movement", "motion"):
+        value = item.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
 def normalize_vision_detections(payload: dict) -> list[str]:
+    detections, _ = normalize_vision_detection_statuses(payload)
+    return detections
+
+
+def normalize_vision_detection_statuses(payload: dict) -> tuple[list[str], dict[str, str]]:
     raw_detections = payload.get("detections")
     if not isinstance(raw_detections, list):
         raw_detections = payload.get("labels")
     if not isinstance(raw_detections, list):
         raw_detections = payload.get("bibs")
     if not isinstance(raw_detections, list):
-        return []
+        raw_detections = []
     detections: list[str] = []
+    status_by_detection: dict[str, str] = {}
     for raw_value in raw_detections:
-        normalized = normalize_detection_text(str(raw_value))
-        if normalized and normalized not in detections:
-            detections.append(normalized)
-    return detections
+        if isinstance(raw_value, dict):
+            raw_label = extract_detection_label_from_mapping(raw_value)
+            if raw_label is None:
+                continue
+            status = extract_detection_status_from_mapping(raw_value)
+            normalized_status = normalize_comparison_status(status)
+            if normalized_status in {"gone", "absent", "left", "removed"}:
+                continue
+            add_detection_with_status(
+                detections,
+                status_by_detection,
+                raw_label,
+                status,
+            )
+        else:
+            add_detection_with_status(detections, status_by_detection, raw_value)
+
+    status_lists = (
+        ("unchanged", "unchanged"),
+        ("same_static_objects", "unchanged"),
+        ("stationary", "unchanged"),
+        ("new", "new"),
+        ("new_detections", "new"),
+        ("moved", "moved"),
+        ("changed", "moved"),
+        ("unclear", "unclear"),
+    )
+    for key, status in status_lists:
+        values = payload.get(key)
+        if not isinstance(values, list):
+            continue
+        for raw_value in values:
+            if isinstance(raw_value, dict):
+                raw_label = extract_detection_label_from_mapping(raw_value)
+                raw_status = extract_detection_status_from_mapping(raw_value) or status
+            else:
+                raw_label = raw_value
+                raw_status = status
+            if raw_label is not None:
+                add_detection_with_status(
+                    detections,
+                    status_by_detection,
+                    raw_label,
+                    raw_status,
+                )
+    return detections, status_by_detection
 
 
 def promoted_frame_path(
@@ -4478,18 +4636,21 @@ def annotate_promoted_frame(
 
 def ask_ollama_for_detections(
     *,
-    image_path: Path,
+    image_paths: Sequence[Path],
     model: str,
     ollama_host: str,
     prompt: str,
     timeout_seconds: float,
     keepalive: str,
-) -> tuple[list[str], str]:
-    image_b64 = base64.b64encode(image_path.read_bytes()).decode("ascii")
+) -> tuple[list[str], str, dict[str, str]]:
+    encoded_images = [
+        base64.b64encode(image_path.read_bytes()).decode("ascii")
+        for image_path in image_paths
+    ]
     request_payload = {
         "model": model,
         "prompt": prompt,
-        "images": [image_b64],
+        "images": encoded_images,
         "stream": False,
         "format": "json",
         "keep_alive": keepalive,
@@ -4517,8 +4678,10 @@ def ask_ollama_for_detections(
         raise RuntimeError(f"ollama returned invalid JSON: {exc}") from exc
 
     response_text = str(response_payload.get("response") or "")
-    detections = normalize_vision_detections(extract_json_object(response_text))
-    return detections, response_text
+    detections, status_by_detection = normalize_vision_detection_statuses(
+        extract_json_object(response_text)
+    )
+    return detections, response_text, status_by_detection
 
 
 def event_detection_label(event: dict) -> str | None:
@@ -4704,6 +4867,7 @@ def process_vision_frame(
     runtime_paths: dict[str, Path],
     session_dir: Path,
     frame_path: Path,
+    comparison_frame_path: Path | None = None,
     ffmpeg_bin: str,
     annotate_frames: bool,
     offset_seconds: float,
@@ -4718,9 +4882,17 @@ def process_vision_frame(
     now = datetime.now().astimezone()
     started_at = time.perf_counter()
     frame_reference = relative_to_session(frame_path, session_dir)
+    image_paths = [frame_path]
+    if comparison_frame_path is not None:
+        image_paths = [comparison_frame_path, frame_path]
+    comparison_frame_reference = (
+        relative_to_session(comparison_frame_path, session_dir)
+        if comparison_frame_path is not None
+        else None
+    )
     try:
-        detections, response_text = ask_ollama_for_detections(
-            image_path=frame_path,
+        detections, response_text, status_by_detection = ask_ollama_for_detections(
+            image_paths=image_paths,
             model=model,
             ollama_host=ollama_host,
             prompt=prompt,
@@ -4730,8 +4902,17 @@ def process_vision_frame(
         elapsed_ms = int(round((time.perf_counter() - started_at) * 1000))
         promoted: list[dict] = []
         suppressed: list[str] = []
+        unchanged_suppressed: list[str] = []
         promoted_frame_reference: str | None = None
         for detection in detections:
+            comparison_status = status_by_detection.get(detection)
+            if (
+                comparison_frame_path is not None
+                and comparison_status in UNCHANGED_COMPARISON_STATUSES
+            ):
+                suppressed.append(detection)
+                unchanged_suppressed.append(detection)
+                continue
             last_promoted_offset = last_promoted_by_detection.get(detection)
             if (
                 repeat_cooldown_seconds > 0
@@ -4778,12 +4959,22 @@ def process_vision_frame(
                 "t": round(offset_seconds, 1),
                 "model": model,
                 "frame": frame_reference,
+                "frames": [
+                    relative_to_session(image_path, session_dir)
+                    for image_path in image_paths
+                ],
                 "elapsed_ms": elapsed_ms,
                 "response": response_text,
                 "detections": detections,
                 "bibs": [item for item in detections if is_bib_detection_label(item)],
                 "promoted": [event_detection_label(payload) for payload in promoted],
                 "suppressed": suppressed,
+                "status_by_detection": status_by_detection,
+                "comparison": {
+                    "enabled": comparison_frame_path is not None,
+                    "previous_frame": comparison_frame_reference,
+                    "unchanged_suppressed": unchanged_suppressed,
+                },
                 "repeat_cooldown_s": repeat_cooldown_seconds,
             },
         )
@@ -4791,6 +4982,9 @@ def process_vision_frame(
             promoted=promoted,
             detections=detections,
             elapsed_ms=elapsed_ms,
+            suppressed=suppressed,
+            status_by_detection=status_by_detection,
+            unchanged_suppressed=unchanged_suppressed,
             error=None,
         )
     except RuntimeError as exc:
@@ -4801,14 +4995,25 @@ def process_vision_frame(
                 "w": event_wall_time(now),
                 "t": round(offset_seconds, 1),
                 "frame": frame_reference,
+                "frames": [
+                    relative_to_session(image_path, session_dir)
+                    for image_path in image_paths
+                ],
                 "elapsed_ms": elapsed_ms,
                 "error": str(exc),
+                "comparison": {
+                    "enabled": comparison_frame_path is not None,
+                    "previous_frame": comparison_frame_reference,
+                },
             },
         )
         return VisionFrameResult(
             promoted=[],
             detections=[],
             elapsed_ms=elapsed_ms,
+            suppressed=[],
+            status_by_detection={},
+            unchanged_suppressed=[],
             error=str(exc),
         )
 
@@ -5020,7 +5225,13 @@ def run_offline_vision_scan(
     runtime_paths = vision_output_paths(output_root)
     for key in ("root", "frames_dir"):
         ensure_directory(runtime_paths[key])
-    for key in ("events_jsonl", "events_log", "debug_log", "scratch_frame"):
+    for key in (
+        "events_jsonl",
+        "events_log",
+        "debug_log",
+        "scratch_frame",
+        "previous_scratch_frame",
+    ):
         try:
             runtime_paths[key].unlink()
         except FileNotFoundError:
@@ -5165,7 +5376,7 @@ def command_vision_scan(args: argparse.Namespace) -> int:
     sample_points = media_sample_points(duration_seconds, args.sample_interval)
     if args.max_samples is not None:
         sample_points = sample_points[: max(args.max_samples, 0)]
-    prompt = args.prompt or default_vision_prompt()
+    prompt = single_frame_vision_prompt(args.prompt or default_vision_prompt())
     try:
         frame_filter = (
             resolve_vision_variant(args.scale_to).frame_filter
@@ -5253,7 +5464,7 @@ def command_vision_sweep(args: argparse.Namespace) -> int:
     sample_points = media_sample_points(duration_seconds, args.sample_interval)
     if args.max_samples is not None:
         sample_points = sample_points[: max(args.max_samples, 0)]
-    prompt = args.prompt or default_vision_prompt()
+    prompt = single_frame_vision_prompt(args.prompt or default_vision_prompt())
 
     print(f"Vision sweep source: {source.source_path}")
     print(f"Vision sweep dir:    {output_root}")
@@ -5412,11 +5623,15 @@ def command_vision_live(args: argparse.Namespace) -> int:
         runtime_paths["scratch_frame"].unlink()
     except FileNotFoundError:
         pass
+    try:
+        runtime_paths["previous_scratch_frame"].unlink()
+    except FileNotFoundError:
+        pass
 
     config["last_session_dir"] = str(session_dir)
     save_config(config_path, config)
 
-    prompt = args.prompt or default_vision_prompt()
+    base_prompt = args.prompt or default_vision_prompt()
     try:
         frame_filter = frame_filter_for_vision_size(args.vision_size)
     except ValueError as exc:
@@ -5486,6 +5701,7 @@ def command_vision_live(args: argparse.Namespace) -> int:
         vision_profile=active_vision_profile_name,
         sample_interval=args.sample_interval,
         motion_gate=args.motion_gate,
+        compare_frames=args.compare_frames,
         motion_size=args.motion_size,
         motion_zone=args.motion_zone,
         motion_threshold=args.motion_threshold,
@@ -5518,6 +5734,7 @@ def command_vision_live(args: argparse.Namespace) -> int:
     print(f"Model:       {args.model}")
     print(f"Cadence:     {args.sample_interval:g}s, {args.tail_offset:g}s behind live")
     print(f"Cooldown:    {args.repeat_cooldown:.0f}s")
+    print(f"Compare:     {'previous frame' if args.compare_frames else 'disabled'}")
     if args.motion_gate:
         print(
             "Motion:      "
@@ -5597,6 +5814,7 @@ def command_vision_live(args: argparse.Namespace) -> int:
                             vision_profile=active_vision_profile_name,
                             sample_interval=args.sample_interval,
                             motion_gate=args.motion_gate,
+                            compare_frames=args.compare_frames,
                             motion_size=args.motion_size,
                             motion_zone=args.motion_zone,
                             motion_threshold=args.motion_threshold,
@@ -5705,10 +5923,21 @@ def command_vision_live(args: argparse.Namespace) -> int:
                     f"({motion_summary_text(motion_result)})...",
                     flush=True,
                 )
+            comparison_frame_path = (
+                runtime_paths["previous_scratch_frame"]
+                if args.compare_frames and runtime_paths["previous_scratch_frame"].exists()
+                else None
+            )
+            prompt = (
+                comparison_vision_prompt(base_prompt)
+                if comparison_frame_path is not None
+                else single_frame_vision_prompt(base_prompt)
+            )
             result = process_vision_frame(
                 runtime_paths=runtime_paths,
                 session_dir=session_dir,
                 frame_path=runtime_paths["scratch_frame"],
+                comparison_frame_path=comparison_frame_path,
                 ffmpeg_bin=ffmpeg_path,
                 annotate_frames=annotate_frames,
                 offset_seconds=offset_seconds,
@@ -5720,6 +5949,11 @@ def command_vision_live(args: argparse.Namespace) -> int:
                 repeat_cooldown_seconds=args.repeat_cooldown,
                 last_promoted_by_detection=last_promoted_by_detection,
             )
+            if args.compare_frames:
+                shutil.copy2(
+                    runtime_paths["scratch_frame"],
+                    runtime_paths["previous_scratch_frame"],
+                )
             if args.motion_gate:
                 append_jsonl(
                     runtime_paths["debug_log"],
@@ -5774,8 +6008,13 @@ def command_vision_live(args: argparse.Namespace) -> int:
             elif args.verbose:
                 flush_skip_markers()
                 detected = ", ".join(result.detections) if result.detections else "nothing"
+                suppressed = (
+                    f"; suppressed unchanged {', '.join(result.unchanged_suppressed)}"
+                    if result.unchanged_suppressed
+                    else ""
+                )
                 print(
-                    f"[vision-live] {format_duration(offset_seconds)} saw {detected} in {result.elapsed_ms} ms",
+                    f"[vision-live] {format_duration(offset_seconds)} saw {detected}{suppressed} in {result.elapsed_ms} ms",
                     flush=True,
                 )
             for payload in result.promoted:
@@ -7070,7 +7309,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     vision_scan.add_argument(
         "--prompt",
-        help="Override the default JSON vision prompt.",
+        help="Override the default detection task prompt.",
     )
     vision_scan.add_argument(
         "--output-dir",
@@ -7149,7 +7388,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     vision_sweep.add_argument(
         "--prompt",
-        help="Override the default JSON vision prompt.",
+        help="Override the default detection task prompt.",
     )
     vision_sweep.add_argument(
         "--output-dir",
@@ -7232,6 +7471,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional WIDTHxHEIGHT to downscale frames before sending them to the vision model.",
     )
     vision_live.add_argument(
+        "--compare-frames",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_VISION_COMPARE_FRAMES,
+        help="Send the previous sampled frame with the current frame and suppress unchanged detections.",
+    )
+    vision_live.add_argument(
         "--motion-gate",
         action=argparse.BooleanOptionalAction,
         default=DEFAULT_MOTION_GATE,
@@ -7294,7 +7539,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     vision_live.add_argument(
         "--prompt",
-        help="Override the default JSON vision prompt.",
+        help="Override the default detection task prompt.",
     )
     vision_live.add_argument(
         "--once",
