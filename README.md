@@ -205,6 +205,10 @@ intentionally calm: promoted sightings and errors are visible, while per-sample
 latency, "saw nothing" messages, and motion-gate skip markers stay out of the
 operator's way.
 
+If you pick an existing saved vision profile interactively, `vision-live` now
+asks whether you want to edit that profile before it starts. That edit flow is
+where `Sample cadence` is set for the saved profile.
+
 To change the cadence:
 
 ```bash

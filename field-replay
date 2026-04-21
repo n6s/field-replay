@@ -1664,6 +1664,27 @@ def configure_vision_profile_interactively(
     return ensure_profile_name(config)
 
 
+def edit_existing_vision_profile_interactively(
+    args: argparse.Namespace,
+    config: dict,
+    profile_name: str,
+) -> None:
+    print()
+    print(f"Editing vision profile '{profile_name}'")
+    configure_vision_profile_interactively(args, config)
+    if prompt_yes_no(
+        f"Update saved vision profile '{profile_name}' with these settings?",
+        default=True,
+    ):
+        vision_profiles = config.get("vision_profiles", {})
+        vision_profiles[profile_name] = vision_profile_from_args(args)
+        config["vision_profiles"] = vision_profiles
+        config["last_vision_profile"] = profile_name
+        save_config(args.config_file.expanduser(), config)
+        print(f"Updated vision profile: {profile_name}")
+        print()
+
+
 def profile_from_args(args: argparse.Namespace) -> dict:
     return {
         "source_type": args.source_type,
@@ -5306,6 +5327,13 @@ def command_vision_scan(args: argparse.Namespace) -> int:
         )
         if selected_vision_profile and selected_vision_profile != "__manual__":
             apply_vision_profile(args, vision_profiles[selected_vision_profile])
+            if prompt_yes_no(
+                f"Edit saved vision profile '{selected_vision_profile}' before scanning?",
+                default=False,
+            ):
+                edit_existing_vision_profile_interactively(
+                    args, config, selected_vision_profile
+                )
             config["last_vision_profile"] = selected_vision_profile
             for line in vision_profile_summary_lines(
                 selected_vision_profile, vision_profiles[selected_vision_profile]
@@ -5557,6 +5585,13 @@ def command_vision_live(args: argparse.Namespace) -> int:
         )
         if selected_vision_profile and selected_vision_profile != "__manual__":
             apply_vision_profile(args, vision_profiles[selected_vision_profile])
+            if prompt_yes_no(
+                f"Edit saved vision profile '{selected_vision_profile}' before starting?",
+                default=False,
+            ):
+                edit_existing_vision_profile_interactively(
+                    args, config, selected_vision_profile
+                )
             config["last_vision_profile"] = selected_vision_profile
             active_vision_profile_name = selected_vision_profile
             for line in vision_profile_summary_lines(
