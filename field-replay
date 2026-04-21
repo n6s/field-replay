@@ -4475,7 +4475,9 @@ def single_frame_vision_prompt(base_prompt: str) -> str:
         "bib when none is visible. If the operator intent is general scene "
         "monitoring, return a descriptive label for each visible instance and use "
         "stable details such as color, type, and coarse position so distinct cars, "
-        "people, and pets do not collapse into one label."
+        "people, and pets do not collapse into one label. Prefer a descriptive "
+        "label such as 'white pickup right' or 'person red shirt left' over a "
+        "bare class label like 'car' unless no better detail is visible."
     )
     return (
         "Use this detection task as the operator intent: "
@@ -4500,7 +4502,9 @@ def comparison_vision_prompt(base_prompt: str) -> str:
         "monitoring, give each distinct car, person, pet, or other object a "
         "descriptive label that includes stable details such as color, type, and "
         "coarse position so a parked background vehicle does not mask a different "
-        "passing one."
+        "passing one. Prefer a descriptive label such as 'white pickup right' or "
+        "'person red shirt left' over a bare class label like 'car' unless no "
+        "better detail is visible."
     )
     return (
         "You will receive two images from the same camera. Image 1 is the previous "
