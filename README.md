@@ -176,6 +176,10 @@ Offline scan:
 ./field-replay vision-scan ~/recordings/run-20260408-181629 --max-samples 3
 ```
 
+`vision-scan` uses the same compare-frame path as `vision-live`, so it can keep a
+permanent background object from masking a newer arrival with the same class
+label. Use `--no-compare-frames` if you want the older one-frame behavior.
+
 Offline resolution sweep:
 
 ```bash
@@ -224,7 +228,9 @@ stream while still writing the normal evidence logs:
 ```
 
 For custom detection prompts, describe what to look for and let `vision-live`
-handle the comparison JSON:
+handle the comparison JSON. For general scene monitoring, ask for descriptive
+labels like `white pickup right` or `person in red shirt` so a parked object
+does not mask a different arrival:
 
 ```bash
 ./field-replay vision-live ~/recordings/run-20260408-181629 \
@@ -234,8 +240,10 @@ handle the comparison JSON:
 With frame comparison enabled, the first sample uses the normal one-frame prompt.
 After that, each model call receives the previous sampled frame and the current
 frame, asks whether each current detection is `new`, `moved`, `unchanged`, or
-`unclear`, and suppresses detections marked `unchanged`. The normal repeat
-cooldown still applies as a fallback. Suppressed comparison decisions are
+`unclear`, and suppresses detections marked `unchanged` after the first sighting.
+For generic object monitoring, the prompt should use descriptive labels so a
+static background vehicle does not monopolize a plain `car` bucket. The normal
+repeat cooldown still applies as a fallback. Suppressed comparison decisions are
 recorded in `vision-debug.jsonl`. Use `--no-compare-frames` to go back to the
 older one-frame behavior.
 
@@ -353,7 +361,7 @@ When motion gating is enabled, `vision-debug.jsonl` also records the per-sample 
 
 Promoted frames are annotated with the detected labels along the bottom beside the timestamp strip so they are easier to review in `eog`.
 
-By default, the same detection is only promoted once every 60 seconds. Sampled frames still go through the model and appear in diagnostics, but only promoted sightings are kept in `frames/` and surfaced in the operator-facing event log.
+By default, the same bib or generic detection bucket is only promoted once every 60 seconds. In compare mode, generic object labels also use their comparison status so a persistent background object does not block a different `new` or `moved` sighting with the same class label. Sampled frames still go through the model and appear in diagnostics, but only promoted sightings are kept in `frames/` and surfaced in the operator-facing event log.
 
 ## Vision Notes
 
@@ -363,7 +371,7 @@ Current vision behavior is intentionally conservative:
 - detection-task prompts wrapped into strict JSON requests
 - fixed-cadence live sampling
 - calm live terminal output by default, with per-sample diagnostics behind `--verbose`
-- two-frame comparison by default for suppressing unchanged live detections
+- two-frame comparison by default for bibs and generic scene monitoring, with repeat unchanged detections suppressed after the first sighting
 - optional motion gate before model calls
 - repeat cooldown for calmer logs
 - promoted frames only, not every sampled frame

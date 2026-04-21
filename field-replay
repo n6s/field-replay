@@ -3162,6 +3162,22 @@ def is_bib_detection_label(value: str) -> bool:
     return normalize_bib_text(value) == value
 
 
+def detection_promotion_key(
+    detection: str,
+    comparison_status: str | None = None,
+    *,
+    compare_mode: bool = False,
+) -> str:
+    normalized_detection = normalize_detection_text(detection)
+    if not normalized_detection:
+        return detection
+    if is_bib_detection_label(normalized_detection):
+        return normalized_detection
+    if compare_mode and comparison_status:
+        return f"{normalized_detection}@@{comparison_status}"
+    return normalized_detection
+
+
 def motion_zone_label(zone_spec: str | None) -> str:
     return zone_spec or "full frame"
 
@@ -4429,30 +4445,69 @@ def default_vision_prompt() -> str:
     )
 
 
+def prompt_seems_bib_focused(base_prompt: str) -> bool:
+    prompt = base_prompt.lower()
+    bib_markers = (
+        "bib",
+        "runner bib",
+        "race number",
+        "race numbers",
+        "number card",
+        "number cards",
+        "bib number",
+        "bib numbers",
+        "pacer",
+    )
+    return any(marker in prompt for marker in bib_markers)
+
+
 def single_frame_vision_prompt(base_prompt: str) -> str:
+    bib_focused = prompt_seems_bib_focused(base_prompt)
+    if bib_focused:
+        example = '{"detections":["573"]}'
+    else:
+        example = '{"detections":["white pickup right"]}'
+    guidance = (
+        "If the operator intent is bib tracking, return exact bib numbers and "
+        "ignore unrelated background text. If the operator intent is general "
+        "scene monitoring, return a descriptive label for each visible instance "
+        "and use stable details such as color, type, and coarse position so "
+        "distinct cars, people, and pets do not collapse into one label."
+    )
     return (
         "Use this detection task as the operator intent: "
         f"{base_prompt}\n"
-        "Report only objects, labels, or bib numbers clearly visible in the current "
-        "image. Return only JSON in this exact shape: "
-        '{"detections":["573"]}. If none are clearly visible, return '
-        '{"detections":[]}. Do not include explanations, markdown, or extra keys.'
+        f"{guidance} Return only JSON in this exact shape: {example}. "
+        'If none are clearly visible, return {"detections":[]}. '
+        "Do not include explanations, markdown, or extra keys."
     )
 
 
 def comparison_vision_prompt(base_prompt: str) -> str:
+    bib_focused = prompt_seems_bib_focused(base_prompt)
+    if bib_focused:
+        example = '{"detections":[{"label":"573","status":"unchanged"}]}'
+    else:
+        example = '{"detections":[{"label":"white pickup right","status":"unchanged"}]}'
+    guidance = (
+        "If the operator intent is bib tracking, return exact bib numbers for "
+        "clearly visible bibs and ignore unrelated background objects. If the "
+        "operator intent is general scene monitoring, give each distinct car, "
+        "person, pet, or other object a descriptive label that includes stable "
+        "details such as color, type, and coarse position so a parked background "
+        "vehicle does not mask a different passing one."
+    )
     return (
         "You will receive two images from the same camera. Image 1 is the previous "
         "sample and image 2 is the current sample. Use this detection task as the "
         f"operator intent: {base_prompt}\n"
         "Ignore any return-format instructions inside the operator intent and use "
-        "the comparison JSON shape below. "
+        f"the comparison JSON shape below. {guidance} "
         "Report only objects or labels that are visible in image 2. For each item, "
         "set status to one of new, moved, unchanged, or unclear compared with image 1. "
         "Use unchanged only when the same relevant object appears to still be in the "
-        "same place. Return only JSON in this exact shape: "
-        '{"detections":[{"label":"car","status":"unchanged"}]}. '
-        "If there are no relevant current detections, return {\"detections\":[]}."
+        f"same place. Return only JSON in this exact shape: {example}. "
+        'If there are no relevant current detections, return {"detections":[]}.'
     )
 
 
@@ -4898,7 +4953,7 @@ def process_vision_frame(
     timeout_seconds: float,
     keepalive: str,
     repeat_cooldown_seconds: float,
-    last_promoted_by_detection: dict[str, float],
+    last_promoted_by_key: dict[str, float],
 ) -> VisionFrameResult:
     now = datetime.now().astimezone()
     started_at = time.perf_counter()
@@ -4927,14 +4982,20 @@ def process_vision_frame(
         promoted_frame_reference: str | None = None
         for detection in detections:
             comparison_status = status_by_detection.get(detection)
+            promotion_key = detection_promotion_key(
+                detection,
+                comparison_status,
+                compare_mode=comparison_frame_path is not None,
+            )
+            last_promoted_offset = last_promoted_by_key.get(promotion_key)
             if (
                 comparison_frame_path is not None
                 and comparison_status in UNCHANGED_COMPARISON_STATUSES
+                and last_promoted_offset is not None
             ):
                 suppressed.append(detection)
                 unchanged_suppressed.append(detection)
                 continue
-            last_promoted_offset = last_promoted_by_detection.get(detection)
             if (
                 repeat_cooldown_seconds > 0
                 and last_promoted_offset is not None
@@ -4972,7 +5033,7 @@ def process_vision_frame(
             append_jsonl(runtime_paths["events_jsonl"], payload)
             append_text_line(runtime_paths["events_log"], vision_event_log_line(payload))
             promoted.append(payload)
-            last_promoted_by_detection[detection] = offset_seconds
+            last_promoted_by_key[promotion_key] = offset_seconds
         append_jsonl(
             runtime_paths["debug_log"],
             {
@@ -5237,6 +5298,7 @@ def run_offline_vision_scan(
     timeout_seconds: float,
     keepalive: str,
     repeat_cooldown_seconds: float,
+    compare_frames: bool = False,
     output_root: Path,
     sample_points: Sequence[float],
     annotate_frames: bool,
@@ -5263,6 +5325,7 @@ def run_offline_vision_scan(
     print(f"Vision model:       {model}")
     print(f"Samples:            {len(sample_points)}")
     print(f"Repeat cooldown:    {repeat_cooldown_seconds:.0f}s")
+    print(f"Compare:            {'previous frame' if compare_frames else 'disabled'}")
     if frame_filter:
         print(f"Frame filter:       {frame_filter}")
     if dry_run:
@@ -5270,7 +5333,8 @@ def run_offline_vision_scan(
             print(f"  sample {format_duration(offset_seconds)}")
         return 0
 
-    last_promoted_by_bib: dict[str, float] = {}
+    last_promoted_by_key: dict[str, float] = {}
+    previous_sample_frame = runtime_paths["previous_scratch_frame"]
     for offset_seconds in sample_points:
         try:
             extract_frame_at_time(
@@ -5289,12 +5353,18 @@ def run_offline_vision_scan(
                 offset_seconds=offset_seconds,
                 model=model,
                 ollama_host=ollama_host,
-                prompt=prompt,
+                prompt=(
+                    comparison_vision_prompt(prompt)
+                    if compare_frames and previous_sample_frame.exists()
+                    else single_frame_vision_prompt(prompt)
+                ),
                 timeout_seconds=timeout_seconds,
                 keepalive=keepalive,
                 repeat_cooldown_seconds=repeat_cooldown_seconds,
-                last_promoted_by_detection=last_promoted_by_bib,
+                last_promoted_by_key=last_promoted_by_key,
             )
+            if compare_frames:
+                shutil.copy2(runtime_paths["scratch_frame"], previous_sample_frame)
         except RuntimeError as exc:
             append_jsonl(
                 runtime_paths["debug_log"],
@@ -5404,7 +5474,7 @@ def command_vision_scan(args: argparse.Namespace) -> int:
     sample_points = media_sample_points(duration_seconds, args.sample_interval)
     if args.max_samples is not None:
         sample_points = sample_points[: max(args.max_samples, 0)]
-    prompt = single_frame_vision_prompt(args.prompt or default_vision_prompt())
+    prompt = args.prompt or default_vision_prompt()
     try:
         frame_filter = (
             resolve_vision_variant(args.scale_to).frame_filter
@@ -5429,6 +5499,7 @@ def command_vision_scan(args: argparse.Namespace) -> int:
         timeout_seconds=args.timeout,
         keepalive=args.keepalive,
         repeat_cooldown_seconds=args.repeat_cooldown,
+        compare_frames=args.compare_frames,
         output_root=output_root,
         sample_points=sample_points,
         annotate_frames=annotate_frames,
@@ -5492,7 +5563,7 @@ def command_vision_sweep(args: argparse.Namespace) -> int:
     sample_points = media_sample_points(duration_seconds, args.sample_interval)
     if args.max_samples is not None:
         sample_points = sample_points[: max(args.max_samples, 0)]
-    prompt = single_frame_vision_prompt(args.prompt or default_vision_prompt())
+    prompt = args.prompt or default_vision_prompt()
 
     print(f"Vision sweep source: {source.source_path}")
     print(f"Vision sweep dir:    {output_root}")
@@ -5521,6 +5592,7 @@ def command_vision_sweep(args: argparse.Namespace) -> int:
             timeout_seconds=args.timeout,
             keepalive=args.keepalive,
             repeat_cooldown_seconds=args.repeat_cooldown,
+            compare_frames=False,
             output_root=variant_output_root,
             sample_points=sample_points,
             annotate_frames=annotate_frames,
@@ -5747,7 +5819,7 @@ def command_vision_live(args: argparse.Namespace) -> int:
     timeshift_path = session_dir / DEFAULT_TIMESHIFT_NAME
     processed_offsets: set[float] = set()
     sample_count = 0
-    last_promoted_by_detection: dict[str, float] = {}
+    last_promoted_by_key: dict[str, float] = {}
     previous_motion_frame: bytes | None = None
     consecutive_motion_hits = 0
     gate_open_until: float | None = None
@@ -5982,7 +6054,7 @@ def command_vision_live(args: argparse.Namespace) -> int:
                 timeout_seconds=args.timeout,
                 keepalive=args.keepalive,
                 repeat_cooldown_seconds=args.repeat_cooldown,
-                last_promoted_by_detection=last_promoted_by_detection,
+                last_promoted_by_key=last_promoted_by_key,
             )
             if args.compare_frames:
                 shutil.copy2(
@@ -7331,7 +7403,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--repeat-cooldown",
         type=float,
         default=DEFAULT_VISION_REPEAT_COOLDOWN,
-        help="Minimum seconds before the same bib is promoted again.",
+        help="Minimum seconds before the same bib or object bucket is promoted again.",
+    )
+    vision_scan.add_argument(
+        "--compare-frames",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_VISION_COMPARE_FRAMES,
+        help="Send the previous sampled frame with the current frame and suppress unchanged detections.",
     )
     vision_scan.add_argument(
         "--vision-size",
@@ -7414,7 +7492,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--repeat-cooldown",
         type=float,
         default=DEFAULT_VISION_REPEAT_COOLDOWN,
-        help="Minimum seconds before the same detection is promoted again within one variant.",
+        help="Minimum seconds before the same detection bucket is promoted again within one variant.",
     )
     vision_sweep.add_argument(
         "--keepalive",
@@ -7499,7 +7577,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--repeat-cooldown",
         type=float,
         default=DEFAULT_VISION_REPEAT_COOLDOWN,
-        help="Minimum seconds before the same detection is promoted again.",
+        help="Minimum seconds before the same bib or object bucket is promoted again.",
     )
     vision_live.add_argument(
         "--vision-size",
