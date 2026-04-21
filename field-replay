@@ -4440,8 +4440,9 @@ def command_motion_tune(args: argparse.Namespace) -> int:
 
 def default_vision_prompt() -> str:
     return (
-        "Find large visible digit sequences on runner bibs, paper bib signs, or "
-        "race number cards. Ignore timestamps and room signs. Do not guess."
+        "Find only clearly visible digit sequences on runner bibs, paper bib signs, "
+        "or race number cards. Ignore timestamps and room signs. Do not guess or "
+        "invent a number if the digits are partial, ambiguous, or missing."
     )
 
 
@@ -4464,15 +4465,17 @@ def prompt_seems_bib_focused(base_prompt: str) -> bool:
 def single_frame_vision_prompt(base_prompt: str) -> str:
     bib_focused = prompt_seems_bib_focused(base_prompt)
     if bib_focused:
-        example = '{"detections":["573"]}'
+        example = '{"detections":["<bib-number>"]}'
     else:
         example = '{"detections":["white pickup right"]}'
     guidance = (
-        "If the operator intent is bib tracking, return exact bib numbers and "
-        "ignore unrelated background text. If the operator intent is general "
-        "scene monitoring, return a descriptive label for each visible instance "
-        "and use stable details such as color, type, and coarse position so "
-        "distinct cars, people, and pets do not collapse into one label."
+        "If the operator intent is bib tracking, return only exact bib numbers "
+        "that are clearly visible on a person or race number card, and ignore "
+        "unrelated background text. Do not copy the example number or invent a "
+        "bib when none is visible. If the operator intent is general scene "
+        "monitoring, return a descriptive label for each visible instance and use "
+        "stable details such as color, type, and coarse position so distinct cars, "
+        "people, and pets do not collapse into one label."
     )
     return (
         "Use this detection task as the operator intent: "
@@ -4486,16 +4489,18 @@ def single_frame_vision_prompt(base_prompt: str) -> str:
 def comparison_vision_prompt(base_prompt: str) -> str:
     bib_focused = prompt_seems_bib_focused(base_prompt)
     if bib_focused:
-        example = '{"detections":[{"label":"573","status":"unchanged"}]}'
+        example = '{"detections":[{"label":"<bib-number>","status":"unchanged"}]}'
     else:
         example = '{"detections":[{"label":"white pickup right","status":"unchanged"}]}'
     guidance = (
-        "If the operator intent is bib tracking, return exact bib numbers for "
-        "clearly visible bibs and ignore unrelated background objects. If the "
-        "operator intent is general scene monitoring, give each distinct car, "
-        "person, pet, or other object a descriptive label that includes stable "
-        "details such as color, type, and coarse position so a parked background "
-        "vehicle does not mask a different passing one."
+        "If the operator intent is bib tracking, return only exact bib numbers "
+        "that are clearly visible on a person or race number card, and ignore "
+        "unrelated background objects. Do not copy the example number or invent a "
+        "bib when none is visible. If the operator intent is general scene "
+        "monitoring, give each distinct car, person, pet, or other object a "
+        "descriptive label that includes stable details such as color, type, and "
+        "coarse position so a parked background vehicle does not mask a different "
+        "passing one."
     )
     return (
         "You will receive two images from the same camera. Image 1 is the previous "

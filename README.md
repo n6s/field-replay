@@ -372,6 +372,7 @@ Current vision behavior is intentionally conservative:
 - fixed-cadence live sampling
 - calm live terminal output by default, with per-sample diagnostics behind `--verbose`
 - two-frame comparison by default for bibs and generic scene monitoring, with repeat unchanged detections suppressed after the first sighting
+- bib-focused prompts use neutral placeholder examples instead of a concrete sample number, which reduces hallucinated reads when no bib is visible
 - optional motion gate before model calls
 - repeat cooldown for calmer logs
 - promoted frames only, not every sampled frame
