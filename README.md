@@ -195,17 +195,27 @@ Live follow:
 - grab a frame a few seconds behind live at each cadence point
 - ask the local model for bib guesses or custom detections
 - promote only useful sightings
-- print promoted sightings to stdout
+- print promoted sightings to stdout without per-sample chatter
 
 By default, live vision samples every `10s` and does not let motion suppress model calls.
 This keeps the normal rolling `timeshift.ts` recording unchanged while making live
-sampling behavior easier to reason about during field work.
+sampling behavior easier to reason about during field work. The default terminal
+view is intentionally calm: promoted sightings and errors are visible, while
+per-sample latency, "saw nothing" messages, and motion-gate skip markers stay out
+of the operator's way.
 
 To change the cadence:
 
 ```bash
 ./field-replay vision-live ~/recordings/run-20260408-181629 \
   --sample-interval 5
+```
+
+For tuning or debugging, add `--verbose` to print the per-sample diagnostic
+stream while still writing the normal evidence logs:
+
+```bash
+./field-replay vision-live ~/recordings/run-20260408-181629 --verbose
 ```
 
 Motion gating is still available as an explicit opt-in diagnostic or load-shedding path:
@@ -325,6 +335,7 @@ Current vision behavior is intentionally conservative:
 - default model: `gemma4:e2b`
 - strict JSON prompt by default, with prompt overrides for custom labels
 - fixed-cadence live sampling
+- calm live terminal output by default, with per-sample diagnostics behind `--verbose`
 - optional motion gate before model calls
 - repeat cooldown for calmer logs
 - promoted frames only, not every sampled frame

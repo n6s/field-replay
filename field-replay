@@ -5513,15 +5513,14 @@ def command_vision_live(args: argparse.Namespace) -> int:
             print()
             pending_skip_markers = 0
 
-    print(f"Vision live session: {session_dir}")
-    print(f"Vision output dir:   {output_root}")
-    print(f"Vision model:        {args.model}")
-    print(f"Vision frame size:   {args.vision_size or 'native'}")
-    print(f"Sample cadence:      {args.sample_interval:g}s")
-    print(f"Repeat cooldown:     {args.repeat_cooldown:.0f}s")
+    print(f"Vision live: {session_dir}")
+    print(f"Output:      {output_root}")
+    print(f"Model:       {args.model}")
+    print(f"Cadence:     {args.sample_interval:g}s, {args.tail_offset:g}s behind live")
+    print(f"Cooldown:    {args.repeat_cooldown:.0f}s")
     if args.motion_gate:
         print(
-            "Motion gate:        "
+            "Motion:      "
             f"{args.motion_size}, zone={motion_zone_label(args.motion_zone)}, "
             f"mean>={args.motion_threshold:g}, "
             f"changed>={args.motion_min_changed_pct:g}%, "
@@ -5532,8 +5531,10 @@ def command_vision_live(args: argparse.Namespace) -> int:
                 "Hint: use `field-replay motion-zone` to save a tighter motion zone later. Running full-frame for now."
             )
     else:
-        print("Motion gate:        disabled")
-    print("Sampling follows fixed media-time cadence points; press Ctrl+C to stop.")
+        print("Motion:      disabled")
+    if args.verbose:
+        print("Verbose:     printing per-sample diagnostics")
+    print("Promoted sightings will appear below. Press Ctrl+C to stop.")
 
     while True:
         if args.max_samples is not None and sample_count >= args.max_samples:
@@ -5677,11 +5678,12 @@ def command_vision_live(args: argparse.Namespace) -> int:
                         "skipped_reason": "motion-gate-closed",
                     },
                 )
-                print(".", end="", flush=True)
-                pending_skip_markers += 1
-                if pending_skip_markers >= 80:
-                    print()
-                    pending_skip_markers = 0
+                if args.verbose:
+                    print(".", end="", flush=True)
+                    pending_skip_markers += 1
+                    if pending_skip_markers >= 80:
+                        print()
+                        pending_skip_markers = 0
                 processed_offsets.add(rounded_offset)
                 sample_count += 1
                 if args.once:
@@ -5696,12 +5698,13 @@ def command_vision_live(args: argparse.Namespace) -> int:
                 runtime_paths["scratch_frame"],
                 frame_filter=frame_filter,
             )
-            flush_skip_markers()
-            print(
-                f"[vision-live] analyzing {format_duration(offset_seconds)} with {args.model} "
-                f"({motion_summary_text(motion_result)})...",
-                flush=True,
-            )
+            if args.verbose:
+                flush_skip_markers()
+                print(
+                    f"[vision-live] analyzing {format_duration(offset_seconds)} with {args.model} "
+                    f"({motion_summary_text(motion_result)})...",
+                    flush=True,
+                )
             result = process_vision_frame(
                 runtime_paths=runtime_paths,
                 session_dir=session_dir,
@@ -5759,15 +5762,16 @@ def command_vision_live(args: argparse.Namespace) -> int:
                     flush=True,
                 )
             elif result.promoted:
-                flush_skip_markers()
-                print(
-                    "[vision-live] "
-                    f"{format_duration(offset_seconds)} promoted "
-                    f"{', '.join(event_detection_label(payload) or '?' for payload in result.promoted)} "
-                    f"in {result.elapsed_ms} ms",
-                    flush=True,
-                )
-            else:
+                if args.verbose:
+                    flush_skip_markers()
+                    print(
+                        "[vision-live] "
+                        f"{format_duration(offset_seconds)} promoted "
+                        f"{', '.join(event_detection_label(payload) or '?' for payload in result.promoted)} "
+                        f"in {result.elapsed_ms} ms",
+                        flush=True,
+                    )
+            elif args.verbose:
                 flush_skip_markers()
                 detected = ", ".join(result.detections) if result.detections else "nothing"
                 print(
@@ -5792,6 +5796,11 @@ def command_vision_live(args: argparse.Namespace) -> int:
                 },
             )
             flush_skip_markers()
+            print(
+                f"[vision-live] {format_duration(rounded_offset)} error: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
             if args.once:
                 return 1
 
@@ -7291,6 +7300,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--once",
         action="store_true",
         help="Run one available sample and exit.",
+    )
+    vision_live.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print per-sample live vision diagnostics to the terminal.",
     )
     vision_live.add_argument(
         "--interactive",
