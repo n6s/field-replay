@@ -1697,6 +1697,7 @@ def profile_from_args(args: argparse.Namespace) -> dict:
         "audio_device": args.audio_device,
         "audio_input_rate": args.audio_input_rate,
         "audio_input_channels": args.audio_input_channels,
+        "audio_thread_queue_size": args.audio_thread_queue_size,
         "audio_gain_db": args.audio_gain_db,
         "framerate": args.framerate,
         "video_size": args.video_size,
@@ -1774,6 +1775,9 @@ def apply_profile(args: argparse.Namespace, profile: dict) -> None:
     args.audio_input_rate = profile.get("audio_input_rate", args.audio_input_rate)
     args.audio_input_channels = profile.get(
         "audio_input_channels", args.audio_input_channels
+    )
+    args.audio_thread_queue_size = profile.get(
+        "audio_thread_queue_size", args.audio_thread_queue_size
     )
     args.audio_gain_db = profile.get("audio_gain_db", args.audio_gain_db)
     args.framerate = profile.get("framerate", args.framerate)
@@ -7222,6 +7226,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=2,
         help="Preferred audio input channel count to probe.",
+    )
+    setup.add_argument(
+        "--audio-thread-queue-size",
+        type=int,
+        default=1024,
+        help="Preferred audio input queue size to save in the profile.",
     )
     setup.add_argument(
         "--audio-gain-db",
