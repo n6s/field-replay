@@ -511,6 +511,17 @@ def v4l_id_aliases() -> dict[str, Path]:
     return aliases
 
 
+def v4l_persistent_alias(device_path: str) -> str | None:
+    try:
+        resolved = str(Path(device_path).resolve())
+    except OSError:
+        return None
+    alias_path = v4l_id_aliases().get(resolved)
+    if alias_path:
+        return str(alias_path)
+    return None
+
+
 def list_video_devices() -> list[VideoDevice]:
     devices: list[VideoDevice] = []
     aliases = v4l_id_aliases()
@@ -531,7 +542,7 @@ def list_video_devices() -> list[VideoDevice]:
         selected_path = str(device_path)
         if alias_path:
             selected_path = str(alias_path)
-            full_label += f" ({alias_path.name})"
+            full_label = f"{alias_path} -> {device_path} - {label}"
         devices.append(VideoDevice(path=selected_path, label=full_label))
     return devices
 
@@ -1357,14 +1368,16 @@ def candidate_storage_paths(current: Path) -> list[Path]:
 def select_video_device(current_device: str) -> str:
     devices = list_video_devices()
     options = [(device.path, device.label) for device in devices]
+    default_device = v4l_persistent_alias(current_device) or current_device
     if not options:
         custom = prompt_text("No video devices discovered. Enter a video device path", current_device)
         return custom
 
-    if current_device not in {value for value, _ in options}:
+    option_values = {value for value, _ in options}
+    if current_device not in option_values and default_device not in option_values:
         options.append((current_device, f"{current_device} (current/custom)"))
     options.append(("__custom__", "Enter a custom video device path"))
-    choice = prompt_menu("Video source", options, default_value=current_device)
+    choice = prompt_menu("Video source", options, default_value=default_device)
     if choice == "__custom__":
         return prompt_text("Video device path", current_device)
     return choice

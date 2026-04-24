@@ -132,6 +132,9 @@ If you want live vision features, also install and run Ollama separately.
 - encoder choice
 - storage destination
 
+When Linux exposes persistent V4L2 aliases, the video chooser shows `/dev/v4l/by-id/*`
+paths and saves that stable path instead of a plain `/dev/video*` node.
+
 For RTSP sources, the initial support is aimed at:
 
 - saving a source profile
