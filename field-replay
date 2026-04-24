@@ -546,6 +546,58 @@ def list_video_devices() -> list[VideoDevice]:
         devices.append(VideoDevice(path=selected_path, label=full_label))
     return devices
 
+
+def device_match_tokens(device_path: str) -> list[str]:
+    text = Path(device_path).name.lower()
+    for prefix in ("usb-", "video-"):
+        if text.startswith(prefix):
+            text = text[len(prefix) :]
+    text = re.sub(r"-video-index\d+$", "", text)
+    tokens = [token for token in re.split(r"[^a-z0-9]+", text) if len(token) >= 3]
+    return [token for token in tokens if token not in {"usb", "video", "index"}]
+
+
+def recover_missing_video_device(device_path: str) -> str | None:
+    configured_path = Path(device_path)
+    if configured_path.exists():
+        return None
+    tokens = device_match_tokens(device_path)
+    if not tokens:
+        return None
+
+    sysfs_root = Path("/sys/class/video4linux")
+    if not sysfs_root.exists():
+        return None
+
+    best_score = 0
+    best_device: Path | None = None
+    for entry in sorted(sysfs_root.iterdir()):
+        name_path = entry / "name"
+        try:
+            label = name_path.read_text().strip().lower()
+        except OSError:
+            continue
+        score = sum(1 for token in tokens if token in label)
+        if score > best_score:
+            best_score = score
+            best_device = Path("/dev") / entry.name
+
+    if best_device and best_score >= 2:
+        return str(best_device)
+    return None
+
+
+def recover_source_device(args: argparse.Namespace) -> str | None:
+    if is_rtsp_source(args):
+        return None
+    recovered = recover_missing_video_device(args.device)
+    if not recovered:
+        return None
+    original = args.device
+    args.device = recovered
+    return f"video device {original} is missing; using {recovered}"
+
+
 def build_ffmpeg_command(paths: SessionPaths, args: argparse.Namespace) -> list[str]:
     gop = effective_gop(args)
     command = [
@@ -1962,6 +2014,10 @@ def command_setup(args: argparse.Namespace) -> int:
     if source_error:
         print(source_error, file=sys.stderr)
         return 1
+
+    source_warning = recover_source_device(args)
+    if source_warning:
+        print(f"warning: {source_warning}", file=sys.stderr)
 
     for warning in auto_select_video_codec_mode(args):
         print(f"warning: {warning}", file=sys.stderr)
@@ -5200,6 +5256,10 @@ def run_record_command(args: argparse.Namespace, *, launch_player: bool = False)
         print(source_error, file=sys.stderr)
         return 1
 
+    source_warning = recover_source_device(args)
+    if source_warning:
+        print(f"warning: {source_warning}", file=sys.stderr)
+
     for warning in auto_select_video_codec_mode(args):
         print(f"warning: {warning}", file=sys.stderr)
 
@@ -6909,7 +6969,12 @@ def source_readiness(args: argparse.Namespace) -> tuple[bool, str]:
         source = args.rtsp_url.strip()
         return bool(source), f"{source or '(missing)'} ({'configured' if source else 'missing'})"
     device_exists = Path(args.device).exists()
-    return device_exists, f"{args.device} ({'ok' if device_exists else 'missing'})"
+    if device_exists:
+        return True, f"{args.device} (ok)"
+    recovered = recover_missing_video_device(args.device)
+    if recovered:
+        return True, f"{args.device} (missing; recoverable as {recovered})"
+    return False, f"{args.device} (missing)"
 
 
 def command_doctor(args: argparse.Namespace) -> int:
