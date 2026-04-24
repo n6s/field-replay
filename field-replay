@@ -496,9 +496,9 @@ def storage_summary(path: Path) -> str:
     return f"{candidate} ({format_bytes(usage.free)} free)"
 
 
-def v4l_id_aliases() -> dict[str, str]:
+def v4l_id_aliases() -> dict[str, Path]:
     by_id_dir = Path("/dev/v4l/by-id")
-    aliases: dict[str, str] = {}
+    aliases: dict[str, Path] = {}
     if not by_id_dir.exists():
         return aliases
 
@@ -507,7 +507,7 @@ def v4l_id_aliases() -> dict[str, str]:
             resolved = item.resolve()
         except OSError:
             continue
-        aliases[str(resolved)] = item.name
+        aliases[str(resolved)] = item
     return aliases
 
 
@@ -526,11 +526,13 @@ def list_video_devices() -> list[VideoDevice]:
         label = entry.name
         if name_path.exists():
             label = name_path.read_text().strip() or label
-        alias = aliases.get(str(device_path.resolve()))
+        alias_path = aliases.get(str(device_path.resolve()))
         full_label = f"{device_path} - {label}"
-        if alias:
-            full_label += f" ({alias})"
-        devices.append(VideoDevice(path=str(device_path), label=full_label))
+        selected_path = str(device_path)
+        if alias_path:
+            selected_path = str(alias_path)
+            full_label += f" ({alias_path.name})"
+        devices.append(VideoDevice(path=selected_path, label=full_label))
     return devices
 
 def build_ffmpeg_command(paths: SessionPaths, args: argparse.Namespace) -> list[str]:
@@ -1370,7 +1372,7 @@ def select_video_device(current_device: str) -> str:
 
 def select_source_type(current_source_type: str) -> str:
     options = [
-        ("v4l2", "Linux video device (/dev/video*)"),
+        ("v4l2", "Linux video device (/dev/video* or /dev/v4l/by-id/*)"),
         ("rtsp", "RTSP network stream"),
     ]
     return (
@@ -7181,7 +7183,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_SOURCE_TYPE,
         help="Capture source type. Defaults to %(default)s.",
     )
-    setup.add_argument("--device", default="/dev/video2", help="Video device path.")
+    setup.add_argument(
+        "--device",
+        default="/dev/video2",
+        help="Video device path. Prefer /dev/v4l/by-id/* for saved profiles.",
+    )
     setup.add_argument(
         "--rtsp-url",
         default="",
