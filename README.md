@@ -7,7 +7,7 @@ Its current sweet spot is:
 - record one growing near-live `timeshift.ts` file while the event is happening
 - watch that file in VLC a few seconds behind live so you can pause and rewind
 - burn a wall-clock timestamp into the video by default
-- run a local vision model against the session to log likely bib sightings or custom detections
+- run a local vision model against the session to log likely bib sightings or other significant motion
 - review saved evidence frames and jump back into video when something needs confirmation
 
 This is no longer just an experiment. The current workflow is stable and usable for real review work, especially when the goal is answering questions like "when did bib 241 arrive?" or "when was the last time we saw bib 573?"
@@ -20,7 +20,7 @@ What is working well right now:
 - interactive setup and saved profiles
 - timestamp overlay burned into the video
 - near-live VLC playback with practical rewind behavior
-- local Ollama vision support for bib detection and custom label prompts
+- local Ollama vision support with bib-focused and motion-focused canned prompts
 - promoted evidence logs plus saved frame grabs
 - `find-bib` and `review` for post-hoc lookup of bibs or custom labels
 
@@ -182,6 +182,9 @@ Offline scan:
 `vision-scan` uses the same compare-frame path as `vision-live`, so it can keep a
 permanent background object from masking a newer arrival with the same class
 label. Use `--no-compare-frames` if you want the older one-frame behavior.
+When you pick a vision setup interactively, it now asks for a primary focus of
+`bibs` or `motion` and fills in a canned prompt for you. Use `--prompt` only if
+you need to override that default wording.
 
 Offline resolution sweep:
 

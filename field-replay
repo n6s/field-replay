@@ -1517,6 +1517,10 @@ def known_recordings_roots(args: argparse.Namespace, config: dict) -> list[Path]
 
 
 def vision_profile_from_args(args: argparse.Namespace) -> dict:
+    focus = normalize_vision_focus(getattr(args, "vision_focus", None))
+    prompt = getattr(args, "prompt", None)
+    if not focus:
+        focus = infer_vision_focus_from_prompt(prompt)
     profile = {
         "model": args.model,
         "ollama_host": args.ollama_host,
@@ -1524,8 +1528,11 @@ def vision_profile_from_args(args: argparse.Namespace) -> dict:
         "keepalive": args.keepalive,
         "repeat_cooldown": args.repeat_cooldown,
         "vision_size": args.vision_size,
-        "prompt": args.prompt,
     }
+    if focus:
+        profile["vision_focus"] = focus
+    if prompt and prompt.strip() != vision_prompt_for_focus(focus):
+        profile["prompt"] = prompt
     if hasattr(args, "sample_interval"):
         profile["sample_interval"] = args.sample_interval
     if hasattr(args, "compare_frames"):
@@ -1548,8 +1555,9 @@ def vision_profile_from_args(args: argparse.Namespace) -> dict:
 
 
 def vision_profile_summary_lines(profile_name: str, profile: dict) -> list[str]:
+    focus = vision_profile_focus(profile)
     prompt_override = profile.get("prompt")
-    prompt_label = "custom" if prompt_override else "default"
+    prompt_label = "custom override" if prompt_override else f"canned {vision_focus_label(focus)}"
     motion_gate = bool(profile.get("motion_gate", DEFAULT_MOTION_GATE))
     return [
         f"Vision profile: {profile_name}",
@@ -1573,6 +1581,7 @@ def vision_profile_summary_lines(profile_name: str, profile: dict) -> list[str]:
             if motion_gate
             else "  Motion:   disabled"
         ),
+        f"  Focus:    {vision_focus_label(focus)}",
         f"  Prompt:   {prompt_label}",
     ]
 
@@ -1587,6 +1596,7 @@ def vision_profile_menu_label(profile_name: str, profile: dict) -> str:
         details.append("compare frames")
     if profile.get("motion_gate", DEFAULT_MOTION_GATE):
         details.append("motion gate")
+    details.append(vision_focus_label(vision_profile_focus(profile)))
     if profile.get("prompt"):
         details.append("custom prompt")
     return f"{profile_name} ({'; '.join(details)})"
@@ -1599,7 +1609,9 @@ def apply_vision_profile(args: argparse.Namespace, profile: dict) -> None:
     args.keepalive = profile.get("keepalive", args.keepalive)
     args.repeat_cooldown = profile.get("repeat_cooldown", args.repeat_cooldown)
     args.vision_size = profile.get("vision_size", args.vision_size)
-    args.prompt = profile.get("prompt", args.prompt)
+    focus = vision_profile_focus(profile)
+    args.vision_focus = focus
+    args.prompt = profile.get("prompt") or vision_prompt_for_focus(focus)
     if hasattr(args, "sample_interval"):
         args.sample_interval = profile.get("sample_interval") or args.sample_interval
     if hasattr(args, "compare_frames"):
@@ -1622,6 +1634,106 @@ def apply_vision_profile(args: argparse.Namespace, profile: dict) -> None:
         args.motion_hold = profile.get("motion_hold", args.motion_hold)
     if hasattr(args, "motion_zone"):
         args.motion_zone = profile.get("motion_zone", args.motion_zone)
+
+
+def normalize_vision_focus(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized in {"bib", "bibs", "bibs-focus", "bib-focus"}:
+        return "bibs"
+    if normalized in {"motion", "motion-focus"}:
+        return "motion"
+    return None
+
+
+def prompt_seems_motion_focused(base_prompt: str) -> bool:
+    prompt = base_prompt.lower()
+    motion_markers = (
+        "motion",
+        "moving",
+        "movement",
+        "vehicle",
+        "car",
+        "pickup",
+        "truck",
+        "license plate",
+        "plate",
+        "person",
+        "people",
+        "runner",
+        "wheelchair",
+        "handcycle",
+        "handcyclist",
+        "animal",
+        "dog",
+        "cat",
+        "bird",
+    )
+    return any(marker in prompt for marker in motion_markers)
+
+
+def infer_vision_focus_from_prompt(prompt: str | None) -> str:
+    if not prompt:
+        return "bibs"
+    if prompt_seems_bib_focused(prompt):
+        return "bibs"
+    if prompt_seems_motion_focused(prompt):
+        return "motion"
+    return "bibs"
+
+
+def vision_focus_label(focus: str | None) -> str:
+    normalized = normalize_vision_focus(focus)
+    if normalized == "motion":
+        return "motion focus"
+    return "bib focus"
+
+
+def vision_focus_choice_options() -> list[tuple[str, str]]:
+    return [
+        (
+            "bibs",
+            "Bib focus - prioritize race participants and bib numbers, while still noting useful motion",
+        ),
+        (
+            "motion",
+            "Motion focus - prioritize significant motion and readable text on moving subjects",
+        ),
+    ]
+
+
+def vision_prompt_for_focus(focus: str | None) -> str:
+    normalized = normalize_vision_focus(focus) or "bibs"
+    if normalized == "motion":
+        return (
+            "Describe significant motion and read any clearly visible text, especially "
+            "on moving cars, people, or animals. Prefer subjects that are actually "
+            "moving and ignore background clutter unless it is the clearest significant "
+            "change. Do not guess at text that is partial or ambiguous."
+        )
+    return (
+        "Find race participants and read only clearly visible bib numbers or other "
+        "race-number text. Prefer runners, wheelchair athletes, and handcyclists "
+        "moving with purpose. Also note significant motion so the operator can jump "
+        "to the right timestamp, but ignore spectators, crew, parked vehicles, and "
+        "casual joggers unless they are the clearest moving subject. Do not guess or "
+        "invent a number if the digits are partial, ambiguous, or missing."
+    )
+
+
+def vision_profile_focus(profile: dict | argparse.Namespace) -> str:
+    if isinstance(profile, dict):
+        focus = normalize_vision_focus(profile.get("vision_focus"))
+        if focus:
+            return focus
+        prompt = profile.get("prompt")
+    else:
+        focus = normalize_vision_focus(getattr(profile, "vision_focus", None))
+        if focus:
+            return focus
+        prompt = getattr(profile, "prompt", None)
+    return infer_vision_focus_from_prompt(prompt if isinstance(prompt, str) else None)
 
 
 def choose_vision_profile(
@@ -1651,6 +1763,14 @@ def configure_vision_profile_interactively(
     args: argparse.Namespace,
     config: dict,
 ) -> str | None:
+    print()
+    args.vision_focus = prompt_menu(
+        "Primary focus",
+        vision_focus_choice_options(),
+        default_value=normalize_vision_focus(getattr(args, "vision_focus", None))
+        or infer_vision_focus_from_prompt(getattr(args, "prompt", None)),
+    )
+    args.prompt = vision_prompt_for_focus(args.vision_focus)
     print()
     args.model = prompt_text("Vision model", args.model)
     args.ollama_host = prompt_text("Ollama host", args.ollama_host)
@@ -1695,9 +1815,6 @@ def configure_vision_profile_interactively(
             args.motion_hold = prompt_float(
                 "Motion hold-open seconds", args.motion_hold
             )
-    args.prompt = prompt_optional_text(
-        "Prompt override (leave blank for default)", args.prompt
-    )
 
     print()
     print("Vision summary")
@@ -1721,10 +1838,8 @@ def configure_vision_profile_interactively(
         )
     else:
         print("  Motion:   disabled")
-    print(
-        "  Prompt:   "
-        f"{'custom detection task' if args.prompt else 'default bib detection task'}"
-    )
+    print(f"  Focus:    {vision_focus_label(args.vision_focus)}")
+    print(f"  Prompt:   canned {vision_focus_label(args.vision_focus)}")
 
     if not prompt_yes_no("Save this vision setup as a reusable profile?", default=False):
         return None
@@ -4514,11 +4629,14 @@ def command_motion_tune(args: argparse.Namespace) -> int:
 
 
 def default_vision_prompt() -> str:
-    return (
-        "Find only clearly visible digit sequences on runner bibs, paper bib signs, "
-        "or race number cards. Ignore timestamps and room signs. Do not guess or "
-        "invent a number if the digits are partial, ambiguous, or missing."
-    )
+    return vision_prompt_for_focus("bibs")
+
+
+def active_vision_prompt(args: argparse.Namespace) -> str:
+    prompt = getattr(args, "prompt", None)
+    if prompt:
+        return prompt
+    return vision_prompt_for_focus(getattr(args, "vision_focus", None))
 
 
 def prompt_seems_bib_focused(base_prompt: str) -> bool:
@@ -4530,6 +4648,10 @@ def prompt_seems_bib_focused(base_prompt: str) -> bool:
         "race numbers",
         "number card",
         "number cards",
+        "wheelchair",
+        "handcycle",
+        "hand cyclist",
+        "handcyclist",
         "bib number",
         "bib numbers",
         "pacer",
@@ -4541,21 +4663,25 @@ def single_frame_vision_prompt(base_prompt: str) -> str:
     bib_focused = prompt_seems_bib_focused(base_prompt)
     if bib_focused:
         example = '{"detections":["<bib-number>"]}'
+        guidance = (
+            "Return only exact bib numbers that are clearly visible on a person, "
+            "wheelchair athlete, handcyclist, or race number card. Ignore unrelated "
+            "background text. Prefer race participants who are moving with purpose "
+            "over spectators, crew, parked vehicles, or casual joggers. Do not copy "
+            "the example number or invent a bib when none is visible."
+        )
     else:
-        example = '{"detections":["white pickup right"]}'
-    guidance = (
-        "If the operator intent is bib tracking, return only exact bib numbers "
-        "that are clearly visible on a person or race number card, and ignore "
-        "unrelated background text. Do not copy the example number or invent a "
-        "bib when none is visible. If the operator intent is general scene "
-        "monitoring, return a descriptive label for each visible instance and use "
-        "stable details such as color, type, and coarse position so distinct cars, "
-        "people, and pets do not collapse into one label. Prefer a descriptive "
-        "label such as 'white pickup right' or 'person red shirt left' over a "
-        "bare class label like 'car' unless no better detail is visible."
-    )
+        example = '{"detections":["runner moving left"]}'
+        guidance = (
+            "Describe significant motion and read any clearly visible text, especially "
+            "on moving cars, people, or animals. Prefer subjects that are actually "
+            "moving and ignore background clutter unless it is the clearest significant "
+            "change. Prefer a descriptive label such as 'runner red shirt left' or "
+            "'wheelchair athlete right' over a bare class label unless no better "
+            "detail is visible. Do not guess at text that is partial or ambiguous."
+        )
     return (
-        "Use this detection task as the operator intent: "
+        "Use this detection task:\n"
         f"{base_prompt}\n"
         f"{guidance} Return only JSON in this exact shape: {example}. "
         'If none are clearly visible, return {"detections":[]}. '
@@ -4567,25 +4693,29 @@ def comparison_vision_prompt(base_prompt: str) -> str:
     bib_focused = prompt_seems_bib_focused(base_prompt)
     if bib_focused:
         example = '{"detections":[{"label":"<bib-number>","status":"unchanged"}]}'
+        guidance = (
+            "Return only exact bib numbers that are clearly visible on a person, "
+            "wheelchair athlete, handcyclist, or race number card. Ignore unrelated "
+            "background objects. Prefer race participants who are moving with purpose "
+            "over spectators, crew, parked vehicles, or casual joggers. Do not copy "
+            "the example number or invent a bib when none is visible."
+        )
     else:
-        example = '{"detections":[{"label":"white pickup right","status":"unchanged"}]}'
-    guidance = (
-        "If the operator intent is bib tracking, return only exact bib numbers "
-        "that are clearly visible on a person or race number card, and ignore "
-        "unrelated background objects. Do not copy the example number or invent a "
-        "bib when none is visible. If the operator intent is general scene "
-        "monitoring, give each distinct car, person, pet, or other object a "
-        "descriptive label that includes stable details such as color, type, and "
-        "coarse position so a parked background vehicle does not mask a different "
-        "passing one. Prefer a descriptive label such as 'white pickup right' or "
-        "'person red shirt left' over a bare class label like 'car' unless no "
-        "better detail is visible."
-    )
+        example = '{"detections":[{"label":"runner moving left","status":"unchanged"}]}'
+        guidance = (
+            "Describe significant motion and read any clearly visible text, especially "
+            "on moving cars, people, or animals. Give each distinct significant moving "
+            "subject a descriptive label that includes stable details such as color, "
+            "type, and coarse position so a parked background vehicle does not mask a "
+            "different passing one. Prefer a descriptive label such as 'runner red shirt "
+            "left' or 'wheelchair athlete right' over a bare class label unless no better "
+            "detail is visible. Do not guess at text that is partial or ambiguous."
+        )
     return (
         "You will receive two images from the same camera. Image 1 is the previous "
-        "sample and image 2 is the current sample. Use this detection task as the "
-        f"operator intent: {base_prompt}\n"
-        "Ignore any return-format instructions inside the operator intent and use "
+        "sample and image 2 is the current sample. Use this detection task:\n"
+        f"{base_prompt}\n"
+        "Ignore any return-format instructions inside the task text and use "
         f"the comparison JSON shape below. {guidance} "
         "Report only objects or labels that are visible in image 2. For each item, "
         "set status to one of new, moved, unchanged, or unclear compared with image 1. "
@@ -5562,7 +5692,7 @@ def command_vision_scan(args: argparse.Namespace) -> int:
     sample_points = media_sample_points(duration_seconds, args.sample_interval)
     if args.max_samples is not None:
         sample_points = sample_points[: max(args.max_samples, 0)]
-    prompt = args.prompt or default_vision_prompt()
+    prompt = active_vision_prompt(args)
     try:
         frame_filter = (
             resolve_vision_variant(args.scale_to).frame_filter
@@ -5651,7 +5781,7 @@ def command_vision_sweep(args: argparse.Namespace) -> int:
     sample_points = media_sample_points(duration_seconds, args.sample_interval)
     if args.max_samples is not None:
         sample_points = sample_points[: max(args.max_samples, 0)]
-    prompt = args.prompt or default_vision_prompt()
+    prompt = active_vision_prompt(args)
 
     print(f"Vision sweep source: {source.source_path}")
     print(f"Vision sweep dir:    {output_root}")
@@ -5826,7 +5956,7 @@ def command_vision_live(args: argparse.Namespace) -> int:
     config["last_session_dir"] = str(session_dir)
     save_config(config_path, config)
 
-    base_prompt = args.prompt or default_vision_prompt()
+    base_prompt = active_vision_prompt(args)
     try:
         frame_filter = frame_filter_for_vision_size(args.vision_size)
     except ValueError as exc:
