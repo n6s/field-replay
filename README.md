@@ -76,7 +76,7 @@ sudo apt install ffmpeg vlc v4l-utils alsa-utils
 Useful extras:
 
 ```bash
-sudo apt install eog mpv vainfo usbutils
+sudo apt install eog mpv vainfo usbutils gstreamer1.0-tools
 ```
 
 What they are for:
@@ -89,6 +89,9 @@ What they are for:
 - `mpv`: optional alternate player
 - `vainfo`: checking video acceleration support
 - `usbutils`: identifying USB capture hardware with `lsusb`
+- `gstreamer1.0-tools`: checking and running Jetson hardware encode paths
+
+For cleaner Jetson DVR containers, also install the GStreamer plugin sets that provide `h264parse` and `mpegtsmux` when they are not already present on the image.
 
 If you want the repo's `mpv` near-live shortcut too, install the bundled config with:
 
@@ -439,13 +442,25 @@ Useful current defaults:
 - audio gain: `+18 dB`
 - timestamp source: `generated`
 - video timestamp overlay: enabled by default
+- capture backend: `auto`
 - framerate: `30`
 - size: `1920x1080`
 - encoder: `h264_nvenc`
 - preset: `fast`
 - archive format after stop: `mkv`
 
-If `h264_nvenc` is unavailable, the tool falls back to another available encoder such as `libx264`.
+If `h264_nvenc` is unavailable, the tool falls back to another available encoder such as `libx264`. On Jetson systems, `auto` can use the GStreamer `nvv4l2h264enc` backend for V4L2 video-only recordings, preserving the wall-clock overlay while moving the final H.264 encode onto Jetson hardware:
+
+```bash
+./field-replay doctor --no-audio
+./field-replay go --no-audio
+```
+
+Use `--capture-backend gstreamer-jetson` to require that path, or `--capture-backend ffmpeg` to force the older FFmpeg path. The Jetson backend currently supports V4L2 capture with optional ALSA audio; RTSP and direct timelapse recordings use FFmpeg.
+
+If `doctor --no-audio` reports that `/dev/v4l2-nvenc` is missing, the Jetson multimedia encoder device is not exposed to the current system session. Fix the Jetson driver/runtime install or device access first; the GStreamer plugin can be installed while the actual encoder device is still unavailable.
+
+Player launches no longer disable hardware decode. mpv defaults to `--hwdec=auto-safe`; use `--player-hwdec no` only when diagnosing playback problems.
 
 For cameras that already expose H.264 on a dedicated V4L2 node, you can save a profile with:
 
@@ -455,7 +470,7 @@ For cameras that already expose H.264 on a dedicated V4L2 node, you can save a p
 
 That keeps the incoming H.264 bitstream and writes it straight into the rolling `timeshift.ts`, which can significantly reduce CPU load compared with decode-and-re-encode. The main tradeoff is that passthrough mode cannot burn the wall-clock timestamp overlay into the video.
 
-When a V4L2 profile selects `--video-input-format h264`, the tool now defaults that profile to passthrough mode automatically.
+When a V4L2 profile selects `--video-input-format h264`, the tool defaults that profile to passthrough mode only when it cannot keep the wall-clock overlay through Jetson hardware encode. On Jetson video-only setups with the overlay enabled, setup keeps encode mode and selects `gstreamer-jetson`.
 
 ## Useful Commands
 

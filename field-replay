@@ -32,8 +32,11 @@ DEFAULT_RTSP_TRANSPORT = "tcp"
 DEFAULT_ENCODER = "h264_nvenc"
 DEFAULT_VIDEO_CODEC_MODE = "encode"
 VIDEO_CODEC_MODES = ("encode", "copy")
+DEFAULT_CAPTURE_BACKEND = "auto"
+CAPTURE_BACKENDS = ("auto", "ffmpeg", "gstreamer-jetson")
 DEFAULT_VIDEO_INPUT_FORMAT = "auto"
 DEFAULT_AUDIO_GAIN_DB = -6.0
+DEFAULT_PLAYER_HWDEC = "auto-safe"
 COMMON_VIDEO_SIZES = ("1920x1080", "1280x720", "1024x576", "640x480")
 COMMON_FRAME_RATES = (30, 25, 15, 10, 5)
 COMMON_VIDEO_INPUT_FORMATS = ("auto", "h264", "mjpeg", "yuyv422", "uyvy422", "nv12")
@@ -259,6 +262,7 @@ def auto_select_video_codec_mode(args: argparse.Namespace) -> list[str]:
     warnings: list[str] = []
     video_input_format = getattr(args, "video_input_format", DEFAULT_VIDEO_INPUT_FORMAT)
     video_codec_mode = getattr(args, "video_codec_mode", DEFAULT_VIDEO_CODEC_MODE)
+    video_timestamp = getattr(args, "video_timestamp", DEFAULT_VIDEO_TIMESTAMP_ENABLED)
     if is_record_timelapse(args) and video_codec_mode == "copy":
         args.video_codec_mode = "encode"
         warnings.append(
@@ -268,7 +272,22 @@ def auto_select_video_codec_mode(args: argparse.Namespace) -> list[str]:
     if (
         not is_rtsp_source(args)
         and video_input_format == "h264"
+        and video_codec_mode == "copy"
+        and video_timestamp
+        and jetson_gstreamer_available()
+        and not getattr(args, "audio", True)
+        and not is_record_timelapse(args)
+    ):
+        args.video_codec_mode = "encode"
+        warnings.append(
+            "h264 V4L2 input can keep the wall-clock overlay with Jetson hardware encode; switching video codec mode to encode"
+        )
+        return warnings
+    if (
+        not is_rtsp_source(args)
+        and video_input_format == "h264"
         and video_codec_mode != "copy"
+        and not (video_timestamp and jetson_gstreamer_available() and not getattr(args, "audio", True))
         and not is_record_timelapse(args)
     ):
         args.video_codec_mode = "copy"
@@ -772,6 +791,280 @@ def build_ffmpeg_command(paths: SessionPaths, args: argparse.Namespace) -> list[
         ]
     )
     return command
+
+
+def gst_element_available(element: str) -> bool:
+    gst_inspect = shutil.which("gst-inspect-1.0")
+    if not gst_inspect:
+        return False
+    result = subprocess.run(
+        [gst_inspect, element],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return result.returncode == 0
+
+
+def jetson_gstreamer_available() -> bool:
+    return bool(
+        shutil.which("gst-launch-1.0")
+        and Path("/dev/v4l2-nvenc").exists()
+        and gst_element_available("nvv4l2h264enc")
+        and gst_element_available("nvvidconv")
+        and gst_element_available("h264parse")
+        and gst_element_available("mpegtsmux")
+    )
+
+
+def jetson_gstreamer_audio_available() -> bool:
+    return bool(
+        gst_element_available("alsasrc")
+        and gst_element_available("audioconvert")
+        and gst_element_available("audioresample")
+        and gst_element_available("voaacenc")
+        and gst_element_available("aacparse")
+    )
+
+
+def jetson_gstreamer_unavailable_reason() -> str:
+    if not shutil.which("gst-launch-1.0"):
+        return "gst-launch-1.0 is missing"
+    if not Path("/dev/v4l2-nvenc").exists():
+        return "Jetson encoder device /dev/v4l2-nvenc is missing"
+    for element in ("nvv4l2h264enc", "nvvidconv", "h264parse", "mpegtsmux"):
+        if not gst_element_available(element):
+            return f"GStreamer element {element} is missing"
+    return "Jetson GStreamer encoder is unavailable"
+
+
+def parse_gst_bitrate(value: str | None, default_bps: int = 8_000_000) -> int:
+    if not value:
+        return default_bps
+    text = value.strip().lower()
+    multiplier = 1
+    if text.endswith("k"):
+        multiplier = 1_000
+        text = text[:-1]
+    elif text.endswith("m"):
+        multiplier = 1_000_000
+        text = text[:-1]
+    try:
+        return max(1, int(float(text) * multiplier))
+    except ValueError:
+        return default_bps
+
+
+def gst_audio_gain_volume(gain_db: float) -> float:
+    return 10 ** (gain_db / 20.0)
+
+
+def gst_caps_fraction(framerate: int | float) -> str:
+    return f"{int(round(float(framerate)))}/1"
+
+
+def gst_v4l2_input_chain(args: argparse.Namespace) -> list[str]:
+    caps_fps = gst_caps_fraction(args.framerate)
+    caps_size = f"width={args.video_size.split('x', 1)[0]},height={args.video_size.split('x', 1)[1]}"
+    command = [
+        "v4l2src",
+        f"device={args.device}",
+        "do-timestamp=true",
+        "!",
+    ]
+    input_format = args.video_input_format
+    if input_format in (DEFAULT_VIDEO_INPUT_FORMAT, "mjpeg"):
+        command.extend(
+            [
+                f"image/jpeg,{caps_size},framerate={caps_fps}",
+                "!",
+                "jpegdec",
+                "!",
+                "videoconvert",
+                "!",
+            ]
+        )
+    elif input_format == "h264":
+        command.extend(
+            [
+                f"video/x-h264,{caps_size},framerate={caps_fps},stream-format=byte-stream",
+                "!",
+            ]
+        )
+        if gst_element_available("h264parse"):
+            command.extend(["h264parse", "!"])
+        command.extend(
+            [
+                "nvv4l2decoder",
+                "enable-max-performance=true",
+                "!",
+                "nvvidconv",
+                "!",
+                "video/x-raw,format=I420",
+                "!",
+            ]
+        )
+    else:
+        raw_format = {
+            "yuyv422": "YUY2",
+            "uyvy422": "UYVY",
+            "nv12": "NV12",
+        }.get(input_format, input_format.upper())
+        command.extend(
+            [
+                f"video/x-raw,format={raw_format},{caps_size},framerate={caps_fps}",
+                "!",
+                "videoconvert",
+                "!",
+            ]
+        )
+    return command
+
+
+def gst_jetson_encoded_video_chain(args: argparse.Namespace) -> list[str]:
+    gop = effective_gop(args)
+    bitrate = parse_gst_bitrate(args.video_bitrate)
+    command: list[str] = []
+    command.extend(gst_v4l2_input_chain(args))
+    if getattr(args, "video_timestamp", DEFAULT_VIDEO_TIMESTAMP_ENABLED):
+        command.extend(
+            [
+                "clockoverlay",
+                "time-format=%Y-%m-%d %H:%M:%S",
+                "shaded-background=true",
+                "halignment=left",
+                "valignment=bottom",
+                "!",
+            ]
+        )
+    command.extend(
+        [
+            "videoconvert",
+            "!",
+            "video/x-raw,format=NV12",
+            "!",
+            "nvvidconv",
+            "!",
+            "video/x-raw(memory:NVMM),format=NV12",
+            "!",
+            "nvv4l2h264enc",
+            f"bitrate={bitrate}",
+            f"iframeinterval={gop}",
+            f"idrinterval={gop}",
+            "insert-sps-pps=true",
+            "maxperf-enable=true",
+            "preset-level=1",
+            "!",
+        ]
+    )
+    command.extend(["h264parse", "!"])
+    return command
+
+
+def gst_alsa_audio_chain(args: argparse.Namespace) -> list[str]:
+    command = [
+        "alsasrc",
+        f"device={args.audio_device}",
+        "do-timestamp=true",
+        "!",
+        f"audio/x-raw,rate={args.audio_input_rate},channels={args.audio_input_channels}",
+        "!",
+        "audioconvert",
+        "!",
+        "audioresample",
+        "!",
+        f"audio/x-raw,format=S16LE,rate={args.audio_sample_rate},channels={args.audio_channels}",
+        "!",
+    ]
+    if abs(args.audio_gain_db) >= 0.05:
+        command.extend(["volume", f"volume={gst_audio_gain_volume(args.audio_gain_db):.6g}", "!"])
+    command.extend(
+        [
+            "voaacenc",
+            f"bitrate={parse_gst_bitrate(args.audio_bitrate, 32_000)}",
+            "!",
+            "aacparse",
+            "!",
+        ]
+    )
+    return command
+
+
+def build_gstreamer_jetson_command(paths: SessionPaths, args: argparse.Namespace) -> list[str]:
+    command = [
+        "gst-launch-1.0",
+        "-e",
+        "-q",
+        "mpegtsmux",
+        "name=mux",
+        "!",
+        "filesink",
+        f"location={paths.timeshift_path.name}",
+    ]
+    command.extend(gst_jetson_encoded_video_chain(args))
+    command.append("mux.")
+    if args.audio:
+        command.extend(gst_alsa_audio_chain(args))
+        command.append("mux.")
+    return command
+
+
+def resolve_capture_backend(args: argparse.Namespace) -> tuple[str | None, str | None]:
+    requested = getattr(args, "capture_backend", DEFAULT_CAPTURE_BACKEND)
+    if requested == "ffmpeg":
+        return "ffmpeg", None
+    if requested == "gstreamer-jetson":
+        if is_rtsp_source(args):
+            return None, "gstreamer-jetson capture currently supports V4L2 sources only"
+        if is_record_timelapse(args):
+            return None, "gstreamer-jetson capture does not support direct timelapse recording yet"
+        if uses_video_passthrough(args):
+            return None, "gstreamer-jetson capture is for encoded overlay recordings, not passthrough"
+        if args.audio and not jetson_gstreamer_audio_available():
+            return None, "Jetson GStreamer audio plugins are unavailable"
+        if not jetson_gstreamer_available():
+            return None, jetson_gstreamer_unavailable_reason()
+        return "gstreamer-jetson", None
+    if (
+        not is_rtsp_source(args)
+        and not is_record_timelapse(args)
+        and not uses_video_passthrough(args)
+        and jetson_gstreamer_available()
+        and (not args.audio or jetson_gstreamer_audio_available())
+    ):
+        return "gstreamer-jetson", None
+    return "ffmpeg", None
+
+
+def build_capture_command(paths: SessionPaths, args: argparse.Namespace) -> tuple[str, list[str]]:
+    backend, error = resolve_capture_backend(args)
+    if error or not backend:
+        raise RuntimeError(error or "capture backend could not be resolved")
+    args.capture_backend = backend
+    if backend == "gstreamer-jetson":
+        args.encoder = "nvv4l2h264enc"
+        return backend, build_gstreamer_jetson_command(paths, args)
+    return backend, build_ffmpeg_command(paths, args)
+
+
+def resolve_profile_capture_settings(
+    args: argparse.Namespace, ffmpeg_path: str | None, supported_encoders: set[str]
+) -> list[str]:
+    warnings: list[str] = []
+    for warning in auto_select_video_codec_mode(args):
+        warnings.append(warning)
+    capture_backend, backend_error = resolve_capture_backend(args)
+    if backend_error:
+        warnings.append(f"{backend_error}; saving ffmpeg-compatible settings")
+        capture_backend = "ffmpeg"
+    args.capture_backend = capture_backend or "ffmpeg"
+    if args.capture_backend == "gstreamer-jetson":
+        args.encoder = "nvv4l2h264enc"
+    elif not uses_video_passthrough(args):
+        resolved_encoder = resolve_encoder(ffmpeg_path, supported_encoders, args.encoder)
+        if resolved_encoder:
+            args.encoder = resolved_encoder
+    return warnings
 
 
 def build_video_filter(args: argparse.Namespace) -> str:
@@ -1969,6 +2262,7 @@ def profile_from_args(args: argparse.Namespace) -> dict:
         "rtsp_url": args.rtsp_url,
         "rtsp_transport": args.rtsp_transport,
         "video_codec_mode": args.video_codec_mode,
+        "capture_backend": getattr(args, "capture_backend", DEFAULT_CAPTURE_BACKEND),
         "video_input_format": args.video_input_format,
         "audio": args.audio,
         "audio_device": args.audio_device,
@@ -2021,6 +2315,7 @@ def profile_summary_lines(profile_name: str, profile: dict) -> list[str]:
         f"  Source:  {source_label}",
         f"  Type:    {source_type_value(profile)}",
         f"  Video path: {profile.get('video_codec_mode', DEFAULT_VIDEO_CODEC_MODE)}",
+        f"  Backend: {profile.get('capture_backend', DEFAULT_CAPTURE_BACKEND)}",
         f"  Format:  {profile.get('video_input_format', DEFAULT_VIDEO_INPUT_FORMAT)}",
         f"  Mode:    {mode_label}",
         f"  Audio:   {audio_label}",
@@ -2059,6 +2354,10 @@ def apply_profile(args: argparse.Namespace, profile: dict) -> None:
     args.video_codec_mode = profile.get(
         "video_codec_mode", getattr(args, "video_codec_mode", DEFAULT_VIDEO_CODEC_MODE)
     )
+    if hasattr(args, "capture_backend"):
+        args.capture_backend = profile.get(
+            "capture_backend", getattr(args, "capture_backend", DEFAULT_CAPTURE_BACKEND)
+        )
     args.video_input_format = profile.get(
         "video_input_format", args.video_input_format
     )
@@ -2168,6 +2467,10 @@ def configure_record_interactively(
     print()
     args.recordings_dir = select_storage_path(args.recordings_dir.expanduser())
 
+    ffmpeg_path, supported_encoders = detect_supported_encoders(args.ffmpeg_bin)
+    for warning in resolve_profile_capture_settings(args, ffmpeg_path, supported_encoders):
+        print(f"warning: {warning}", file=sys.stderr)
+
     print()
     print("Recording summary")
     print(f"  Source:  {source_display_label(args)}")
@@ -2178,6 +2481,7 @@ def configure_record_interactively(
         f"  Format:  {args.video_input_format if args.video_input_format != DEFAULT_VIDEO_INPUT_FORMAT else 'auto'}"
     )
     print(f"  Video path: {args.video_codec_mode}")
+    print(f"  Backend: {getattr(args, 'capture_backend', DEFAULT_CAPTURE_BACKEND)}")
     if uses_alsa_audio_input(args):
         print(f"  Audio:   {args.audio_device}")
     else:
@@ -2289,10 +2593,6 @@ def command_setup(args: argparse.Namespace) -> int:
         print(f"warning: {warning}", file=sys.stderr)
 
     ffmpeg_path, supported_encoders = detect_supported_encoders(args.ffmpeg_bin)
-    if not uses_video_passthrough(args):
-        resolved_encoder = resolve_encoder(ffmpeg_path, supported_encoders, args.encoder)
-        if resolved_encoder:
-            args.encoder = resolved_encoder
 
     if args.probe:
         if not ffmpeg_path:
@@ -2356,6 +2656,9 @@ def command_setup(args: argparse.Namespace) -> int:
 
         print()
 
+    for warning in resolve_profile_capture_settings(args, ffmpeg_path, supported_encoders):
+        print(f"warning: {warning}", file=sys.stderr)
+
     for warning in normalize_video_settings(args):
         print(f"warning: {warning}", file=sys.stderr)
 
@@ -2368,6 +2671,9 @@ def command_setup(args: argparse.Namespace) -> int:
         f"  Video input fmt:   {args.video_input_format if args.video_input_format != DEFAULT_VIDEO_INPUT_FORMAT else 'auto'}"
     )
     print(f"  Video path:        {args.video_codec_mode}")
+    print(
+        f"  Capture backend:   {getattr(args, 'capture_backend', DEFAULT_CAPTURE_BACKEND)}"
+    )
     if is_rtsp_source(args):
         print(f"  Output pacing:     target {args.framerate} fps")
     else:
@@ -2829,6 +3135,8 @@ def write_metadata(
         "video_timestamp": args.video_timestamp,
         "preset": args.preset,
         "archive_format": args.archive_format,
+        "capture_backend": getattr(args, "capture_backend", "ffmpeg"),
+        "capture_command": list(ffmpeg_command),
         "ffmpeg_command": list(ffmpeg_command),
         "exit_code": exit_code,
         "archive_status": archive_status,
@@ -3381,6 +3689,7 @@ def build_player_command(
     target_path: Path,
     file_caching_ms: int,
     start_seconds: float | None = None,
+    player_hwdec: str | None = DEFAULT_PLAYER_HWDEC,
 ) -> list[str]:
     player_name = Path(player).name
     if player_name == "ffplay":
@@ -3393,7 +3702,7 @@ def build_player_command(
         cache_seconds = max(file_caching_ms / 1000.0, 0.1)
         command = [
             player,
-            "--hwdec=no",
+            f"--hwdec={player_hwdec or DEFAULT_PLAYER_HWDEC}",
             "--cache=yes",
             f"--demuxer-readahead-secs={cache_seconds:.1f}",
             f"--audio-buffer={cache_seconds:.1f}",
@@ -3408,9 +3717,10 @@ def build_player_command(
         return command
     command = [
         player,
-        "--avcodec-hw=none",
         f"--file-caching={file_caching_ms}",
     ]
+    if player_hwdec and player_hwdec != "no":
+        command.insert(1, "--avcodec-hw=any")
     if start_seconds is not None and start_seconds > 0:
         command.append(f"--start-time={start_seconds:.1f}")
     command.append(str(target_path))
@@ -5540,7 +5850,7 @@ def print_session_summary(paths: SessionPaths) -> None:
     print(f"Session:   {paths.session_dir}")
     print(f"Archive:   {paths.archive_path}")
     print(f"DVR File:  {paths.timeshift_path}")
-    print(f"FFmpeg:    {paths.ffmpeg_log_path}")
+    print(f"Capture:   {paths.ffmpeg_log_path}")
 
 
 def print_record_mode_summary(args: argparse.Namespace) -> None:
@@ -5555,9 +5865,12 @@ def print_record_mode_summary(args: argparse.Namespace) -> None:
 
 
 def launch_background_player(
-    player: str, target_path: Path, file_caching_ms: int
+    player: str,
+    target_path: Path,
+    file_caching_ms: int,
+    player_hwdec: str | None = DEFAULT_PLAYER_HWDEC,
 ) -> subprocess.Popen[bytes]:
-    command = build_player_command(player, target_path, file_caching_ms)
+    command = build_player_command(player, target_path, file_caching_ms, player_hwdec=player_hwdec)
     print("Player:", shlex.join(command))
     return subprocess.Popen(
         command,
@@ -5624,7 +5937,13 @@ def run_record_command(args: argparse.Namespace, *, launch_player: bool = False)
         print(f"ffmpeg binary not found: {args.ffmpeg_bin}", file=sys.stderr)
         return 1
 
-    if not uses_video_passthrough(args):
+    capture_backend, backend_error = resolve_capture_backend(args)
+    if backend_error or not capture_backend:
+        print(backend_error or "capture backend could not be resolved", file=sys.stderr)
+        return 1
+    args.capture_backend = capture_backend
+
+    if capture_backend == "ffmpeg" and not uses_video_passthrough(args):
         resolved_encoder = resolve_encoder(ffmpeg_path, supported_encoders, args.encoder)
         if not resolved_encoder:
             print("no supported video encoder found for this ffmpeg build", file=sys.stderr)
@@ -5636,9 +5955,10 @@ def run_record_command(args: argparse.Namespace, *, launch_player: bool = False)
             )
             args.encoder = resolved_encoder
 
-    _, supported_filters = detect_supported_filters(args.ffmpeg_bin)
-    for warning in normalize_video_settings(args, supported_filters=supported_filters):
-        print(f"warning: {warning}", file=sys.stderr)
+    if capture_backend == "ffmpeg":
+        _, supported_filters = detect_supported_filters(args.ffmpeg_bin)
+        for warning in normalize_video_settings(args, supported_filters=supported_filters):
+            print(f"warning: {warning}", file=sys.stderr)
     player = None
     if launch_player:
         player = choose_player(args.player)
@@ -5650,17 +5970,26 @@ def run_record_command(args: argparse.Namespace, *, launch_player: bool = False)
     recordings_dir = args.recordings_dir.expanduser()
     session_name = args.session_name or default_session_name(args.session_prefix)
     paths = make_session_paths(recordings_dir, session_name, args.archive_format)
-    ffmpeg_command = build_ffmpeg_command(paths, args)
+    try:
+        capture_backend, capture_command = build_capture_command(paths, args)
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
 
     if args.dry_run:
         print_session_summary(paths)
         print_record_mode_summary(args)
-        print("FFmpeg:", shlex.join(ffmpeg_command))
+        print(f"Capture ({capture_backend}):", shlex.join(capture_command))
         if launch_player and player:
             print(
                 "Player:",
                 shlex.join(
-                    build_player_command(player, paths.timeshift_path, args.file_caching_ms)
+                    build_player_command(
+                        player,
+                        paths.timeshift_path,
+                        args.file_caching_ms,
+                        player_hwdec=args.player_hwdec,
+                    )
                 ),
             )
         return 0
@@ -5670,7 +5999,7 @@ def run_record_command(args: argparse.Namespace, *, launch_player: bool = False)
         return 1
 
     ensure_directory(paths.session_dir)
-    write_metadata(paths, args, ffmpeg_command, state="starting")
+    write_metadata(paths, args, capture_command, state="starting")
 
     try:
         lock_paths = acquire_device_locks(recordings_dir, args, session_name)
@@ -5680,15 +6009,15 @@ def run_record_command(args: argparse.Namespace, *, launch_player: bool = False)
 
     print_session_summary(paths)
     print_record_mode_summary(args)
-    print("FFmpeg:", shlex.join(ffmpeg_command))
+    print(f"Capture ({capture_backend}):", shlex.join(capture_command))
     with paths.ffmpeg_log_path.open("a", encoding="utf-8") as ffmpeg_log:
         ffmpeg_log.write(
             f"=== {datetime.now().astimezone().isoformat()} start ===\n"
         )
-        ffmpeg_log.write(shlex.join(ffmpeg_command) + "\n")
+        ffmpeg_log.write(shlex.join(capture_command) + "\n")
         ffmpeg_log.flush()
         process = subprocess.Popen(
-            ffmpeg_command,
+            capture_command,
             cwd=paths.session_dir,
             stderr=ffmpeg_log,
         )
@@ -5705,7 +6034,10 @@ def run_record_command(args: argparse.Namespace, *, launch_player: bool = False)
             save_config(config_path, config)
             if launch_player and player:
                 player_process = launch_background_player(
-                    player, paths.timeshift_path, args.file_caching_ms
+                    player,
+                    paths.timeshift_path,
+                    args.file_caching_ms,
+                    args.player_hwdec,
                 )
         exit_code = process.wait()
     except KeyboardInterrupt:
@@ -5742,7 +6074,7 @@ def run_record_command(args: argparse.Namespace, *, launch_player: bool = False)
     write_metadata(
         paths,
         args,
-        ffmpeg_command,
+        capture_command,
         state=final_state,
         exit_code=exit_code,
         archive_status=archive_status,
@@ -7137,7 +7469,12 @@ def command_watch(args: argparse.Namespace) -> int:
         print(f"watch target not found: {target_path}", file=sys.stderr)
         return 1
 
-    command = build_player_command(player, target_path, args.file_caching_ms)
+    command = build_player_command(
+        player,
+        target_path,
+        args.file_caching_ms,
+        player_hwdec=args.player_hwdec,
+    )
     print("Player:", shlex.join(command))
     if args.dry_run:
         return 0
@@ -7377,6 +7714,9 @@ def command_doctor(args: argparse.Namespace) -> int:
         if uses_video_passthrough(args)
         else resolve_encoder(ffmpeg_path, supported_encoders, args.encoder)
     )
+    capture_backend, backend_error = resolve_capture_backend(args)
+    if capture_backend == "gstreamer-jetson":
+        resolved_encoder = "nvv4l2h264enc"
     player = choose_player(args.player)
     source_ok, source_status = source_readiness(args)
     if uses_alsa_audio_input(args):
@@ -7388,7 +7728,13 @@ def command_doctor(args: argparse.Namespace) -> int:
 
     print(f"ffmpeg:   {ffmpeg_path or 'missing'}")
     print(f"nvenc:    {'yes' if has_nvenc else 'no'}")
+    print(f"gst-jetson:{' yes' if jetson_gstreamer_available() else ' no'}")
+    if not jetson_gstreamer_available():
+        print(f"gst-reason:{' '}{jetson_gstreamer_unavailable_reason()}")
     print(f"video:    {args.video_codec_mode}")
+    print(f"backend:  {capture_backend or 'missing'}")
+    if backend_error:
+        print(f"backend-error: {backend_error}")
     print(f"encoder:  {resolved_encoder or 'missing'}")
     print(f"player:   {player or 'missing'}")
     print(f"type:     {args.source_type}")
@@ -7398,7 +7744,7 @@ def command_doctor(args: argparse.Namespace) -> int:
     print(f"audio:    {audio_status}")
     print(f"outputs:  {args.recordings_dir.expanduser()}")
 
-    if not ffmpeg_path or not resolved_encoder or not source_ok or not audio_ok:
+    if not ffmpeg_path or backend_error or not resolved_encoder or not source_ok or not audio_ok:
         return 1
     return 0
 
@@ -7468,6 +7814,12 @@ def add_record_arguments(
         choices=VIDEO_CODEC_MODES,
         default=DEFAULT_VIDEO_CODEC_MODE,
         help="Encode video normally or pass through an already-encoded stream.",
+    )
+    parser.add_argument(
+        "--capture-backend",
+        choices=CAPTURE_BACKENDS,
+        default=DEFAULT_CAPTURE_BACKEND,
+        help="Capture backend. auto uses Jetson GStreamer hardware encode when available.",
     )
     parser.add_argument(
         "--audio",
@@ -7630,6 +7982,11 @@ def add_record_arguments(
             default=300,
             help="Player file cache in milliseconds for the auto-launched watch window.",
         )
+        parser.add_argument(
+            "--player-hwdec",
+            default=DEFAULT_PLAYER_HWDEC,
+            help="Player hardware decode mode. Use 'no' to disable.",
+        )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -7696,6 +8053,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=VIDEO_CODEC_MODES,
         default=DEFAULT_VIDEO_CODEC_MODE,
         help="Encode video normally or pass through an already-encoded stream.",
+    )
+    setup.add_argument(
+        "--capture-backend",
+        choices=CAPTURE_BACKENDS,
+        default=DEFAULT_CAPTURE_BACKEND,
+        help="Capture backend to save. auto uses Jetson GStreamer hardware encode when available.",
     )
     setup.add_argument(
         "--audio",
@@ -7832,6 +8195,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=300,
         help="VLC file cache in milliseconds for DVR playback.",
+    )
+    watch.add_argument(
+        "--player-hwdec",
+        default=DEFAULT_PLAYER_HWDEC,
+        help="Player hardware decode mode. Use 'no' to disable.",
     )
     watch.add_argument(
         "--interactive",
@@ -8438,6 +8806,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=VIDEO_CODEC_MODES,
         default=DEFAULT_VIDEO_CODEC_MODE,
         help="Check encoder readiness or passthrough mode compatibility.",
+    )
+    doctor.add_argument(
+        "--capture-backend",
+        choices=CAPTURE_BACKENDS,
+        default=DEFAULT_CAPTURE_BACKEND,
+        help="Capture backend to validate.",
     )
     doctor.set_defaults(func=command_doctor)
 
