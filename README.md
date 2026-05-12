@@ -253,6 +253,10 @@ repeat cooldown still applies as a fallback. Suppressed comparison decisions are
 recorded in `vision-debug.jsonl`. Use `--no-compare-frames` to go back to the
 older one-frame behavior.
 
+In motion-focused profiles, repeat suppression now keys off the object class
+instead of the exact wording, so the same bicycle or car will not keep getting
+re-promoted just because the model changed the color or position phrase.
+
 Motion gating is still available as an explicit opt-in diagnostic or load-shedding path:
 
 ```bash
@@ -422,6 +426,7 @@ A profile currently remembers:
 - audio device
 - probed audio input rate and channel count
 - probed video size and framerate
+- direct-to-DVR timelapse mode, interval, and playback fps
 - preferred encoder
 - recordings directory
 
@@ -470,8 +475,12 @@ A few common variations:
 ```bash
 ./field-replay go --player vlc
 ./field-replay record --profile portable-capture --no-interactive
+./field-replay setup --profile lot-overview-timelapse --timelapse --timelapse-interval 10 --timelapse-output-fps 20 --no-interactive
+./field-replay record --profile lot-overview-timelapse --no-interactive
 ./field-replay record --no-audio
 ./field-replay record --no-video-timestamp
+./field-replay record --timelapse
+./field-replay go --timelapse --timelapse-interval 10 --timelapse-output-fps 20
 ./field-replay vision-live ~/recordings/run-20260408-181629
 ./field-replay vision-scan ~/recordings/run-20260408-181629 --max-samples 20
 ./field-replay vision-scan ~/recordings/run-20260408-181629 --scale-to 640x360 --max-samples 20
@@ -483,6 +492,12 @@ A few common variations:
 ```
 
 `export` can create either a normal-speed share copy or a timelapse. In interactive mode it asks for the export type, then offers common timelapse speeds and playback frame rates before showing the final `ffmpeg` command.
+
+`record` and `go` can also write a timelapse directly to the normal growing `timeshift.ts` DVR file with `--timelapse`. By default, this captures one frame every 10 seconds and encodes playback at 20 fps, so the resulting DVR stream is 200x real time while still preserving the wall-clock overlay on each retained frame. Direct timelapse recording is video-only and uses encode mode because frame sampling, timestamp rebuilds, and overlays cannot work with passthrough copy mode.
+
+Interactive `setup` asks whether the saved recording setup should be a timelapse, then asks for the frame interval and playback FPS when timelapse mode is enabled.
+
+Each recording session also writes FFmpeg stderr to `ffmpeg.log` inside the session directory, which is the first place to check if a timelapse file stays at 0 bytes.
 
 `vision-sweep` writes one scan directory per tested rung plus `summary.json` and `summary.txt` under `vision-scan-sweep/`. The first rung is treated as the reference baseline for comparison, so the default ladder starts with `source`. In the sweeps so far, `720p` matched source reliably, while `640x360` and below were more likely to drop or misread harder bibs.
 

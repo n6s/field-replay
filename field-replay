@@ -1803,7 +1803,9 @@ def vision_prompt_for_focus(focus: str | None) -> str:
             "Describe significant motion and read any clearly visible text, especially "
             "on moving cars, people, or animals. Prefer subjects that are actually "
             "moving and ignore background clutter unless it is the clearest significant "
-            "change. Do not guess at text that is partial or ambiguous."
+            "change. Report each moving object at most once using a stable class label, "
+            "and do not keep re-describing the same parked or stationary object. Do not "
+            "guess at text that is partial or ambiguous."
         )
     return (
         "Find race participants and read only clearly visible bib numbers or other "
@@ -3516,6 +3518,40 @@ def normalize_detection_text(value: str) -> str | None:
     return normalized
 
 
+def motion_detection_key(value: str) -> str | None:
+    normalized = normalize_detection_text(value)
+    if not normalized:
+        return None
+    for token in (
+        "bicycle",
+        "bike",
+        "runner",
+        "person",
+        "pedestrian",
+        "wheelchair",
+        "handcycle",
+        "handcyclist",
+        "car",
+        "sedan",
+        "pickup",
+        "truck",
+        "vehicle",
+        "motorcycle",
+        "motorbike",
+        "bus",
+        "van",
+    ):
+        if token in normalized:
+            if token == "bike":
+                return "bicycle"
+            if token == "pickup":
+                return "pickup-truck"
+            if token == "motorbike":
+                return "motorcycle"
+            return token
+    return normalized
+
+
 def is_bib_detection_label(value: str) -> bool:
     return normalize_bib_text(value) == value
 
@@ -3525,7 +3561,12 @@ def detection_promotion_key(
     comparison_status: str | None = None,
     *,
     compare_mode: bool = False,
+    motion_focus: bool = False,
 ) -> str:
+    if motion_focus:
+        motion_key = motion_detection_key(detection)
+        if motion_key:
+            return motion_key
     normalized_detection = normalize_detection_text(detection)
     if not normalized_detection:
         return detection
@@ -5336,6 +5377,7 @@ def process_vision_frame(
     keepalive: str,
     repeat_cooldown_seconds: float,
     last_promoted_by_key: dict[str, float],
+    motion_focus: bool = False,
 ) -> VisionFrameResult:
     now = datetime.now().astimezone()
     started_at = time.perf_counter()
@@ -5368,6 +5410,7 @@ def process_vision_frame(
                 detection,
                 comparison_status,
                 compare_mode=comparison_frame_path is not None,
+                motion_focus=motion_focus,
             )
             last_promoted_offset = last_promoted_by_key.get(promotion_key)
             if (
@@ -5784,6 +5827,8 @@ def run_offline_vision_scan(
                 keepalive=keepalive,
                 repeat_cooldown_seconds=repeat_cooldown_seconds,
                 last_promoted_by_key=last_promoted_by_key,
+                motion_focus=normalized_vision_focus(getattr(args, "vision_focus", None))
+                == "motion",
             )
             if compare_frames:
                 shutil.copy2(runtime_paths["scratch_frame"], previous_sample_frame)
@@ -6477,6 +6522,7 @@ def command_vision_live(args: argparse.Namespace) -> int:
                 keepalive=args.keepalive,
                 repeat_cooldown_seconds=args.repeat_cooldown,
                 last_promoted_by_key=last_promoted_by_key,
+                motion_focus=normalized_vision_focus(args.vision_focus) == "motion",
             )
             if args.compare_frames:
                 shutil.copy2(
