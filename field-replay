@@ -36,7 +36,7 @@ DEFAULT_CAPTURE_BACKEND = "auto"
 CAPTURE_BACKENDS = ("auto", "ffmpeg", "gstreamer-jetson")
 DEFAULT_VIDEO_INPUT_FORMAT = "auto"
 DEFAULT_AUDIO_GAIN_DB = -6.0
-DEFAULT_PLAYER_HWDEC = "auto-safe"
+DEFAULT_PLAYER_HWDEC = "auto"
 COMMON_VIDEO_SIZES = ("1920x1080", "1280x720", "1024x576", "640x480")
 COMMON_FRAME_RATES = (30, 25, 15, 10, 5)
 COMMON_VIDEO_INPUT_FORMATS = ("auto", "h264", "mjpeg", "yuyv422", "uyvy422", "nv12")
@@ -3684,6 +3684,29 @@ def validate_timelapse_args(args: argparse.Namespace) -> str | None:
     return None
 
 
+def is_tegra_system() -> bool:
+    try:
+        release = os.uname().release.lower()
+    except OSError:
+        release = ""
+    return (
+        "tegra" in release
+        or Path("/etc/nv_tegra_release").exists()
+        or Path("/dev/v4l2-nvdec").exists()
+    )
+
+
+def resolve_mpv_hwdec(player_hwdec: str | None) -> str:
+    requested = player_hwdec or DEFAULT_PLAYER_HWDEC
+    if requested != "auto":
+        return requested
+    if is_tegra_system():
+        if Path("/dev/v4l2-nvdec").exists():
+            return "v4l2m2m-copy"
+        return "no"
+    return "auto-safe"
+
+
 def build_player_command(
     player: str,
     target_path: Path,
@@ -3702,7 +3725,7 @@ def build_player_command(
         cache_seconds = max(file_caching_ms / 1000.0, 0.1)
         command = [
             player,
-            f"--hwdec={player_hwdec or DEFAULT_PLAYER_HWDEC}",
+            f"--hwdec={resolve_mpv_hwdec(player_hwdec)}",
             "--cache=yes",
             f"--demuxer-readahead-secs={cache_seconds:.1f}",
             f"--audio-buffer={cache_seconds:.1f}",
