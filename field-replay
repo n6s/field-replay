@@ -67,6 +67,8 @@ DEFAULT_TIMELAPSE_SPEED = 60.0
 DEFAULT_TIMELAPSE_OUTPUT_FPS = 60.0
 TIMELAPSE_SPEED_CHOICES = (30.0, 60.0, 120.0)
 TIMELAPSE_OUTPUT_FPS_CHOICES = (60.0, 30.0)
+DEFAULT_RECORD_TIMELAPSE_INTERVAL = 10.0
+DEFAULT_RECORD_TIMELAPSE_OUTPUT_FPS = 20.0
 VISION_RESOLUTION_ALIASES = {
     "1080p": "1920x1080",
     "720p": "1280x720",
@@ -107,6 +109,8 @@ EXPORT_PRESETS = {
 def effective_gop(args: argparse.Namespace) -> int:
     if args.gop is not None:
         return max(1, args.gop)
+    if is_record_timelapse(args):
+        return max(1, int(round(args.timelapse_output_fps)))
     return max(1, args.framerate)
 
 
@@ -135,6 +139,7 @@ class SessionPaths:
     session_dir: Path
     archive_path: Path
     timeshift_path: Path
+    ffmpeg_log_path: Path
     metadata_path: Path
     latest_link: Path
 
@@ -226,14 +231,45 @@ def uses_video_passthrough(args: argparse.Namespace | dict) -> bool:
     return mode == "copy"
 
 
+def is_record_timelapse(args: argparse.Namespace | dict) -> bool:
+    if isinstance(args, dict):
+        return bool(args.get("record_timelapse", False))
+    return bool(getattr(args, "record_timelapse", False))
+
+
+def record_timelapse_speed(args: argparse.Namespace | dict) -> float:
+    if isinstance(args, dict):
+        interval = float(
+            args.get("timelapse_interval", DEFAULT_RECORD_TIMELAPSE_INTERVAL)
+        )
+        output_fps = float(
+            args.get("timelapse_output_fps", DEFAULT_RECORD_TIMELAPSE_OUTPUT_FPS)
+        )
+    else:
+        interval = float(
+            getattr(args, "timelapse_interval", DEFAULT_RECORD_TIMELAPSE_INTERVAL)
+        )
+        output_fps = float(
+            getattr(args, "timelapse_output_fps", DEFAULT_RECORD_TIMELAPSE_OUTPUT_FPS)
+        )
+    return interval * output_fps
+
+
 def auto_select_video_codec_mode(args: argparse.Namespace) -> list[str]:
     warnings: list[str] = []
     video_input_format = getattr(args, "video_input_format", DEFAULT_VIDEO_INPUT_FORMAT)
     video_codec_mode = getattr(args, "video_codec_mode", DEFAULT_VIDEO_CODEC_MODE)
+    if is_record_timelapse(args) and video_codec_mode == "copy":
+        args.video_codec_mode = "encode"
+        warnings.append(
+            "direct timelapse recording must filter/re-time frames; switching video codec mode to encode"
+        )
+        return warnings
     if (
         not is_rtsp_source(args)
         and video_input_format == "h264"
         and video_codec_mode != "copy"
+        and not is_record_timelapse(args)
     ):
         args.video_codec_mode = "copy"
         warnings.append(
@@ -253,6 +289,7 @@ def make_session_paths(
     session_dir = recordings_dir / session_name
     archive_path = session_dir / f"{DEFAULT_ARCHIVE_STEM}.{archive_format}"
     timeshift_path = session_dir / DEFAULT_TIMESHIFT_NAME
+    ffmpeg_log_path = session_dir / "ffmpeg.log"
     metadata_path = session_dir / "session.json"
     latest_link = recordings_dir / "latest"
     return SessionPaths(
@@ -260,6 +297,7 @@ def make_session_paths(
         session_dir=session_dir,
         archive_path=archive_path,
         timeshift_path=timeshift_path,
+        ffmpeg_log_path=ffmpeg_log_path,
         metadata_path=metadata_path,
         latest_link=latest_link,
     )
@@ -671,12 +709,19 @@ def build_ffmpeg_command(paths: SessionPaths, args: argparse.Namespace) -> list[
     if uses_video_passthrough(args):
         command.extend(["-c:v", "copy"])
     else:
+        _, supported_options = detect_supported_options(args.ffmpeg_bin)
+        fps_mode_args = (
+            ["-fps_mode", "cfr"]
+            if "fps_mode" in supported_options
+            else ["-vsync", "cfr"]
+        )
         command.extend(
             [
                 "-vf",
                 build_video_filter(args),
-                "-fps_mode",
-                "cfr",
+            ]
+            + fps_mode_args
+            + [
                 "-c:v",
                 args.encoder,
                 "-preset",
@@ -730,11 +775,21 @@ def build_ffmpeg_command(paths: SessionPaths, args: argparse.Namespace) -> list[
 
 
 def build_video_filter(args: argparse.Namespace) -> str:
-    filters = [
-        f"fps={args.framerate}",
-        "settb=AVTB",
-        f"setpts=N/({args.framerate}*TB)",
-    ]
+    if is_record_timelapse(args):
+        interval = float(args.timelapse_interval)
+        output_fps = float(args.timelapse_output_fps)
+        capture_fps = 1.0 / interval
+        filters = [
+            f"fps={capture_fps:g}",
+            "settb=AVTB",
+            f"setpts=N/({output_fps:g}*TB)",
+        ]
+    else:
+        filters = [
+            f"fps={args.framerate}",
+            "settb=AVTB",
+            f"setpts=N/({args.framerate}*TB)",
+        ]
     if getattr(args, "video_timestamp", DEFAULT_VIDEO_TIMESTAMP_ENABLED):
         filters.append(
             "drawtext="
@@ -747,7 +802,9 @@ def build_video_filter(args: argparse.Namespace) -> str:
 
 
 def build_audio_filter(args: argparse.Namespace) -> str:
-    filters = ["aresample=async=1:first_pts=0"]
+    filters = [
+        "aresample=async=1:first_pts=0",
+    ]
     if abs(args.audio_gain_db) >= 0.05:
         filters.append(f"volume={args.audio_gain_db}dB")
     return ",".join(filters)
@@ -904,6 +961,27 @@ def detect_supported_filters(ffmpeg_bin: str) -> tuple[str | None, set[str]]:
     return ffmpeg_path, filters
 
 
+def detect_supported_options(ffmpeg_bin: str) -> tuple[str | None, set[str]]:
+    ffmpeg_path = shutil.which(ffmpeg_bin)
+    if not ffmpeg_path:
+        return None, set()
+
+    result = subprocess.run(
+        [ffmpeg_path, "-hide_banner", "-h", "full"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    options: set[str] = set()
+    for line in result.stdout.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("-"):
+            continue
+        option = stripped.split()[0].rstrip(".,")
+        options.add(option)
+    return ffmpeg_path, options
+
+
 def ffprobe_duration_seconds(target_path: Path) -> float | None:
     ffprobe_bin = shutil.which("ffprobe")
     if not ffprobe_bin:
@@ -963,6 +1041,21 @@ def normalize_video_settings(
         args.video_timestamp = False
         warnings.append(
             "ffmpeg drawtext filter is unavailable; disabling video timestamp overlay"
+        )
+    return warnings
+
+
+def normalize_record_timelapse_settings(args: argparse.Namespace) -> list[str]:
+    warnings: list[str] = []
+    if not is_record_timelapse(args):
+        return warnings
+    if args.audio:
+        args.audio = False
+        warnings.append("direct timelapse recording is video-only; disabling audio")
+    if args.video_codec_mode == "copy":
+        args.video_codec_mode = "encode"
+        warnings.append(
+            "direct timelapse recording must filter/re-time frames; switching video codec mode to encode"
         )
     return warnings
 
@@ -1883,6 +1976,13 @@ def profile_from_args(args: argparse.Namespace) -> dict:
         "audio_gain_db": args.audio_gain_db,
         "framerate": args.framerate,
         "video_size": args.video_size,
+        "record_timelapse": is_record_timelapse(args),
+        "timelapse_interval": getattr(
+            args, "timelapse_interval", DEFAULT_RECORD_TIMELAPSE_INTERVAL
+        ),
+        "timelapse_output_fps": getattr(
+            args, "timelapse_output_fps", DEFAULT_RECORD_TIMELAPSE_OUTPUT_FPS
+        ),
         "encoder": args.encoder,
         "video_timestamp": getattr(args, "video_timestamp", DEFAULT_VIDEO_TIMESTAMP_ENABLED),
         "recordings_dir": str(args.recordings_dir.expanduser()),
@@ -1908,6 +2008,12 @@ def profile_summary_lines(profile_name: str, profile: dict) -> list[str]:
             else "stream paced"
         )
     )
+    if is_record_timelapse(profile):
+        mode_label = (
+            f"timelapse: frame every "
+            f"{profile.get('timelapse_interval', DEFAULT_RECORD_TIMELAPSE_INTERVAL):g}s, "
+            f"playback {profile.get('timelapse_output_fps', DEFAULT_RECORD_TIMELAPSE_OUTPUT_FPS):g} fps"
+        )
     return [
         f"Quick start: {profile_name}",
         f"  Source:  {source_label}",
@@ -1933,6 +2039,8 @@ def profile_menu_label(profile_name: str, profile: dict) -> str:
         details.append(f"{profile['video_size']} @ {profile['framerate']} fps")
     elif is_rtsp_source(profile) and profile.get("rtsp_transport"):
         details.append(f"{profile['rtsp_transport']} transport")
+    if is_record_timelapse(profile):
+        details.append(f"timelapse {record_timelapse_speed(profile):g}x")
     recordings_dir = profile.get("recordings_dir")
     if recordings_dir:
         details.append(str(Path(recordings_dir).expanduser()))
@@ -1964,6 +2072,16 @@ def apply_profile(args: argparse.Namespace, profile: dict) -> None:
     args.audio_gain_db = profile.get("audio_gain_db", args.audio_gain_db)
     args.framerate = profile.get("framerate", args.framerate)
     args.video_size = profile.get("video_size", args.video_size)
+    if hasattr(args, "record_timelapse"):
+        args.record_timelapse = profile.get("record_timelapse", args.record_timelapse)
+    if hasattr(args, "timelapse_interval"):
+        args.timelapse_interval = profile.get(
+            "timelapse_interval", args.timelapse_interval
+        )
+    if hasattr(args, "timelapse_output_fps"):
+        args.timelapse_output_fps = profile.get(
+            "timelapse_output_fps", args.timelapse_output_fps
+        )
     args.encoder = profile.get("encoder", args.encoder)
     if hasattr(args, "video_timestamp"):
         args.video_timestamp = profile.get("video_timestamp", args.video_timestamp)
@@ -1987,6 +2105,23 @@ def choose_record_profile(config: dict, preferred_profile: str | None = None) ->
         default_value = options[0][0]
     print("Choose a recording setup")
     return prompt_menu("", options, default_value=default_value)
+
+
+def configure_timelapse_recording_interactively(args: argparse.Namespace) -> None:
+    args.record_timelapse = prompt_yes_no(
+        "Record this setup as a timelapse?", default=is_record_timelapse(args)
+    )
+    if not is_record_timelapse(args):
+        return
+    args.timelapse_interval = prompt_float(
+        "Seconds between timelapse frames", args.timelapse_interval
+    )
+    args.timelapse_output_fps = prompt_float(
+        "Timelapse playback FPS", args.timelapse_output_fps
+    )
+    if args.audio:
+        args.audio = False
+        print("Timelapse recording is video-only, so audio will be disabled.")
 
 
 def configure_record_interactively(
@@ -2027,6 +2162,8 @@ def configure_record_interactively(
     if args.audio:
         args.audio_gain_db = prompt_float("Audio gain (dB)", args.audio_gain_db)
         print()
+    configure_timelapse_recording_interactively(args)
+    print()
     args.recordings_dir = select_storage_path(args.recordings_dir.expanduser())
 
     print()
@@ -2045,6 +2182,13 @@ def configure_record_interactively(
         print(f"  Audio:   {'embedded stream audio' if args.audio else 'disabled'}")
     if args.audio:
         print(f"  Gain:    {args.audio_gain_db:g} dB")
+    if is_record_timelapse(args):
+        print(
+            "  Mode:    "
+            f"timelapse, frame every {args.timelapse_interval:g}s, "
+            f"playback {args.timelapse_output_fps:g} fps "
+            f"({record_timelapse_speed(args):g}x)"
+        )
     print(f"  Storage: {storage_summary(args.recordings_dir)}")
     print(
         "  Stamp:   "
@@ -2122,6 +2266,8 @@ def command_setup(args: argparse.Namespace) -> int:
         if args.audio:
             args.audio_gain_db = prompt_float("Audio gain (dB)", args.audio_gain_db)
             print()
+        configure_timelapse_recording_interactively(args)
+        print()
         args.recordings_dir = select_storage_path(args.recordings_dir.expanduser())
         print()
 
@@ -2133,6 +2279,9 @@ def command_setup(args: argparse.Namespace) -> int:
     source_warning = recover_source_device(args)
     if source_warning:
         print(f"warning: {source_warning}", file=sys.stderr)
+
+    for warning in normalize_record_timelapse_settings(args):
+        print(f"warning: {warning}", file=sys.stderr)
 
     for warning in auto_select_video_codec_mode(args):
         print(f"warning: {warning}", file=sys.stderr)
@@ -2221,6 +2370,13 @@ def command_setup(args: argparse.Namespace) -> int:
         print(f"  Output pacing:     target {args.framerate} fps")
     else:
         print(f"  Capture mode:      {args.video_size} @ {args.framerate} fps")
+    if is_record_timelapse(args):
+        print(
+            "  Record mode:       "
+            f"timelapse, frame every {args.timelapse_interval:g}s, "
+            f"playback {args.timelapse_output_fps:g} fps "
+            f"({record_timelapse_speed(args):g}x)"
+        )
     if uses_alsa_audio_input(args):
         print(f"  Audio device:      {args.audio_device}")
         print(
@@ -2640,6 +2796,7 @@ def write_metadata(
         "session_dir": str(paths.session_dir),
         "archive_path": str(paths.archive_path),
         "timeshift_path": str(paths.timeshift_path),
+        "ffmpeg_log_path": str(paths.ffmpeg_log_path),
         "source_type": args.source_type,
         "source": source_reference(args),
         "source_label": source_display_label(args),
@@ -2655,6 +2812,17 @@ def write_metadata(
         "audio_gain_db": args.audio_gain_db,
         "framerate": args.framerate,
         "video_size": args.video_size,
+        "recording_mode": "timelapse" if is_record_timelapse(args) else "normal",
+        "record_timelapse": is_record_timelapse(args),
+        "timelapse_interval": getattr(
+            args, "timelapse_interval", DEFAULT_RECORD_TIMELAPSE_INTERVAL
+        ),
+        "timelapse_output_fps": getattr(
+            args, "timelapse_output_fps", DEFAULT_RECORD_TIMELAPSE_OUTPUT_FPS
+        ),
+        "timelapse_speed": (
+            record_timelapse_speed(args) if is_record_timelapse(args) else None
+        ),
         "encoder": "copy" if uses_video_passthrough(args) else args.encoder,
         "video_timestamp": args.video_timestamp,
         "preset": args.preset,
@@ -5329,6 +5497,18 @@ def print_session_summary(paths: SessionPaths) -> None:
     print(f"Session:   {paths.session_dir}")
     print(f"Archive:   {paths.archive_path}")
     print(f"DVR File:  {paths.timeshift_path}")
+    print(f"FFmpeg:    {paths.ffmpeg_log_path}")
+
+
+def print_record_mode_summary(args: argparse.Namespace) -> None:
+    if not is_record_timelapse(args):
+        return
+    print(
+        "Mode:      "
+        f"timelapse, frame every {args.timelapse_interval:g}s, "
+        f"playback {args.timelapse_output_fps:g} fps "
+        f"({record_timelapse_speed(args):g}x)"
+    )
 
 
 def launch_background_player(
@@ -5390,6 +5570,9 @@ def run_record_command(args: argparse.Namespace, *, launch_player: bool = False)
     if source_warning:
         print(f"warning: {source_warning}", file=sys.stderr)
 
+    for warning in normalize_record_timelapse_settings(args):
+        print(f"warning: {warning}", file=sys.stderr)
+
     for warning in auto_select_video_codec_mode(args):
         print(f"warning: {warning}", file=sys.stderr)
 
@@ -5428,6 +5611,7 @@ def run_record_command(args: argparse.Namespace, *, launch_player: bool = False)
 
     if args.dry_run:
         print_session_summary(paths)
+        print_record_mode_summary(args)
         print("FFmpeg:", shlex.join(ffmpeg_command))
         if launch_player and player:
             print(
@@ -5452,8 +5636,20 @@ def run_record_command(args: argparse.Namespace, *, launch_player: bool = False)
         return 1
 
     print_session_summary(paths)
+    print_record_mode_summary(args)
     print("FFmpeg:", shlex.join(ffmpeg_command))
-    process = subprocess.Popen(ffmpeg_command, cwd=paths.session_dir)
+    with paths.ffmpeg_log_path.open("a", encoding="utf-8") as ffmpeg_log:
+        ffmpeg_log.write(
+            f"=== {datetime.now().astimezone().isoformat()} start ===\n"
+        )
+        ffmpeg_log.write(shlex.join(ffmpeg_command) + "\n")
+        ffmpeg_log.flush()
+        process = subprocess.Popen(
+            ffmpeg_command,
+            cwd=paths.session_dir,
+            stderr=ffmpeg_log,
+        )
+
     interrupted = False
     capture_started = False
     player_process = None
@@ -5476,6 +5672,14 @@ def run_record_command(args: argparse.Namespace, *, launch_player: bool = False)
         exit_code = process.wait()
     finally:
         release_device_locks(lock_paths)
+
+    try:
+        with paths.ffmpeg_log_path.open("a", encoding="utf-8") as ffmpeg_log:
+            ffmpeg_log.write(
+                f"=== {datetime.now().astimezone().isoformat()} exit code {exit_code} ===\n"
+            )
+    except OSError:
+        pass
 
     capture_ok = exit_code == 0 or (interrupted and exit_code == 255)
     archive_ok = False
@@ -7091,6 +7295,11 @@ def check_ffmpeg_support(ffmpeg_bin: str) -> tuple[str | None, bool]:
 def validate_source_args(args: argparse.Namespace) -> str | None:
     if is_rtsp_source(args) and not args.rtsp_url.strip():
         return "RTSP source type requires --rtsp-url"
+    if is_record_timelapse(args):
+        if args.timelapse_interval <= 0:
+            return "--timelapse-interval must be greater than zero"
+        if args.timelapse_output_fps <= 0:
+            return "--timelapse-output-fps must be greater than zero"
     return None
 
 
@@ -7300,6 +7509,30 @@ def add_record_arguments(
         help="Burn a wall-clock timestamp into the captured video.",
     )
     parser.add_argument(
+        "--timelapse",
+        dest="record_timelapse",
+        action="store_true",
+        default=False,
+        help=(
+            "Record direct-to-DVR timelapse video instead of normal-speed video. "
+            "Defaults to one frame every 10 seconds at 20 fps playback."
+        ),
+    )
+    parser.add_argument(
+        "--timelapse-interval",
+        type=float,
+        default=DEFAULT_RECORD_TIMELAPSE_INTERVAL,
+        help="Seconds between captured frames for --timelapse recordings.",
+    )
+    parser.add_argument(
+        "--timelapse-output-fps",
+        "--timelapse-fps",
+        dest="timelapse_output_fps",
+        type=float,
+        default=DEFAULT_RECORD_TIMELAPSE_OUTPUT_FPS,
+        help="Playback FPS for --timelapse recordings.",
+    )
+    parser.add_argument(
         "--encoder", default=DEFAULT_ENCODER, help="Video encoder, like h264_nvenc."
     )
     parser.add_argument("--preset", default="fast", help="Encoder preset.")
@@ -7469,6 +7702,30 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=DEFAULT_VIDEO_TIMESTAMP_ENABLED,
         help="Save whether recordings should burn a wall-clock timestamp into the video.",
+    )
+    setup.add_argument(
+        "--timelapse",
+        dest="record_timelapse",
+        action="store_true",
+        default=False,
+        help=(
+            "Save this recording profile as direct-to-DVR timelapse. "
+            "Defaults to one frame every 10 seconds at 20 fps playback."
+        ),
+    )
+    setup.add_argument(
+        "--timelapse-interval",
+        type=float,
+        default=DEFAULT_RECORD_TIMELAPSE_INTERVAL,
+        help="Seconds between captured frames for saved timelapse profiles.",
+    )
+    setup.add_argument(
+        "--timelapse-output-fps",
+        "--timelapse-fps",
+        dest="timelapse_output_fps",
+        type=float,
+        default=DEFAULT_RECORD_TIMELAPSE_OUTPUT_FPS,
+        help="Playback FPS for saved timelapse profiles.",
     )
     setup.add_argument(
         "--encoder",
