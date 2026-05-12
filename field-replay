@@ -5827,7 +5827,7 @@ def run_offline_vision_scan(
                 keepalive=keepalive,
                 repeat_cooldown_seconds=repeat_cooldown_seconds,
                 last_promoted_by_key=last_promoted_by_key,
-                motion_focus=normalized_vision_focus(getattr(args, "vision_focus", None))
+                motion_focus=normalize_vision_focus(getattr(args, "vision_focus", None))
                 == "motion",
             )
             if compare_frames:
@@ -6522,7 +6522,7 @@ def command_vision_live(args: argparse.Namespace) -> int:
                 keepalive=args.keepalive,
                 repeat_cooldown_seconds=args.repeat_cooldown,
                 last_promoted_by_key=last_promoted_by_key,
-                motion_focus=normalized_vision_focus(args.vision_focus) == "motion",
+                motion_focus=normalize_vision_focus(args.vision_focus) == "motion",
             )
             if args.compare_frames:
                 shutil.copy2(
