@@ -6152,6 +6152,7 @@ def run_offline_vision_scan(
     sample_points: Sequence[float],
     annotate_frames: bool,
     frame_filter: str | None = None,
+    motion_focus: bool = False,
     dry_run: bool = False,
 ) -> int:
     runtime_paths = vision_output_paths(output_root)
@@ -6193,10 +6194,16 @@ def run_offline_vision_scan(
                 runtime_paths["scratch_frame"],
                 frame_filter=frame_filter,
             )
+            comparison_frame_path = (
+                previous_sample_frame
+                if compare_frames and previous_sample_frame.exists()
+                else None
+            )
             process_vision_frame(
                 runtime_paths=runtime_paths,
                 session_dir=source.session_dir,
                 frame_path=runtime_paths["scratch_frame"],
+                comparison_frame_path=comparison_frame_path,
                 ffmpeg_bin=ffmpeg_path,
                 annotate_frames=annotate_frames,
                 offset_seconds=offset_seconds,
@@ -6204,15 +6211,14 @@ def run_offline_vision_scan(
                 ollama_host=ollama_host,
                 prompt=(
                     comparison_vision_prompt(prompt)
-                    if compare_frames and previous_sample_frame.exists()
+                    if comparison_frame_path is not None
                     else single_frame_vision_prompt(prompt)
                 ),
                 timeout_seconds=timeout_seconds,
                 keepalive=keepalive,
                 repeat_cooldown_seconds=repeat_cooldown_seconds,
                 last_promoted_by_key=last_promoted_by_key,
-                motion_focus=normalize_vision_focus(getattr(args, "vision_focus", None))
-                == "motion",
+                motion_focus=motion_focus,
             )
             if compare_frames:
                 shutil.copy2(runtime_paths["scratch_frame"], previous_sample_frame)
@@ -6355,6 +6361,7 @@ def command_vision_scan(args: argparse.Namespace) -> int:
         sample_points=sample_points,
         annotate_frames=annotate_frames,
         frame_filter=frame_filter,
+        motion_focus=normalize_vision_focus(getattr(args, "vision_focus", None)) == "motion",
         dry_run=args.dry_run,
     )
 
@@ -6448,6 +6455,7 @@ def command_vision_sweep(args: argparse.Namespace) -> int:
             sample_points=sample_points,
             annotate_frames=annotate_frames,
             frame_filter=variant.frame_filter,
+            motion_focus=normalize_vision_focus(getattr(args, "vision_focus", None)) == "motion",
             dry_run=False,
         )
         summary = summarize_vision_scan_output(variant_output_root)
