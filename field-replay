@@ -37,6 +37,7 @@ CAPTURE_BACKENDS = ("auto", "ffmpeg", "gstreamer-jetson")
 DEFAULT_VIDEO_INPUT_FORMAT = "auto"
 DEFAULT_AUDIO_GAIN_DB = -6.0
 DEFAULT_PLAYER_HWDEC = "auto"
+PLAYER_FALLBACK_LABEL = "mpv/vlc/nvgstplayer/ffplay"
 COMMON_VIDEO_SIZES = ("1920x1080", "1280x720", "1024x576", "640x480")
 COMMON_FRAME_RATES = (30, 25, 15, 10, 5)
 COMMON_VIDEO_INPUT_FORMATS = ("auto", "h264", "mjpeg", "yuyv422", "uyvy422", "nv12")
@@ -1136,8 +1137,10 @@ def choose_player(preferred: str | None) -> str | None:
         preferred_path = Path(preferred).expanduser()
         if preferred_path.is_file():
             return str(preferred_path)
+        if preferred in {"nvgstplayer", "nvgstplayer-1.0"}:
+            return shutil.which("nvgstplayer-1.0") or shutil.which("nvgstplayer")
         return shutil.which(preferred)
-    for name in ("mpv", "vlc", "ffplay", "cvlc"):
+    for name in ("mpv", "vlc", "nvgstplayer-1.0", "nvgstplayer", "ffplay", "cvlc"):
         resolved = shutil.which(name)
         if resolved:
             return resolved
@@ -3744,6 +3747,16 @@ def build_player_command(
     player_hwdec: str | None = DEFAULT_PLAYER_HWDEC,
 ) -> list[str]:
     player_name = Path(player).name
+    if player_name in {"nvgstplayer", "nvgstplayer-1.0"}:
+        command = [
+            player,
+            "-i",
+            target_path.expanduser().resolve(strict=False).as_uri(),
+            "--disable-fullscreen",
+        ]
+        if start_seconds is not None and start_seconds > 0:
+            command.extend(["--start", f"{start_seconds:.1f}"])
+        return command
     if player_name == "ffplay":
         command = [player]
         if start_seconds is not None and start_seconds > 0:
@@ -4960,7 +4973,7 @@ def run_motion_tune_candidate_review(
 ) -> str | None:
     player = choose_player(args.player)
     if not player:
-        requested = args.player or "vlc/mpv/ffplay"
+        requested = args.player or PLAYER_FALLBACK_LABEL
         print(f"player not found: {requested}", file=sys.stderr)
         return None
     try:
@@ -6015,7 +6028,7 @@ def run_record_command(args: argparse.Namespace, *, launch_player: bool = False)
     if launch_player:
         player = choose_player(args.player)
         if not player:
-            requested = args.player or "vlc/mpv/ffplay"
+            requested = args.player or PLAYER_FALLBACK_LABEL
             print(f"player not found: {requested}", file=sys.stderr)
             return 1
 
@@ -7204,7 +7217,7 @@ def run_review_bib_action(
         )
         player = choose_player(args.player)
         if not player:
-            requested = args.player or "vlc/mpv/ffplay"
+            requested = args.player or PLAYER_FALLBACK_LABEL
             print(f"player not found: {requested}", file=sys.stderr)
             return 1
         try:
@@ -7515,7 +7528,7 @@ def command_watch(args: argparse.Namespace) -> int:
 
     player = choose_player(args.player)
     if not player:
-        requested = args.player or "vlc/mpv/ffplay"
+        requested = args.player or PLAYER_FALLBACK_LABEL
         print(f"player not found: {requested}", file=sys.stderr)
         return 1
 
@@ -7778,6 +7791,7 @@ def command_doctor(args: argparse.Namespace) -> int:
     if capture_backend == "gstreamer-jetson":
         resolved_encoder = "nvv4l2h264enc"
     player = choose_player(args.player)
+    jetson_player = shutil.which("nvgstplayer-1.0") or shutil.which("nvgstplayer")
     source_ok, source_status = source_readiness(args)
     if uses_alsa_audio_input(args):
         audio_ok = alsa_device_exists(args.audio_device)
@@ -7791,6 +7805,7 @@ def command_doctor(args: argparse.Namespace) -> int:
     print(f"gst-jetson:{' yes' if jetson_gstreamer_available() else ' no'}")
     if not jetson_gstreamer_available():
         print(f"gst-reason:{' '}{jetson_gstreamer_unavailable_reason()}")
+    print(f"gst-player:{' '}{jetson_player or 'missing'}")
     print(f"video:    {args.video_codec_mode}")
     print(f"backend:  {capture_backend or 'missing'}")
     if backend_error:
@@ -8034,7 +8049,7 @@ def add_record_arguments(
     if include_player_options:
         parser.add_argument(
             "--player",
-            help="Preferred player for go mode. Defaults to mpv, then vlc, ffplay, cvlc.",
+            help="Preferred player for go mode. Defaults to mpv, then vlc, nvgstplayer, ffplay, cvlc.",
         )
         parser.add_argument(
             "--file-caching-ms",
@@ -8072,7 +8087,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--player",
-        help="Preferred player for watch mode. Defaults to mpv, then vlc, ffplay, cvlc.",
+        help="Preferred player for watch mode. Defaults to mpv, then vlc, nvgstplayer, ffplay, cvlc.",
     )
 
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -8245,7 +8260,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     watch.add_argument(
         "--player",
-        help="Preferred player for watch mode. Defaults to mpv, then vlc, ffplay, cvlc.",
+        help="Preferred player for watch mode. Defaults to mpv, then vlc, nvgstplayer, ffplay, cvlc.",
     )
     watch.add_argument(
         "--dry-run", action="store_true", help="Print the player command and exit."
@@ -8686,7 +8701,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     motion_tune.add_argument(
         "--player",
-        help="Preferred player for clip review. Defaults to mpv, then vlc, ffplay, cvlc.",
+        help="Preferred player for clip review. Defaults to mpv, then vlc, nvgstplayer, ffplay, cvlc.",
     )
     motion_tune.add_argument(
         "--pre-roll",
@@ -8778,7 +8793,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     review_bib.add_argument(
         "--player",
-        help="Preferred player for video review. Defaults to mpv, then vlc, ffplay, cvlc.",
+        help="Preferred player for video review. Defaults to mpv, then vlc, nvgstplayer, ffplay, cvlc.",
     )
     review_bib.add_argument(
         "--image-viewer",
@@ -8854,7 +8869,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     doctor.add_argument(
         "--player",
-        help="Preferred player to check. Defaults to mpv, then vlc, ffplay, cvlc.",
+        help="Preferred player to check. Defaults to mpv, then vlc, nvgstplayer, ffplay, cvlc.",
     )
     doctor.add_argument(
         "--encoder",

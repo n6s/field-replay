@@ -89,7 +89,7 @@ What they are for:
 - `mpv`: optional alternate player
 - `vainfo`: checking video acceleration support
 - `usbutils`: identifying USB capture hardware with `lsusb`
-- `gstreamer1.0-tools`: checking and running Jetson hardware encode paths
+- `gstreamer1.0-tools`: checking and running Jetson hardware encode/decode paths
 
 For cleaner Jetson DVR containers, also install the GStreamer plugin sets that provide `h264parse` and `mpegtsmux` when they are not already present on the image.
 
@@ -461,6 +461,20 @@ Use `--capture-backend gstreamer-jetson` to require that path, or `--capture-bac
 If `doctor --no-audio` reports that `/dev/v4l2-nvenc` is missing, the Jetson multimedia encoder device is not exposed to the current system session. Fix the Jetson driver/runtime install or device access first; the GStreamer plugin can be installed while the actual encoder device is still unavailable.
 
 Player launches no longer disable hardware decode globally. The `--player-hwdec auto` default avoids mpv's broken CUDA/NVDEC and V4L2 M2M autodetect paths on Jetson builds, and uses `auto-safe` on non-Jetson systems. You can still force a player mode with `--player-hwdec`, but recording hardware acceleration is independent of playback decode.
+
+On Jetson Linux r36.5, Ubuntu's stock mpv/FFmpeg can advertise `nvdec` and `v4l2m2m-copy` while still failing at playback time: `nvdec` expects desktop CUVID (`libnvcuvid.so.1`), and `v4l2m2m-copy` does not use NVIDIA's GStreamer `nvv4l2decoder` path. For the mpv live-minus shortcut workflow, keep using mpv with the default `--player-hwdec auto`; on Jetson that intentionally resolves to software decode so the player opens cleanly:
+
+```bash
+./field-replay watch --player mpv
+```
+
+When hardware decode matters more than the mpv shortcut, use NVIDIA's GStreamer player explicitly:
+
+```bash
+./field-replay watch --player nvgstplayer
+```
+
+`nvgstplayer` is provided by `nvidia-l4t-gstreamer` and uses the same Jetson multimedia decoder stack as `nvv4l2decoder`. Test it with your event workflow before relying on it live; it does not currently replace the bundled mpv live-minus shortcut.
 
 For cameras that already expose H.264 on a dedicated V4L2 node, you can save a profile with:
 
