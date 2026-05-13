@@ -863,6 +863,21 @@ def gst_caps_fraction(framerate: int | float) -> str:
     return f"{int(round(float(framerate)))}/1"
 
 
+def gst_video_caps(args: argparse.Namespace, *, media_type: str, format_name: str | None = None) -> str:
+    width, height = args.video_size.split("x", 1)
+    fields = [media_type]
+    if format_name:
+        fields.append(f"format={format_name}")
+    fields.extend(
+        [
+            f"width={width}",
+            f"height={height}",
+            f"framerate={gst_caps_fraction(args.framerate)}",
+        ]
+    )
+    return ",".join(fields)
+
+
 def gst_v4l2_input_chain(args: argparse.Namespace) -> list[str]:
     caps_fps = gst_caps_fraction(args.framerate)
     caps_size = f"width={args.video_size.split('x', 1)[0]},height={args.video_size.split('x', 1)[1]}"
@@ -882,6 +897,8 @@ def gst_v4l2_input_chain(args: argparse.Namespace) -> list[str]:
                 "!",
                 "videoconvert",
                 "!",
+                gst_video_caps(args, media_type="video/x-raw"),
+                "!",
             ]
         )
     elif input_format == "h264":
@@ -900,7 +917,7 @@ def gst_v4l2_input_chain(args: argparse.Namespace) -> list[str]:
                 "!",
                 "nvvidconv",
                 "!",
-                "video/x-raw,format=I420",
+                gst_video_caps(args, media_type="video/x-raw", format_name="I420"),
                 "!",
             ]
         )
@@ -915,6 +932,8 @@ def gst_v4l2_input_chain(args: argparse.Namespace) -> list[str]:
                 f"video/x-raw,format={raw_format},{caps_size},framerate={caps_fps}",
                 "!",
                 "videoconvert",
+                "!",
+                gst_video_caps(args, media_type="video/x-raw"),
                 "!",
             ]
         )
@@ -931,9 +950,14 @@ def gst_jetson_encoded_video_chain(args: argparse.Namespace) -> list[str]:
             [
                 "clockoverlay",
                 "time-format=%Y-%m-%d %H:%M:%S",
+                "auto-resize=false",
+                "font-desc=Sans 24",
                 "shaded-background=true",
+                "shading-value=153",
                 "halignment=left",
                 "valignment=bottom",
+                "xpad=20",
+                "ypad=20",
                 "!",
             ]
         )
@@ -941,11 +965,15 @@ def gst_jetson_encoded_video_chain(args: argparse.Namespace) -> list[str]:
         [
             "videoconvert",
             "!",
-            "video/x-raw,format=NV12",
+            gst_video_caps(args, media_type="video/x-raw", format_name="NV12"),
             "!",
             "nvvidconv",
             "!",
-            "video/x-raw(memory:NVMM),format=NV12",
+            gst_video_caps(
+                args,
+                media_type="video/x-raw(memory:NVMM)",
+                format_name="NV12",
+            ),
             "!",
             "nvv4l2h264enc",
             f"bitrate={bitrate}",
@@ -3701,8 +3729,9 @@ def resolve_mpv_hwdec(player_hwdec: str | None) -> str:
     if requested != "auto":
         return requested
     if is_tegra_system():
-        if Path("/dev/v4l2-nvdec").exists():
-            return "v4l2m2m-copy"
+        # Jetson mpv/FFmpeg builds often advertise CUDA/NVDEC or V4L2 M2M
+        # decode paths that fail at playback time. Keep recording hardware
+        # accelerated, but avoid noisy playback autodetect failures by default.
         return "no"
     return "auto-safe"
 

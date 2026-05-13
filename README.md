@@ -460,7 +460,7 @@ Use `--capture-backend gstreamer-jetson` to require that path, or `--capture-bac
 
 If `doctor --no-audio` reports that `/dev/v4l2-nvenc` is missing, the Jetson multimedia encoder device is not exposed to the current system session. Fix the Jetson driver/runtime install or device access first; the GStreamer plugin can be installed while the actual encoder device is still unavailable.
 
-Player launches no longer disable hardware decode globally. The `--player-hwdec auto` default resolves to Jetson's `v4l2m2m-copy` path when `/dev/v4l2-nvdec` is available, avoids mpv's broken CUDA/NVDEC autodetect on Jetson builds, and uses `auto-safe` on non-Jetson systems. Use `--player-hwdec no` when diagnosing playback problems.
+Player launches no longer disable hardware decode globally. The `--player-hwdec auto` default avoids mpv's broken CUDA/NVDEC and V4L2 M2M autodetect paths on Jetson builds, and uses `auto-safe` on non-Jetson systems. You can still force a player mode with `--player-hwdec`, but recording hardware acceleration is independent of playback decode.
 
 For cameras that already expose H.264 on a dedicated V4L2 node, you can save a profile with:
 
