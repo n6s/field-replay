@@ -311,6 +311,92 @@ For tuning motion sensitivity after a live test, use:
 
 That command can run a short tail calibration, open triggered or near-miss clips with a `2s` preroll, record `good` / `false-positive` / `missed` feedback, and suggest updated motion settings for the current vision profile.
 
+For fast vehicles or other sub-second pass-through events, start with a dense
+offline motion scan instead of the normal vision cadence:
+
+```bash
+./field-replay motion-setup
+```
+
+That creates a reusable motion profile, so field use can be as short as:
+
+```bash
+./field-replay motion-scan /home/roger/recordings/NORC-NS-narrow.mp4
+```
+
+For a running session, start the live follower in another terminal:
+
+```bash
+./field-replay motion-live
+```
+
+`motion-live` follows the active `timeshift.ts` a little behind live, promotes
+motion candidates as they happen, and saves source-resolution evidence frames
+under `motion-live/frames/`.
+
+To create a Jetson fast-pass profile non-interactively:
+
+```bash
+./field-replay motion-setup --no-interactive \
+  --motion-profile jetson-fast-pass \
+  --motion-engine auto \
+  --sample-interval 0.05 \
+  --motion-size 320x180 \
+  --motion-detect-mode smart \
+  --motion-threshold 6 \
+  --motion-min-changed-pct 3
+```
+
+To force a one-off scan with explicit settings:
+
+```bash
+./field-replay motion-scan /home/roger/recordings/NORC-NS-narrow.mp4 \
+  --motion-engine gstreamer-jetson \
+  --sample-interval 0.05 \
+  --motion-size 320x180 \
+  --motion-zone B2:D4 \
+  --motion-threshold 8 \
+  --motion-min-changed-pct 1.5
+```
+
+`motion-scan` writes grouped candidate windows to `motion-scan/events.jsonl`
+and a human-readable `events.log`. Both `motion-scan` and `motion-live` also
+save several source-resolution frames around each candidate peak and record
+those paths on the event. Treat those windows and frames as the cheap trigger
+stage for heavier number-reading passes: OCR at source resolution, YOLO vehicle
+cropping, or a Jetson-native DeepStream/TensorRT pipeline. On Jetson, this keeps
+the reliable DVR recording separate from inference and lets NVIDIA-accelerated
+detectors spend work only on road-constrained, high-motion windows.
+
+`--motion-engine auto` prefers Jetson GStreamer decode when `/dev/v4l2-nvdec`,
+`nvv4l2decoder`, `nvvidconv`, Python GStreamer bindings, and `appsink` are
+available. That path decodes once through NVDEC, crops/scales to a small GRAY8
+motion plane, and only brings the tiny motion frame back to Python. If Jetson
+decode is unavailable, `auto` falls back to the slower FFmpeg sampler and prints
+the reason. Use `./field-replay doctor --no-audio` to check `gst-decode`,
+`gst-jetson`, and `deepstream` readiness before a field run.
+
+The default goal is a single smart profile, not per-camera threshold tuning.
+`--motion-detect-mode smart` keeps a rolling baseline of normal scene motion and
+promotes samples that stand out from that baseline, while retaining conservative
+minimum thresholds. Triggered fragments with overlapping evidence windows are
+merged when their raw hit timing and peaks indicate the same pass, before they
+are shown to the operator. The saved `jetson-motion` profile
+uses a full-frame `320x180` motion plane at `0.05s` cadence, with `mean>=6` and
+`changed>=3%` as its floor. It is intended as the normal operator choice for
+both wide approach views and close fast-pass views.
+
+Current note: the prerecorded `motion-scan` path can use the Jetson streaming
+decoder. The live follower tails a growing `timeshift.ts` with timed FFmpeg
+frame grabs so it can work against an active recording immediately; a future
+version should move that live path closer to a persistent GStreamer/DeepStream
+pipeline.
+
+Motion profiles are stored with the other operator profiles in
+`~/.config/field-replay/config.json`. Keep the generic `jetson-motion` profile
+full-frame unless you have a very predictable road, chute, lane, or doorway and
+want to save a tighter zone for that venue.
+
 For custom prompt experiments, the vision parser accepts classic one-frame
 responses:
 

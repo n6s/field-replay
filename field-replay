@@ -57,6 +57,15 @@ DEFAULT_MOTION_HOLD = 4.0
 DEFAULT_MOTION_PIXEL_DELTA = 20
 DEFAULT_MOTION_ZONE_GRID = 4
 DEFAULT_MOTION_PREVIEW_SIZE = "960x540"
+DEFAULT_MOTION_SCAN_INTERVAL = 0.05
+DEFAULT_MOTION_SCAN_GROUP_GAP = 0.5
+DEFAULT_MOTION_SCAN_PRE_ROLL = 0.25
+DEFAULT_MOTION_SCAN_POST_ROLL = 0.5
+DEFAULT_MOTION_EVIDENCE_FRAMES = 5
+DEFAULT_MOTION_EVIDENCE_FRAME_STEP = 0.1
+DEFAULT_MOTION_LIVE_TAIL_OFFSET = 2.0
+MOTION_DETECT_MODES = ("smart", "fixed")
+MOTION_SCAN_ENGINES = ("auto", "gstreamer-jetson", "ffmpeg")
 DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
 DEFAULT_MPV_CONFIG_DIR = Path("~/.config/mpv").expanduser()
 DEFAULT_VISION_SWEEP_VARIANTS = (
@@ -349,17 +358,18 @@ def bundled_mpv_files() -> list[tuple[Path, Path]]:
 
 def load_config(config_path: Path) -> dict:
     if not config_path.exists():
-        return {"profiles": {}, "vision_profiles": {}}
+        return {"profiles": {}, "vision_profiles": {}, "motion_profiles": {}}
 
     try:
         payload = json.loads(config_path.read_text())
     except (OSError, json.JSONDecodeError):
-        return {"profiles": {}, "vision_profiles": {}}
+        return {"profiles": {}, "vision_profiles": {}, "motion_profiles": {}}
 
     if not isinstance(payload, dict):
-        return {"profiles": {}, "vision_profiles": {}}
+        return {"profiles": {}, "vision_profiles": {}, "motion_profiles": {}}
     payload.setdefault("profiles", {})
     payload.setdefault("vision_profiles", {})
+    payload.setdefault("motion_profiles", {})
     return payload
 
 
@@ -807,6 +817,17 @@ def gst_element_available(element: str) -> bool:
     return result.returncode == 0
 
 
+def python_gst_available() -> bool:
+    try:
+        import gi  # type: ignore
+
+        gi.require_version("Gst", "1.0")
+        from gi.repository import Gst  # noqa: F401
+    except (ImportError, ValueError):
+        return False
+    return True
+
+
 def jetson_gstreamer_available() -> bool:
     return bool(
         shutil.which("gst-launch-1.0")
@@ -837,6 +858,47 @@ def jetson_gstreamer_unavailable_reason() -> str:
         if not gst_element_available(element):
             return f"GStreamer element {element} is missing"
     return "Jetson GStreamer encoder is unavailable"
+
+
+def jetson_gstreamer_decode_available() -> bool:
+    return bool(
+        shutil.which("gst-inspect-1.0")
+        and python_gst_available()
+        and Path("/dev/v4l2-nvdec").exists()
+        and gst_element_available("nvv4l2decoder")
+        and gst_element_available("nvvidconv")
+        and gst_element_available("appsink")
+    )
+
+
+def jetson_gstreamer_decode_unavailable_reason() -> str:
+    if not shutil.which("gst-inspect-1.0"):
+        return "gst-inspect-1.0 is missing"
+    if not python_gst_available():
+        return "Python GStreamer bindings are missing"
+    if not Path("/dev/v4l2-nvdec").exists():
+        return "Jetson decoder device /dev/v4l2-nvdec is missing"
+    for element in ("nvv4l2decoder", "nvvidconv", "appsink"):
+        if not gst_element_available(element):
+            return f"GStreamer element {element} is missing"
+    return "Jetson GStreamer decoder is unavailable"
+
+
+def deepstream_available() -> tuple[bool, str]:
+    deepstream_path = shutil.which("deepstream-app")
+    if not deepstream_path:
+        return False, "deepstream-app is missing"
+    result = subprocess.run(
+        [deepstream_path, "--version-all"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode == 0:
+        first_line = result.stdout.splitlines()[0] if result.stdout.splitlines() else "ok"
+        return True, first_line
+    detail = (result.stderr or result.stdout).strip().splitlines()
+    return False, detail[0] if detail else f"deepstream-app exited {result.returncode}"
 
 
 def parse_gst_bitrate(value: str | None, default_bps: int = 8_000_000) -> int:
@@ -2286,6 +2348,243 @@ def edit_existing_vision_profile_interactively(
         print()
 
 
+def motion_profile_from_args(args: argparse.Namespace) -> dict:
+    return {
+        "motion_detect_mode": args.motion_detect_mode,
+        "motion_engine": args.motion_engine,
+        "sample_interval": args.sample_interval,
+        "motion_size": args.motion_size,
+        "motion_threshold": args.motion_threshold,
+        "motion_min_changed_pct": args.motion_min_changed_pct,
+        "motion_zone": args.motion_zone,
+        "group_gap": args.group_gap,
+        "pre_roll": args.pre_roll,
+        "post_roll": args.post_roll,
+        "evidence_frames": args.evidence_frames,
+        "evidence_frame_step": args.evidence_frame_step,
+    }
+
+
+def motion_profile_summary_lines(profile_name: str, profile: dict) -> list[str]:
+    return [
+        f"Motion profile: {profile_name}",
+        f"  Detect:   {profile.get('motion_detect_mode', 'smart')}",
+        f"  Engine:   {profile.get('motion_engine', 'auto')}",
+        f"  Cadence:  {profile.get('sample_interval', DEFAULT_MOTION_SCAN_INTERVAL):g}s",
+        f"  Plane:    {profile.get('motion_size', DEFAULT_MOTION_SIZE)}",
+        f"  Zone:     {motion_zone_label(profile.get('motion_zone'))}",
+        (
+            "  Trigger:  "
+            f"mean>={profile.get('motion_threshold', DEFAULT_MOTION_THRESHOLD):g}, "
+            f"changed>={profile.get('motion_min_changed_pct', DEFAULT_MOTION_MIN_CHANGED_PCT):g}%"
+        ),
+        (
+            "  Window:   "
+            f"gap<={profile.get('group_gap', DEFAULT_MOTION_SCAN_GROUP_GAP):g}s, "
+            f"pre={profile.get('pre_roll', DEFAULT_MOTION_SCAN_PRE_ROLL):g}s, "
+            f"post={profile.get('post_roll', DEFAULT_MOTION_SCAN_POST_ROLL):g}s"
+        ),
+        (
+            "  Evidence: "
+            f"{profile.get('evidence_frames', DEFAULT_MOTION_EVIDENCE_FRAMES)} frames, "
+            f"step={profile.get('evidence_frame_step', DEFAULT_MOTION_EVIDENCE_FRAME_STEP):g}s"
+        ),
+    ]
+
+
+def motion_profile_menu_label(profile_name: str, profile: dict) -> str:
+    details = [
+        profile.get("motion_detect_mode", "smart"),
+        profile.get("motion_engine", "auto"),
+        f"{profile.get('sample_interval', DEFAULT_MOTION_SCAN_INTERVAL):g}s",
+        profile.get("motion_size", DEFAULT_MOTION_SIZE),
+        f"zone {motion_zone_label(profile.get('motion_zone'))}",
+    ]
+    return f"{profile_name} ({'; '.join(details)})"
+
+
+def apply_motion_profile(args: argparse.Namespace, profile: dict) -> None:
+    args.motion_detect_mode = profile.get(
+        "motion_detect_mode", args.motion_detect_mode
+    )
+    args.motion_engine = profile.get("motion_engine", args.motion_engine)
+    args.sample_interval = profile.get("sample_interval", args.sample_interval)
+    args.motion_size = profile.get("motion_size", args.motion_size)
+    args.motion_threshold = profile.get("motion_threshold", args.motion_threshold)
+    args.motion_min_changed_pct = profile.get(
+        "motion_min_changed_pct", args.motion_min_changed_pct
+    )
+    args.motion_zone = profile.get("motion_zone", args.motion_zone)
+    args.group_gap = profile.get("group_gap", args.group_gap)
+    args.pre_roll = profile.get("pre_roll", args.pre_roll)
+    args.post_roll = profile.get("post_roll", args.post_roll)
+    args.evidence_frames = profile.get("evidence_frames", args.evidence_frames)
+    args.evidence_frame_step = profile.get(
+        "evidence_frame_step", args.evidence_frame_step
+    )
+
+
+def choose_motion_profile(
+    config: dict,
+    preferred_profile: str | None = None,
+    *,
+    allow_manual: bool = True,
+) -> str | None:
+    profiles = config.get("motion_profiles", {})
+    if not profiles and not allow_manual:
+        return None
+    options = [
+        (name, motion_profile_menu_label(name, profile))
+        for name, profile in sorted(profiles.items())
+    ]
+    if allow_manual:
+        options.append(("__manual__", "Manual / one-time motion setup"))
+    default_value = preferred_profile or config.get("last_motion_profile")
+    if default_value not in profiles:
+        default_value = "__manual__" if allow_manual else (options[0][0] if options else None)
+    print("Choose a motion setup")
+    return prompt_menu("", options, default_value=default_value)
+
+
+def configure_motion_profile_interactively(
+    args: argparse.Namespace,
+    config: dict,
+    *,
+    ask_save: bool = True,
+) -> str | None:
+    print()
+    args.motion_detect_mode = prompt_menu(
+        "Motion detect mode",
+        [
+            ("smart", "Smart - adapt to the scene baseline"),
+            ("fixed", "Fixed - use exact thresholds"),
+        ],
+        default_value=args.motion_detect_mode,
+    ) or args.motion_detect_mode
+    args.motion_engine = prompt_menu(
+        "Motion engine",
+        [
+            ("auto", "Auto - prefer Jetson GStreamer, fall back to FFmpeg"),
+            ("gstreamer-jetson", "Jetson GStreamer - require NVDEC/VIC path"),
+            ("ffmpeg", "FFmpeg - portable fallback"),
+        ],
+        default_value=args.motion_engine,
+    ) or args.motion_engine
+    args.sample_interval = prompt_float(
+        "Motion sample cadence (seconds)", args.sample_interval
+    )
+    args.motion_size = prompt_text("Motion plane size WIDTHxHEIGHT", args.motion_size)
+    args.motion_zone = prompt_optional_text(
+        "Motion zone like B2:D4 (blank for full frame)", args.motion_zone
+    )
+    args.motion_threshold = prompt_float(
+        "Motion mean-difference threshold", args.motion_threshold
+    )
+    args.motion_min_changed_pct = prompt_float(
+        "Motion minimum changed percent", args.motion_min_changed_pct
+    )
+    args.group_gap = prompt_float("Candidate grouping gap (seconds)", args.group_gap)
+    args.pre_roll = prompt_float("Candidate pre-roll (seconds)", args.pre_roll)
+    args.post_roll = prompt_float("Candidate post-roll (seconds)", args.post_roll)
+    args.evidence_frames = int(
+        prompt_float("Evidence frames per candidate", float(args.evidence_frames))
+    )
+    args.evidence_frame_step = prompt_float(
+        "Evidence frame spacing (seconds)", args.evidence_frame_step
+    )
+
+    print()
+    for line in motion_profile_summary_lines("preview", motion_profile_from_args(args)):
+        print(line.replace("Motion profile: preview", "Motion summary"))
+    if not ask_save:
+        return None
+    if not prompt_yes_no("Save this motion setup as a reusable profile?", default=True):
+        return None
+    return ensure_profile_name(config)
+
+
+def edit_existing_motion_profile_interactively(
+    args: argparse.Namespace,
+    config: dict,
+    profile_name: str,
+) -> None:
+    print()
+    print(f"Editing motion profile '{profile_name}'")
+    configure_motion_profile_interactively(args, config, ask_save=False)
+    if prompt_yes_no(
+        f"Update saved motion profile '{profile_name}' with these settings?",
+        default=True,
+    ):
+        motion_profiles = config.get("motion_profiles", {})
+        motion_profiles[profile_name] = motion_profile_from_args(args)
+        config["motion_profiles"] = motion_profiles
+        config["last_motion_profile"] = profile_name
+        save_config(args.config_file.expanduser(), config)
+        print(f"Updated motion profile: {profile_name}")
+        print()
+
+
+def command_motion_setup(args: argparse.Namespace) -> int:
+    config_path = args.config_file.expanduser()
+    config = load_config(config_path)
+    motion_profiles = config.get("motion_profiles", {})
+    selected_profile = args.motion_profile
+
+    if interactive_mode_enabled(args):
+        if motion_profiles:
+            selected_profile = choose_motion_profile(
+                config,
+                preferred_profile=args.motion_profile,
+                allow_manual=True,
+            )
+        if selected_profile and selected_profile != "__manual__" and selected_profile in motion_profiles:
+            apply_motion_profile(args, motion_profiles[selected_profile])
+            if not prompt_yes_no(
+                f"Edit saved motion profile '{selected_profile}'?",
+                default=True,
+            ):
+                for line in motion_profile_summary_lines(
+                    selected_profile, motion_profiles[selected_profile]
+                ):
+                    print(line)
+                config["last_motion_profile"] = selected_profile
+                save_config(config_path, config)
+                return 0
+            edit_existing_motion_profile_interactively(args, config, selected_profile)
+            return 0
+        created_profile = configure_motion_profile_interactively(args, config)
+        if created_profile:
+            motion_profiles[created_profile] = motion_profile_from_args(args)
+            config["motion_profiles"] = motion_profiles
+            config["last_motion_profile"] = created_profile
+            save_config(config_path, config)
+            print(f"Saved motion profile: {created_profile}")
+        return 0
+
+    if not args.dry_run and not selected_profile:
+        print(
+            "motion-setup --no-interactive requires --motion-profile for the saved profile name",
+            file=sys.stderr,
+        )
+        return 1
+
+    for line in motion_profile_summary_lines(
+        selected_profile or "preview", motion_profile_from_args(args)
+    ):
+        print(line)
+    if args.dry_run:
+        return 0
+    if not selected_profile:
+        print("motion profile name is required", file=sys.stderr)
+        return 1
+    motion_profiles[selected_profile] = motion_profile_from_args(args)
+    config["motion_profiles"] = motion_profiles
+    config["last_motion_profile"] = selected_profile
+    save_config(config_path, config)
+    print(f"Saved motion profile: {selected_profile}")
+    return 0
+
+
 def profile_from_args(args: argparse.Namespace) -> dict:
     return {
         "source_type": args.source_type,
@@ -2859,6 +3158,8 @@ def evidence_event_sources_for_session(session_dir: Path) -> list[tuple[str, Pat
     sources = [
         ("vision-scan", session_dir / "vision-scan" / "events.jsonl"),
         ("vision-live", session_dir / "vision-live" / "events.jsonl"),
+        ("motion-scan", session_dir / "motion-scan" / "events.jsonl"),
+        ("motion-live", session_dir / "motion-live" / "events.jsonl"),
     ]
     seen_paths = {path for _, path in sources}
     for scan_dir in sorted(session_dir.glob("vision-scan-*")):
@@ -3289,6 +3590,57 @@ def probe_media_duration(ffmpeg_bin: str, source_path: Path) -> float | None:
         return float(result.stdout.strip())
     except ValueError:
         return None
+
+
+def probe_media_video_info(ffmpeg_bin: str, source_path: Path) -> dict:
+    ffprobe_bin = "ffprobe"
+    ffmpeg_path = shutil.which(ffmpeg_bin)
+    if ffmpeg_path:
+        ffprobe_bin = str(Path(ffmpeg_path).with_name("ffprobe"))
+    ffprobe_path = shutil.which(ffprobe_bin) or (
+        ffprobe_bin if Path(ffprobe_bin).exists() else None
+    )
+    if not ffprobe_path:
+        return {}
+
+    result = subprocess.run(
+        [
+            ffprobe_path,
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_name,width,height,avg_frame_rate,r_frame_rate",
+            "-of",
+            "json",
+            str(source_path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return {}
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return {}
+    streams = payload.get("streams")
+    if not streams:
+        return {}
+    stream = streams[0]
+    fps = None
+    for key in ("avg_frame_rate", "r_frame_rate"):
+        fps = parse_frame_rate(stream.get(key))
+        if fps and fps > 0:
+            break
+    return {
+        "codec_name": stream.get("codec_name"),
+        "width": stream.get("width"),
+        "height": stream.get("height"),
+        "frame_rate": fps,
+    }
 
 
 def parse_frame_rate(value: str | None) -> float | None:
@@ -4490,7 +4842,7 @@ def live_sample_offset(
     sample_interval: float,
 ) -> float:
     available_offset = max(duration_seconds - max(tail_offset, 0.0), 0.0)
-    interval = max(sample_interval, 0.1)
+    interval = max(sample_interval, 0.01)
     return int(available_offset / interval) * interval
 
 
@@ -4794,6 +5146,1247 @@ def group_motion_records_into_candidates(
         )
         for group in groups
     ]
+
+
+def motion_scan_output_paths(output_root: Path) -> dict[str, Path]:
+    return {
+        "root": output_root,
+        "frames_dir": output_root / "frames",
+        "events_jsonl": output_root / "events.jsonl",
+        "events_log": output_root / "events.log",
+        "debug_log": output_root / "motion-debug.jsonl",
+        "summary_json": output_root / "summary.json",
+        "summary_text": output_root / "summary.txt",
+    }
+
+
+def motion_scan_record_to_gate(record: dict) -> dict:
+    return {
+        "zone": record.get("zone"),
+        "mean_diff": record.get("mean_diff"),
+        "changed_pct": record.get("changed_pct"),
+        "reason": record.get("reason"),
+    }
+
+
+def build_motion_scan_candidate(
+    records: Sequence[dict],
+    *,
+    source_path: Path,
+    motion_threshold: float,
+    min_changed_pct: float,
+    pre_roll: float,
+    post_roll: float,
+    duration_seconds: float,
+) -> dict:
+    wrapped_records = [
+        {
+            "t": record.get("t"),
+            "motion_gate": motion_scan_record_to_gate(record),
+        }
+        for record in records
+    ]
+    candidate = build_motion_candidate(
+        wrapped_records,
+        kind="motion",
+        current_threshold=motion_threshold,
+        min_changed_pct=min_changed_pct,
+    )
+    candidate["source"] = str(source_path)
+    candidate["raw_t_start"] = float(candidate["t_start"])
+    candidate["raw_t_end"] = float(candidate["t_end"])
+    candidate["t_start"] = max(float(candidate["t_start"]) - pre_roll, 0.0)
+    candidate["t_end"] = min(float(candidate["t_end"]) + post_roll, duration_seconds)
+    candidate["duration"] = round(
+        max(float(candidate["t_end"]) - float(candidate["t_start"]), 0.0), 3
+    )
+    return candidate
+
+
+def group_motion_scan_records(
+    records: Sequence[dict],
+    *,
+    source_path: Path,
+    motion_threshold: float,
+    min_changed_pct: float,
+    group_gap_seconds: float,
+    pre_roll: float,
+    post_roll: float,
+    duration_seconds: float,
+) -> list[dict]:
+    sorted_records = sorted(records, key=event_sort_key)
+    if not sorted_records:
+        return []
+    groups: list[list[dict]] = []
+    current_group: list[dict] = [sorted_records[0]]
+    for record in sorted_records[1:]:
+        previous_time = float(current_group[-1].get("t") or 0.0)
+        current_time = float(record.get("t") or 0.0)
+        if (current_time - previous_time) <= group_gap_seconds:
+            current_group.append(record)
+        else:
+            groups.append(current_group)
+            current_group = [record]
+    groups.append(current_group)
+    return [
+        build_motion_scan_candidate(
+            group,
+            source_path=source_path,
+            motion_threshold=motion_threshold,
+            min_changed_pct=min_changed_pct,
+            pre_roll=pre_roll,
+            post_roll=post_roll,
+            duration_seconds=duration_seconds,
+        )
+        for group in groups
+    ]
+
+
+def merge_motion_scan_candidates(
+    candidates: Sequence[dict],
+    *,
+    merge_gap_seconds: float,
+    duration_seconds: float,
+) -> list[dict]:
+    sorted_candidates = sorted(candidates, key=lambda item: float(item.get("t_start") or 0.0))
+    if not sorted_candidates:
+        return []
+
+    merged: list[dict] = [dict(sorted_candidates[0])]
+    for candidate in sorted_candidates[1:]:
+        current = merged[-1]
+        current_raw_end = float(current.get("raw_t_end") or current.get("t_end") or 0.0)
+        candidate_raw_start = float(
+            candidate.get("raw_t_start") or candidate.get("t_start") or 0.0
+        )
+        current_peak = float(current.get("t") or 0.0)
+        candidate_peak = float(candidate.get("t") or 0.0)
+        close_raw_gap = candidate_raw_start <= current_raw_end + max(
+            merge_gap_seconds,
+            0.0,
+        )
+        close_peak_gap = abs(candidate_peak - current_peak) <= max(
+            merge_gap_seconds * 2.0,
+            1.0,
+        )
+        if not close_raw_gap and not close_peak_gap:
+            merged.append(dict(candidate))
+            continue
+
+        current_score = float(current.get("score") or 0.0)
+        candidate_score = float(candidate.get("score") or 0.0)
+        peak = candidate if candidate_score > current_score else current
+        current["t"] = float(peak.get("t") or 0.0)
+        current["w"] = peak.get("w")
+        current["zone"] = peak.get("zone")
+        current["mean_diff"] = peak.get("mean_diff")
+        current["changed_pct"] = peak.get("changed_pct")
+        current["reason"] = peak.get("reason")
+        current["score"] = max(current_score, candidate_score)
+        current["raw_t_start"] = min(
+            float(current.get("raw_t_start") or current.get("t_start") or 0.0),
+            candidate_raw_start,
+        )
+        current["raw_t_end"] = max(
+            current_raw_end,
+            float(candidate.get("raw_t_end") or candidate.get("t_end") or 0.0),
+        )
+        current["t_start"] = max(
+            min(
+                float(current.get("t_start") or 0.0),
+                float(candidate.get("t_start") or 0.0),
+            ),
+            0.0,
+        )
+        current["t_end"] = min(
+            max(
+                float(current.get("t_end") or 0.0),
+                float(candidate.get("t_end") or 0.0),
+            ),
+            duration_seconds,
+        )
+        current["duration"] = round(
+            max(float(current["t_end"]) - float(current["t_start"]), 0.0),
+            3,
+        )
+        current["sample_count"] = int(current.get("sample_count") or 0) + int(
+            candidate.get("sample_count") or 0
+        )
+        current["merged_count"] = int(current.get("merged_count") or 1) + int(
+            candidate.get("merged_count") or 1
+        )
+    return merged
+
+
+def motion_evidence_offsets(
+    candidate: dict,
+    *,
+    frame_count: int,
+    frame_step: float,
+    duration_seconds: float,
+) -> list[float]:
+    frame_count = max(0, int(frame_count))
+    if frame_count <= 0:
+        return []
+    peak = float(candidate.get("t") or 0.0)
+    if frame_count == 1:
+        return [min(max(peak, 0.0), duration_seconds)]
+    half = (frame_count - 1) / 2.0
+    offsets = []
+    for index in range(frame_count):
+        offset = peak + (index - half) * max(frame_step, 0.001)
+        offset = min(max(offset, 0.0), duration_seconds)
+        offsets.append(round(offset, 3))
+    unique: list[float] = []
+    seen: set[float] = set()
+    for offset in offsets:
+        if offset in seen:
+            continue
+        unique.append(offset)
+        seen.add(offset)
+    return unique
+
+
+def save_motion_evidence_frames(
+    *,
+    ffmpeg_path: str,
+    source_path: Path,
+    session_dir: Path,
+    runtime_paths: dict[str, Path],
+    candidate_label: str,
+    candidate: dict,
+    frame_count: int,
+    frame_step: float,
+    duration_seconds: float,
+) -> tuple[str | None, list[str]]:
+    offsets = motion_evidence_offsets(
+        candidate,
+        frame_count=frame_count,
+        frame_step=frame_step,
+        duration_seconds=duration_seconds,
+    )
+    if not offsets:
+        return None, []
+    ensure_directory(runtime_paths["frames_dir"])
+    frame_references: list[str] = []
+    peak_reference: str | None = None
+    peak_offset = round(float(candidate.get("t") or 0.0), 3)
+    nearest_peak_delta: float | None = None
+    for index, offset_seconds in enumerate(offsets, start=1):
+        frame_path = runtime_paths["frames_dir"] / (
+            f"{candidate_label}-{index:02d}-{int(round(offset_seconds * 1000)):09d}.jpg"
+        )
+        try:
+            extract_frame_at_time(
+                ffmpeg_path,
+                source_path,
+                offset_seconds,
+                frame_path,
+            )
+        except RuntimeError:
+            continue
+        reference = relative_to_session(frame_path, session_dir)
+        frame_references.append(reference)
+        peak_delta = abs(offset_seconds - peak_offset)
+        if nearest_peak_delta is None or peak_delta < nearest_peak_delta:
+            nearest_peak_delta = peak_delta
+            peak_reference = reference
+    return peak_reference, frame_references
+
+
+def write_motion_candidate_event(
+    *,
+    ffmpeg_path: str,
+    source: ExportSource,
+    runtime_paths: dict[str, Path],
+    candidate: dict,
+    candidate_index: int,
+    event_source: str,
+    frame_count: int,
+    frame_step: float,
+    duration_seconds: float,
+) -> dict:
+    candidate_label = f"motion-{candidate_index:04d}"
+    peak_frame_reference, frame_references = save_motion_evidence_frames(
+        ffmpeg_path=ffmpeg_path,
+        source_path=source.source_path,
+        session_dir=source.session_dir,
+        runtime_paths=runtime_paths,
+        candidate_label=candidate_label,
+        candidate=candidate,
+        frame_count=frame_count,
+        frame_step=frame_step,
+        duration_seconds=duration_seconds,
+    )
+    payload = {
+        "t": round(float(candidate["t"]), 3),
+        "k": "motion",
+        "l": candidate_label,
+        "s": event_source,
+        "t_start": round(float(candidate["t_start"]), 3),
+        "t_end": round(float(candidate["t_end"]), 3),
+        "duration": candidate["duration"],
+        "zone": candidate.get("zone"),
+        "mean_diff": candidate.get("mean_diff"),
+        "changed_pct": candidate.get("changed_pct"),
+        "sample_count": candidate.get("sample_count"),
+        "score": round(float(candidate.get("score") or 0.0), 3),
+    }
+    if candidate.get("merged_count"):
+        payload["merged_count"] = candidate.get("merged_count")
+    if peak_frame_reference:
+        payload["f"] = peak_frame_reference
+    if frame_references:
+        payload["frames"] = frame_references
+    append_jsonl(runtime_paths["events_jsonl"], payload)
+    append_text_line(
+        runtime_paths["events_log"],
+        (
+            f"{payload['l']} {format_duration(payload['t_start'])}-"
+            f"{format_duration(payload['t_end'])} "
+            f"peak {format_duration(payload['t'])} "
+            f"mean {float(payload['mean_diff'] or 0.0):.2f}, "
+            f"changed {float(payload['changed_pct'] or 0.0):.2f}%"
+            + (f", frame {payload['f']}" if payload.get("f") else "")
+        ),
+    )
+    return payload
+
+
+def motion_scan_parser_for_codec(codec_name: str | None) -> str | None:
+    normalized = (codec_name or "").strip().lower()
+    if normalized in {"h264", "avc1"}:
+        return "h264parse"
+    if normalized in {"hevc", "h265"}:
+        return "h265parse"
+    return None
+
+
+def motion_scan_demux_for_path(source_path: Path) -> str | None:
+    suffix = source_path.suffix.lower()
+    if suffix in {".mp4", ".mov", ".m4v"}:
+        return "qtdemux"
+    if suffix in {".mkv", ".webm"}:
+        return "matroskademux"
+    if suffix in {".ts", ".mts", ".m2ts"}:
+        return "tsdemux"
+    return None
+
+
+def collect_ffmpeg_motion_scan_records(
+    *,
+    ffmpeg_path: str,
+    source_path: Path,
+    sample_points: Sequence[float],
+    motion_size: str,
+    motion_zone: str | None,
+    motion_threshold: float,
+    min_changed_pct: float,
+    motion_detect_mode: str,
+) -> tuple[list[dict], list[dict], int]:
+    previous_frame: bytes | None = None
+    records: list[dict] = []
+    hit_records: list[dict] = []
+    sample_count = 0
+    adaptive_state = MotionAdaptiveState() if motion_detect_mode == "smart" else None
+    for offset_seconds in sample_points:
+        try:
+            current_frame = extract_motion_plane_at_time(
+                ffmpeg_path,
+                source_path,
+                offset_seconds,
+                motion_size=motion_size,
+                motion_zone=motion_zone,
+                motion_zone_grid=DEFAULT_MOTION_ZONE_GRID,
+            )
+            result = evaluate_motion_gate(
+                enabled=True,
+                previous_frame=previous_frame,
+                current_frame=current_frame,
+                mean_threshold=motion_threshold,
+                min_changed_pct=min_changed_pct,
+            )
+            previous_frame = current_frame
+            if adaptive_state:
+                result = adaptive_state.evaluate(
+                    result,
+                    fixed_mean_floor=motion_threshold,
+                    fixed_changed_floor=min_changed_pct,
+                )
+            record = motion_record_from_result(
+                offset_seconds=offset_seconds,
+                motion_zone=motion_zone,
+                result=result,
+            )
+            record["detect_mode"] = motion_detect_mode
+            records.append(record)
+            if result.triggered:
+                hit_records.append(record)
+            sample_count += 1
+        except RuntimeError:
+            continue
+    return records, hit_records, sample_count
+
+
+def make_required_gst_element(factory: str, name: str):
+    from gi.repository import Gst
+
+    element = Gst.ElementFactory.make(factory, name)
+    if element is None:
+        raise RuntimeError(f"GStreamer element {factory} is unavailable")
+    return element
+
+
+def build_gstreamer_motion_scan_pipeline(
+    *,
+    source_path: Path,
+    source_info: dict,
+    motion_size: str,
+    motion_zone: str | None,
+):
+    import gi  # type: ignore
+
+    gi.require_version("Gst", "1.0")
+    from gi.repository import Gst
+
+    Gst.init(None)
+    dimensions = parse_scale_dimensions(motion_size)
+    if not dimensions:
+        raise RuntimeError(f"invalid motion size: {motion_size!r}")
+    motion_width, motion_height = dimensions
+    demux_factory = motion_scan_demux_for_path(source_path)
+    if not demux_factory:
+        raise RuntimeError(f"unsupported GStreamer motion-scan container: {source_path.suffix}")
+    parser_factory = motion_scan_parser_for_codec(source_info.get("codec_name"))
+    if not parser_factory:
+        raise RuntimeError(
+            f"unsupported GStreamer motion-scan codec: {source_info.get('codec_name') or 'unknown'}"
+        )
+
+    pipeline = Gst.Pipeline.new("field-replay-motion-scan")
+    elements = [
+        make_required_gst_element("filesrc", "source"),
+        make_required_gst_element(demux_factory, "demux"),
+        make_required_gst_element("queue", "queue"),
+        make_required_gst_element(parser_factory, "parser"),
+        make_required_gst_element("nvv4l2decoder", "decoder"),
+        make_required_gst_element("nvvidconv", "motion_convert"),
+        make_required_gst_element("capsfilter", "motion_caps"),
+        make_required_gst_element("appsink", "motion_sink"),
+    ]
+    source, demux, queue, parser, decoder, converter, capsfilter, sink = elements
+    source.set_property("location", str(source_path))
+    for prop_name, prop_value in (
+        ("enable-max-performance", True),
+        ("disable-dpb", True),
+    ):
+        try:
+            decoder.set_property(prop_name, prop_value)
+        except TypeError:
+            pass
+
+    source_width = source_info.get("width")
+    source_height = source_info.get("height")
+    if isinstance(source_width, int) and isinstance(source_height, int):
+        crop_x, crop_y, crop_width, crop_height = motion_zone_pixel_rect(
+            motion_zone,
+            width=source_width,
+            height=source_height,
+            grid_size=DEFAULT_MOTION_ZONE_GRID,
+        )
+        if motion_zone:
+            converter.set_property("left", crop_x)
+            converter.set_property("top", crop_y)
+            converter.set_property("right", crop_x + crop_width)
+            converter.set_property("bottom", crop_y + crop_height)
+
+    caps = Gst.Caps.from_string(
+        f"video/x-raw,format=GRAY8,width={motion_width},height={motion_height}"
+    )
+    capsfilter.set_property("caps", caps)
+    sink.set_property("sync", False)
+    sink.set_property("max-buffers", 4)
+    sink.set_property("drop", False)
+
+    for element in elements:
+        pipeline.add(element)
+    if not source.link(demux):
+        raise RuntimeError("could not link GStreamer filesrc to demux")
+    for left, right in (
+        (queue, parser),
+        (parser, decoder),
+        (decoder, converter),
+        (converter, capsfilter),
+        (capsfilter, sink),
+    ):
+        if not left.link(right):
+            raise RuntimeError(
+                f"could not link GStreamer {left.get_name()} to {right.get_name()}"
+            )
+
+    queue_sink = queue.get_static_pad("sink")
+
+    def on_pad_added(_demux, pad) -> None:
+        if queue_sink.is_linked():
+            return
+        caps = pad.get_current_caps() or pad.query_caps(None)
+        caps_text = caps.to_string() if caps else ""
+        if "video/" not in caps_text:
+            return
+        pad.link(queue_sink)
+
+    demux.connect("pad-added", on_pad_added)
+    return pipeline, sink
+
+
+def collect_gstreamer_motion_scan_records(
+    *,
+    source_path: Path,
+    source_info: dict,
+    sample_interval: float,
+    max_samples: int | None,
+    motion_size: str,
+    motion_zone: str | None,
+    motion_threshold: float,
+    min_changed_pct: float,
+    motion_detect_mode: str,
+) -> tuple[list[dict], list[dict], int]:
+    import gi  # type: ignore
+
+    gi.require_version("Gst", "1.0")
+    from gi.repository import Gst
+
+    pipeline, sink = build_gstreamer_motion_scan_pipeline(
+        source_path=source_path,
+        source_info=source_info,
+        motion_size=motion_size,
+        motion_zone=motion_zone,
+    )
+    bus = pipeline.get_bus()
+    previous_frame: bytes | None = None
+    records: list[dict] = []
+    hit_records: list[dict] = []
+    sample_count = 0
+    adaptive_state = MotionAdaptiveState() if motion_detect_mode == "smart" else None
+    next_sample_time = 0.0
+    fallback_time = 0.0
+    pipeline.set_state(Gst.State.PLAYING)
+    try:
+        while True:
+            message = bus.pop_filtered(Gst.MessageType.ERROR | Gst.MessageType.EOS)
+            if message:
+                if message.type == Gst.MessageType.ERROR:
+                    error, debug = message.parse_error()
+                    raise RuntimeError(f"{error.message}: {debug or 'no debug detail'}")
+                break
+            sample = sink.emit("try-pull-sample", 100_000_000)
+            if sample is None:
+                continue
+            buffer = sample.get_buffer()
+            pts = buffer.pts
+            if pts == Gst.CLOCK_TIME_NONE:
+                offset_seconds = fallback_time
+                fallback_time += max(sample_interval, 0.001)
+            else:
+                offset_seconds = pts / Gst.SECOND
+            if offset_seconds + 0.0005 < next_sample_time:
+                continue
+            success, map_info = buffer.map(Gst.MapFlags.READ)
+            if not success:
+                continue
+            try:
+                current_frame = bytes(map_info.data)
+            finally:
+                buffer.unmap(map_info)
+            result = evaluate_motion_gate(
+                enabled=True,
+                previous_frame=previous_frame,
+                current_frame=current_frame,
+                mean_threshold=motion_threshold,
+                min_changed_pct=min_changed_pct,
+            )
+            previous_frame = current_frame
+            if adaptive_state:
+                result = adaptive_state.evaluate(
+                    result,
+                    fixed_mean_floor=motion_threshold,
+                    fixed_changed_floor=min_changed_pct,
+                )
+            record = motion_record_from_result(
+                offset_seconds=offset_seconds,
+                motion_zone=motion_zone,
+                result=result,
+            )
+            record["detect_mode"] = motion_detect_mode
+            records.append(record)
+            if result.triggered:
+                hit_records.append(record)
+            sample_count += 1
+            next_sample_time = offset_seconds + max(sample_interval, 0.001)
+            if max_samples is not None and sample_count >= max(max_samples, 0):
+                break
+    finally:
+        pipeline.set_state(Gst.State.NULL)
+    return records, hit_records, sample_count
+
+
+def motion_record_from_result(
+    *,
+    offset_seconds: float,
+    motion_zone: str | None,
+    result: MotionSampleResult,
+) -> dict:
+    return {
+        "t": round(offset_seconds, 3),
+        "zone": motion_zone,
+        "mean_diff": (
+            round(result.mean_diff, 3) if result.mean_diff is not None else None
+        ),
+        "changed_pct": (
+            round(result.changed_pct, 3) if result.changed_pct is not None else None
+        ),
+        "triggered": result.triggered,
+        "reason": result.reason,
+    }
+
+
+class MotionAdaptiveState:
+    def __init__(self, *, history_size: int = 240, warmup_samples: int = 8) -> None:
+        self.history_size = history_size
+        self.warmup_samples = warmup_samples
+        self.mean_history: list[float] = []
+        self.changed_history: list[float] = []
+
+    def evaluate(
+        self,
+        result: MotionSampleResult,
+        *,
+        fixed_mean_floor: float,
+        fixed_changed_floor: float,
+    ) -> MotionSampleResult:
+        if result.mean_diff is None or result.changed_pct is None:
+            return result
+
+        mean_threshold = max(float(fixed_mean_floor), 0.0)
+        changed_threshold = max(float(fixed_changed_floor), 0.0)
+        baseline_ready = len(self.mean_history) >= self.warmup_samples
+        reason = result.reason
+        if baseline_ready:
+            mean_median = statistics.median(self.mean_history)
+            changed_median = statistics.median(self.changed_history)
+            mean_p95 = percentile_value(self.mean_history, 0.95) or mean_median
+            changed_p95 = percentile_value(self.changed_history, 0.95) or changed_median
+            mean_threshold = max(
+                mean_threshold,
+                mean_median + 1.0,
+                mean_p95 * 1.15,
+            )
+            changed_threshold = max(
+                changed_threshold,
+                changed_median + 0.25,
+                changed_p95 * 1.15,
+            )
+            reason = (
+                f"smart-threshold mean>={mean_threshold:.2f}, "
+                f"changed>={changed_threshold:.2f}%"
+            )
+        else:
+            reason = f"smart-warmup {len(self.mean_history)}/{self.warmup_samples}"
+
+        triggered = result.mean_diff >= mean_threshold and result.changed_pct >= changed_threshold
+        if not baseline_ready or not triggered:
+            self.mean_history.append(float(result.mean_diff))
+            self.changed_history.append(float(result.changed_pct))
+            if len(self.mean_history) > self.history_size:
+                self.mean_history = self.mean_history[-self.history_size :]
+                self.changed_history = self.changed_history[-self.history_size :]
+
+        return MotionSampleResult(
+            enabled=result.enabled,
+            mean_diff=result.mean_diff,
+            changed_pct=result.changed_pct,
+            triggered=triggered,
+            gate_open=triggered,
+            reason=reason if triggered else f"below-{reason}",
+        )
+
+
+def resolve_motion_scan_engine(requested: str, *, allow_fallback: bool = True) -> tuple[str, str | None]:
+    if requested == "ffmpeg":
+        return "ffmpeg", None
+    if requested == "gstreamer-jetson":
+        if jetson_gstreamer_decode_available():
+            return "gstreamer-jetson", None
+        return "", jetson_gstreamer_decode_unavailable_reason()
+    if jetson_gstreamer_decode_available():
+        return "gstreamer-jetson", None
+    if allow_fallback:
+        return "ffmpeg", jetson_gstreamer_decode_unavailable_reason()
+    return "", jetson_gstreamer_decode_unavailable_reason()
+
+
+def command_motion_scan(args: argparse.Namespace) -> int:
+    config_path = args.config_file.expanduser()
+    config = load_config(config_path)
+    motion_profiles = config.get("motion_profiles", {})
+    selected_motion_profile = args.motion_profile
+    if interactive_mode_enabled(args):
+        selected_motion_profile = choose_motion_profile(
+            config,
+            preferred_profile=args.motion_profile,
+            allow_manual=True,
+        )
+        if selected_motion_profile and selected_motion_profile != "__manual__":
+            apply_motion_profile(args, motion_profiles[selected_motion_profile])
+            if prompt_yes_no(
+                f"Edit saved motion profile '{selected_motion_profile}' before scanning?",
+                default=False,
+            ):
+                edit_existing_motion_profile_interactively(
+                    args, config, selected_motion_profile
+                )
+            config["last_motion_profile"] = selected_motion_profile
+            for line in motion_profile_summary_lines(
+                selected_motion_profile, motion_profile_from_args(args)
+            ):
+                print(line)
+            print()
+        else:
+            created_profile = configure_motion_profile_interactively(args, config)
+            if created_profile:
+                motion_profiles[created_profile] = motion_profile_from_args(args)
+                config["motion_profiles"] = motion_profiles
+                config["last_motion_profile"] = created_profile
+                save_config(config_path, config)
+                print(f"Saved motion profile: {created_profile}")
+                print()
+    elif selected_motion_profile:
+        profile = motion_profiles.get(selected_motion_profile)
+        if not profile:
+            print(f"motion profile not found: {selected_motion_profile}", file=sys.stderr)
+            return 1
+        apply_motion_profile(args, profile)
+        config["last_motion_profile"] = selected_motion_profile
+
+    if not args.target and interactive_mode_enabled(args):
+        selected_target = select_export_target(
+            args,
+            config,
+            title="Choose a session for motion scan",
+        )
+        if not selected_target:
+            print("no sessions found for motion scan", file=sys.stderr)
+            return 1
+        args.target = selected_target
+
+    try:
+        source = resolve_export_source(
+            args.recordings_dir.expanduser(),
+            str(args.target) if args.target else None,
+        )
+    except FileNotFoundError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+
+    ffmpeg_path = shutil.which(args.ffmpeg_bin)
+    if not ffmpeg_path:
+        print(f"ffmpeg binary not found: {args.ffmpeg_bin}", file=sys.stderr)
+        return 1
+    if parse_scale_dimensions(args.motion_size) is None:
+        print(
+            f"invalid motion size: {args.motion_size!r}; expected WxH like 160x90",
+            file=sys.stderr,
+        )
+        return 1
+    motion_zone, zone_error = parse_motion_zone_value(args.motion_zone)
+    if zone_error:
+        print(zone_error, file=sys.stderr)
+        return 1
+    if args.sample_interval <= 0:
+        print("sample-interval must be greater than 0", file=sys.stderr)
+        return 1
+    if args.motion_detect_mode not in MOTION_DETECT_MODES:
+        print(f"invalid motion detect mode: {args.motion_detect_mode}", file=sys.stderr)
+        return 1
+    if args.motion_threshold < 0 or args.motion_min_changed_pct < 0:
+        print("motion thresholds must be non-negative", file=sys.stderr)
+        return 1
+    if args.evidence_frames < 0:
+        print("evidence-frames must be non-negative", file=sys.stderr)
+        return 1
+    if args.evidence_frame_step <= 0:
+        print("evidence-frame-step must be greater than 0", file=sys.stderr)
+        return 1
+
+    duration_seconds = probe_media_duration(args.ffmpeg_bin, source.source_path) or 0.0
+    if duration_seconds <= 0:
+        print(f"could not determine media duration: {source.source_path}", file=sys.stderr)
+        return 1
+    source_info = probe_media_video_info(args.ffmpeg_bin, source.source_path)
+    sample_points = media_sample_points(duration_seconds, args.sample_interval)
+    if args.max_samples is not None:
+        sample_points = sample_points[: max(args.max_samples, 0)]
+    engine, engine_notice = resolve_motion_scan_engine(args.motion_engine)
+    if not engine:
+        print(engine_notice or "motion scan engine is unavailable", file=sys.stderr)
+        return 1
+
+    if args.output_dir:
+        output_root = args.output_dir.expanduser()
+    else:
+        output_root, output_notice = default_vision_output_root(source, "motion-scan")
+        if output_notice:
+            print(f"warning: {output_notice}", file=sys.stderr)
+    paths = motion_scan_output_paths(output_root)
+    ensure_directory(paths["root"])
+    if args.evidence_frames:
+        ensure_directory(paths["frames_dir"])
+    config["last_session_dir"] = str(source.session_dir)
+    save_config(config_path, config)
+
+    print(f"Motion scan source: {source.source_path}")
+    print(f"Motion output dir:  {output_root}")
+    print(f"Motion engine:      {engine}")
+    print(f"Motion detect:      {args.motion_detect_mode}")
+    if engine_notice:
+        print(f"Engine notice:      {engine_notice}")
+    print(f"Samples:            {len(sample_points)} planned at {args.sample_interval:g}s")
+    print(
+        "Motion:             "
+        f"{args.motion_size}, zone={motion_zone_label(motion_zone)}, "
+        f"mean>={args.motion_threshold:g}, changed>={args.motion_min_changed_pct:g}%"
+    )
+    if args.dry_run:
+        for offset_seconds in sample_points[:20]:
+            print(f"  sample {format_duration(offset_seconds)}")
+        if len(sample_points) > 20:
+            print(f"  ... {len(sample_points) - 20} more")
+        return 0
+
+    for key in ("events_jsonl", "events_log", "debug_log", "summary_json", "summary_text"):
+        try:
+            paths[key].unlink()
+        except FileNotFoundError:
+            pass
+
+    try:
+        if engine == "gstreamer-jetson":
+            records, hit_records, sample_count = collect_gstreamer_motion_scan_records(
+                source_path=source.source_path,
+                source_info=source_info,
+                sample_interval=args.sample_interval,
+                max_samples=args.max_samples,
+                motion_size=args.motion_size,
+                motion_zone=motion_zone,
+                motion_threshold=args.motion_threshold,
+                min_changed_pct=args.motion_min_changed_pct,
+                motion_detect_mode=args.motion_detect_mode,
+            )
+        else:
+            records, hit_records, sample_count = collect_ffmpeg_motion_scan_records(
+                ffmpeg_path=ffmpeg_path,
+                source_path=source.source_path,
+                sample_points=sample_points,
+                motion_size=args.motion_size,
+                motion_zone=motion_zone,
+                motion_threshold=args.motion_threshold,
+                min_changed_pct=args.motion_min_changed_pct,
+                motion_detect_mode=args.motion_detect_mode,
+            )
+    except RuntimeError as exc:
+        if args.motion_engine == "auto":
+            print(
+                f"warning: gstreamer-jetson motion scan failed ({exc}); falling back to ffmpeg",
+                file=sys.stderr,
+            )
+            engine = "ffmpeg"
+            records, hit_records, sample_count = collect_ffmpeg_motion_scan_records(
+                ffmpeg_path=ffmpeg_path,
+                source_path=source.source_path,
+                sample_points=sample_points,
+                motion_size=args.motion_size,
+                motion_zone=motion_zone,
+                motion_threshold=args.motion_threshold,
+                min_changed_pct=args.motion_min_changed_pct,
+                motion_detect_mode=args.motion_detect_mode,
+            )
+        else:
+            print(f"motion scan failed: {exc}", file=sys.stderr)
+            return 1
+
+    for record in records:
+        try:
+            record["engine"] = engine
+            append_jsonl(paths["debug_log"], record)
+        except OSError as exc:
+            append_jsonl(
+                paths["debug_log"],
+                {
+                    "t": record.get("t"),
+                    "error": str(exc),
+                },
+            )
+
+    raw_candidates = group_motion_scan_records(
+        hit_records,
+        source_path=source.source_path,
+        motion_threshold=args.motion_threshold,
+        min_changed_pct=args.motion_min_changed_pct,
+        group_gap_seconds=args.group_gap,
+        pre_roll=args.pre_roll,
+        post_roll=args.post_roll,
+        duration_seconds=duration_seconds,
+    )
+    candidates = merge_motion_scan_candidates(
+        raw_candidates,
+        merge_gap_seconds=args.group_gap,
+        duration_seconds=duration_seconds,
+    )
+    for index, candidate in enumerate(candidates, start=1):
+        write_motion_candidate_event(
+            ffmpeg_path=ffmpeg_path,
+            source=source,
+            runtime_paths=paths,
+            candidate=candidate,
+            candidate_index=index,
+            event_source="motion-scan",
+            frame_count=args.evidence_frames,
+            frame_step=args.evidence_frame_step,
+            duration_seconds=duration_seconds,
+        )
+
+    summary = {
+        "created_at": datetime.now().astimezone().isoformat(),
+        "source_path": str(source.source_path),
+        "duration_seconds": duration_seconds,
+        "sample_interval_seconds": args.sample_interval,
+        "samples": sample_count,
+        "hit_samples": len(hit_records),
+        "candidate_count": len(candidates),
+        "raw_candidate_count": len(raw_candidates),
+        "engine": engine,
+        "motion_detect_mode": args.motion_detect_mode,
+        "source_codec": source_info.get("codec_name"),
+        "source_width": source_info.get("width"),
+        "source_height": source_info.get("height"),
+        "motion_size": args.motion_size,
+        "motion_zone": motion_zone,
+        "motion_threshold": args.motion_threshold,
+        "motion_min_changed_pct": args.motion_min_changed_pct,
+        "group_gap_seconds": args.group_gap,
+        "pre_roll_seconds": args.pre_roll,
+        "post_roll_seconds": args.post_roll,
+        "evidence_frames": args.evidence_frames,
+        "evidence_frame_step_seconds": args.evidence_frame_step,
+    }
+    paths["summary_json"].write_text(json.dumps(summary, indent=2) + "\n")
+    paths["summary_text"].write_text(
+        "\n".join(
+            [
+                "Motion Scan Summary",
+                f"Source: {source.source_path}",
+                f"Samples: {sample_count}",
+                f"Hit samples: {len(hit_records)}",
+                f"Candidates: {len(candidates)}",
+                f"Raw candidates: {len(raw_candidates)}",
+                f"Output: {output_root}",
+            ]
+        )
+        + "\n"
+    )
+    print(f"Motion candidates:  {len(candidates)}")
+    print(f"Motion events:      {paths['events_log']}")
+    print(f"Motion debug:       {paths['debug_log']}")
+    return 0
+
+
+def command_motion_live(args: argparse.Namespace) -> int:
+    config_path = args.config_file.expanduser()
+    config = load_config(config_path)
+    motion_profiles = config.get("motion_profiles", {})
+    selected_motion_profile = args.motion_profile
+    if interactive_mode_enabled(args):
+        selected_motion_profile = choose_motion_profile(
+            config,
+            preferred_profile=args.motion_profile,
+            allow_manual=True,
+        )
+        if selected_motion_profile and selected_motion_profile != "__manual__":
+            apply_motion_profile(args, motion_profiles[selected_motion_profile])
+            if prompt_yes_no(
+                f"Edit saved motion profile '{selected_motion_profile}' before starting?",
+                default=False,
+            ):
+                edit_existing_motion_profile_interactively(
+                    args, config, selected_motion_profile
+                )
+            config["last_motion_profile"] = selected_motion_profile
+            for line in motion_profile_summary_lines(
+                selected_motion_profile, motion_profile_from_args(args)
+            ):
+                print(line)
+            print()
+        else:
+            created_profile = configure_motion_profile_interactively(args, config)
+            if created_profile:
+                motion_profiles[created_profile] = motion_profile_from_args(args)
+                config["motion_profiles"] = motion_profiles
+                config["last_motion_profile"] = created_profile
+                save_config(config_path, config)
+                print(f"Saved motion profile: {created_profile}")
+                print()
+    elif selected_motion_profile:
+        profile = motion_profiles.get(selected_motion_profile)
+        if not profile:
+            print(f"motion profile not found: {selected_motion_profile}", file=sys.stderr)
+            return 1
+        apply_motion_profile(args, profile)
+        config["last_motion_profile"] = selected_motion_profile
+
+    if not args.session_dir and interactive_mode_enabled(args):
+        selected_target = select_session_target(
+            args,
+            config,
+            title="Choose a session for live motion",
+        )
+        if not selected_target:
+            print("no sessions found for live motion", file=sys.stderr)
+            return 1
+        args.session_dir = Path(selected_target)
+
+    try:
+        session_dir = resolve_session_dir(
+            args.recordings_dir.expanduser(),
+            str(args.session_dir) if args.session_dir else None,
+        )
+    except FileNotFoundError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+
+    ffmpeg_path = shutil.which(args.ffmpeg_bin)
+    if not ffmpeg_path:
+        print(f"ffmpeg binary not found: {args.ffmpeg_bin}", file=sys.stderr)
+        return 1
+    if parse_scale_dimensions(args.motion_size) is None:
+        print(
+            f"invalid motion size: {args.motion_size!r}; expected WxH like 160x90",
+            file=sys.stderr,
+        )
+        return 1
+    motion_zone, zone_error = parse_motion_zone_value(args.motion_zone)
+    if zone_error:
+        print(zone_error, file=sys.stderr)
+        return 1
+    if args.sample_interval <= 0:
+        print("sample-interval must be greater than 0", file=sys.stderr)
+        return 1
+    if args.motion_detect_mode not in MOTION_DETECT_MODES:
+        print(f"invalid motion detect mode: {args.motion_detect_mode}", file=sys.stderr)
+        return 1
+    if args.tail_offset < 0:
+        print("tail-offset must be non-negative", file=sys.stderr)
+        return 1
+    if args.evidence_frames < 0:
+        print("evidence-frames must be non-negative", file=sys.stderr)
+        return 1
+    if args.evidence_frame_step <= 0:
+        print("evidence-frame-step must be greater than 0", file=sys.stderr)
+        return 1
+
+    timeshift_path = session_dir / DEFAULT_TIMESHIFT_NAME
+    source = ExportSource(session_dir, timeshift_path, DEFAULT_TIMESHIFT_NAME)
+    if not timeshift_path.exists():
+        fallback_source = export_source_for_session(session_dir)
+        if not fallback_source:
+            print(f"no watchable media found under {session_dir}", file=sys.stderr)
+            return 1
+        source = fallback_source
+
+    output_root = session_dir / "motion-live"
+    paths = motion_scan_output_paths(output_root)
+    ensure_directory(paths["root"])
+    if args.evidence_frames:
+        ensure_directory(paths["frames_dir"])
+    for key in ("events_jsonl", "events_log", "debug_log", "summary_json", "summary_text"):
+        try:
+            paths[key].unlink()
+        except FileNotFoundError:
+            pass
+    config["last_session_dir"] = str(session_dir)
+    save_config(config_path, config)
+
+    print(f"Motion live:   {session_dir}")
+    print(f"Source:        {source.source_path}")
+    print(f"Output:        {output_root}")
+    print(f"Cadence:       {args.sample_interval:g}s, {args.tail_offset:g}s behind live")
+    print(f"Detect:        {args.motion_detect_mode}")
+    print(
+        "Motion:        "
+        f"{args.motion_size}, zone={motion_zone_label(motion_zone)}, "
+        f"mean>={args.motion_threshold:g}, changed>={args.motion_min_changed_pct:g}%"
+    )
+    print("Promoted motion candidates will appear below. Press Ctrl+C to stop.")
+
+    previous_frame: bytes | None = None
+    adaptive_state = (
+        MotionAdaptiveState() if args.motion_detect_mode == "smart" else None
+    )
+    processed_offsets: set[float] = set()
+    current_group: list[dict] = []
+    candidate_count = 0
+    sample_count = 0
+    last_duration = 0.0
+
+    def flush_group(duration_seconds: float) -> None:
+        nonlocal current_group, candidate_count
+        if not current_group:
+            return
+        candidate = build_motion_scan_candidate(
+            current_group,
+            source_path=source.source_path,
+            motion_threshold=args.motion_threshold,
+            min_changed_pct=args.motion_min_changed_pct,
+            pre_roll=args.pre_roll,
+            post_roll=args.post_roll,
+            duration_seconds=duration_seconds,
+        )
+        candidate_count += 1
+        payload = write_motion_candidate_event(
+            ffmpeg_path=ffmpeg_path,
+            source=source,
+            runtime_paths=paths,
+            candidate=candidate,
+            candidate_index=candidate_count,
+            event_source="motion-live",
+            frame_count=args.evidence_frames,
+            frame_step=args.evidence_frame_step,
+            duration_seconds=duration_seconds,
+        )
+        print(
+            f"{payload['l']} {format_duration(payload['t_start'])}-"
+            f"{format_duration(payload['t_end'])}"
+            + (f" frame {payload['f']}" if payload.get("f") else ""),
+            flush=True,
+        )
+        current_group = []
+
+    try:
+        while True:
+            if args.max_samples is not None and sample_count >= args.max_samples:
+                flush_group(last_duration)
+                break
+            if not source.source_path.exists() or source.source_path.stat().st_size == 0:
+                if args.once:
+                    break
+                time.sleep(args.idle_sleep)
+                continue
+            duration_seconds = ffprobe_duration_seconds(source.source_path)
+            if duration_seconds is None or duration_seconds <= 0:
+                if args.once:
+                    break
+                time.sleep(args.idle_sleep)
+                continue
+            last_duration = duration_seconds
+            latest_offset = live_sample_offset(
+                duration_seconds,
+                tail_offset=args.tail_offset,
+                sample_interval=args.sample_interval,
+            )
+            rounded_latest = round(latest_offset, 3)
+            if rounded_latest in processed_offsets:
+                if args.once:
+                    break
+                time.sleep(args.idle_sleep)
+                continue
+            try:
+                current_frame = extract_motion_plane_at_time(
+                    ffmpeg_path,
+                    source.source_path,
+                    latest_offset,
+                    motion_size=args.motion_size,
+                    motion_zone=motion_zone,
+                    motion_zone_grid=DEFAULT_MOTION_ZONE_GRID,
+                )
+                result = evaluate_motion_gate(
+                    enabled=True,
+                    previous_frame=previous_frame,
+                    current_frame=current_frame,
+                    mean_threshold=args.motion_threshold,
+                    min_changed_pct=args.motion_min_changed_pct,
+                )
+                if adaptive_state:
+                    result = adaptive_state.evaluate(
+                        result,
+                        fixed_mean_floor=args.motion_threshold,
+                        fixed_changed_floor=args.motion_min_changed_pct,
+                    )
+                previous_frame = current_frame
+                record = motion_record_from_result(
+                    offset_seconds=latest_offset,
+                    motion_zone=motion_zone,
+                    result=result,
+                )
+                record["engine"] = "ffmpeg-tail"
+                append_jsonl(paths["debug_log"], record)
+                if result.triggered:
+                    current_group.append(record)
+                elif current_group:
+                    last_hit_time = float(current_group[-1].get("t") or 0.0)
+                    if latest_offset - last_hit_time > args.group_gap:
+                        flush_group(duration_seconds)
+                processed_offsets.add(rounded_latest)
+                sample_count += 1
+            except RuntimeError as exc:
+                append_jsonl(
+                    paths["debug_log"],
+                    {
+                        "t": round(latest_offset, 3),
+                        "engine": "ffmpeg-tail",
+                        "error": str(exc),
+                    },
+                )
+            if args.once:
+                flush_group(duration_seconds)
+                break
+            time.sleep(args.idle_sleep)
+    except KeyboardInterrupt:
+        print("\nStopping live motion...")
+        flush_group(last_duration)
+
+    summary = {
+        "created_at": datetime.now().astimezone().isoformat(),
+        "source_path": str(source.source_path),
+        "samples": sample_count,
+        "candidate_count": candidate_count,
+        "engine": "ffmpeg-tail",
+        "motion_detect_mode": args.motion_detect_mode,
+        "motion_size": args.motion_size,
+        "motion_zone": motion_zone,
+        "motion_threshold": args.motion_threshold,
+        "motion_min_changed_pct": args.motion_min_changed_pct,
+        "group_gap_seconds": args.group_gap,
+        "pre_roll_seconds": args.pre_roll,
+        "post_roll_seconds": args.post_roll,
+        "evidence_frames": args.evidence_frames,
+        "evidence_frame_step_seconds": args.evidence_frame_step,
+    }
+    paths["summary_json"].write_text(json.dumps(summary, indent=2) + "\n")
+    paths["summary_text"].write_text(
+        "\n".join(
+            [
+                "Motion Live Summary",
+                f"Source: {source.source_path}",
+                f"Samples: {sample_count}",
+                f"Candidates: {candidate_count}",
+                f"Output: {output_root}",
+            ]
+        )
+        + "\n"
+    )
+    print(f"Motion candidates:  {candidate_count}")
+    print(f"Motion events:      {paths['events_log']}")
+    print(f"Motion debug:       {paths['debug_log']}")
+    return 0
 
 
 def load_motion_candidates(
@@ -7792,6 +9385,7 @@ def command_doctor(args: argparse.Namespace) -> int:
         resolved_encoder = "nvv4l2h264enc"
     player = choose_player(args.player)
     jetson_player = shutil.which("nvgstplayer-1.0") or shutil.which("nvgstplayer")
+    deepstream_ok, deepstream_status = deepstream_available()
     source_ok, source_status = source_readiness(args)
     if uses_alsa_audio_input(args):
         audio_ok = alsa_device_exists(args.audio_device)
@@ -7805,6 +9399,13 @@ def command_doctor(args: argparse.Namespace) -> int:
     print(f"gst-jetson:{' yes' if jetson_gstreamer_available() else ' no'}")
     if not jetson_gstreamer_available():
         print(f"gst-reason:{' '}{jetson_gstreamer_unavailable_reason()}")
+    print(
+        f"gst-decode:{' yes' if jetson_gstreamer_decode_available() else ' no'}"
+    )
+    if not jetson_gstreamer_decode_available():
+        print(f"gst-decode-reason: {jetson_gstreamer_decode_unavailable_reason()}")
+    print(f"deepstream:{' yes' if deepstream_ok else ' no'}")
+    print(f"deepstream-status: {deepstream_status}")
     print(f"gst-player:{' '}{jetson_player or 'missing'}")
     print(f"video:    {args.video_codec_mode}")
     print(f"backend:  {capture_backend or 'missing'}")
@@ -8683,6 +10284,327 @@ def build_parser() -> argparse.ArgumentParser:
         help="Prompt to choose a recent session and zone when the target is omitted.",
     )
     motion_zone.set_defaults(func=command_motion_zone)
+
+    motion_setup = subparsers.add_parser(
+        "motion-setup",
+        help="Save or update a reusable motion profile for dense Jetson/FFmpeg scans.",
+    )
+    motion_setup.add_argument(
+        "--motion-profile",
+        "--profile",
+        dest="motion_profile",
+        help="Existing motion profile name to update, or the save target when using --no-interactive.",
+    )
+    motion_setup.add_argument(
+        "--sample-interval",
+        type=float,
+        default=DEFAULT_MOTION_SCAN_INTERVAL,
+        help="Seconds between dense motion samples.",
+    )
+    motion_setup.add_argument(
+        "--motion-detect-mode",
+        choices=MOTION_DETECT_MODES,
+        default="smart",
+        help="Motion decision mode. smart adapts to the scene baseline.",
+    )
+    motion_setup.add_argument(
+        "--motion-engine",
+        choices=MOTION_SCAN_ENGINES,
+        default="auto",
+        help="Motion scan backend. 'auto' prefers Jetson GStreamer decode and falls back to ffmpeg.",
+    )
+    motion_setup.add_argument(
+        "--motion-size",
+        default="320x180",
+        help="Motion frame size, as WIDTHxHEIGHT. Smaller is cheaper.",
+    )
+    motion_setup.add_argument(
+        "--motion-threshold",
+        type=float,
+        default=DEFAULT_MOTION_THRESHOLD,
+        help="Minimum mean grayscale delta needed to count as motion.",
+    )
+    motion_setup.add_argument(
+        "--motion-min-changed-pct",
+        type=float,
+        default=DEFAULT_MOTION_MIN_CHANGED_PCT,
+        help="Minimum percent of pixels with meaningful change to count as motion.",
+    )
+    motion_setup.add_argument(
+        "--motion-zone",
+        help="Optional 4x4 motion zone like C3 or B3:D4. Leave unset for the full frame.",
+    )
+    motion_setup.add_argument(
+        "--group-gap",
+        type=float,
+        default=DEFAULT_MOTION_SCAN_GROUP_GAP,
+        help="Maximum seconds between hit samples that belong to the same motion candidate.",
+    )
+    motion_setup.add_argument(
+        "--pre-roll",
+        type=float,
+        default=DEFAULT_MOTION_SCAN_PRE_ROLL,
+        help="Seconds to include before each grouped motion window.",
+    )
+    motion_setup.add_argument(
+        "--post-roll",
+        type=float,
+        default=DEFAULT_MOTION_SCAN_POST_ROLL,
+        help="Seconds to include after each grouped motion window.",
+    )
+    motion_setup.add_argument(
+        "--evidence-frames",
+        type=int,
+        default=DEFAULT_MOTION_EVIDENCE_FRAMES,
+        help="Source-resolution frames to save around each motion candidate.",
+    )
+    motion_setup.add_argument(
+        "--evidence-frame-step",
+        type=float,
+        default=DEFAULT_MOTION_EVIDENCE_FRAME_STEP,
+        help="Seconds between saved evidence frames around each candidate peak.",
+    )
+    motion_setup.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show the motion profile summary without saving it.",
+    )
+    motion_setup.add_argument(
+        "--interactive",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Prompt for motion profile settings.",
+    )
+    motion_setup.set_defaults(func=command_motion_setup)
+
+    motion_scan = subparsers.add_parser(
+        "motion-scan",
+        help="Densely scan media for motion windows that can feed OCR, YOLO, or review.",
+    )
+    motion_scan.add_argument(
+        "target",
+        nargs="?",
+        type=Path,
+        help="Optional session directory or media file. Defaults to an interactive picker or the latest session.",
+    )
+    motion_scan.add_argument(
+        "--ffmpeg-bin",
+        default="ffmpeg",
+        help="FFmpeg binary to use for frame extraction.",
+    )
+    motion_scan.add_argument(
+        "--motion-profile",
+        help="Saved motion profile to use before any interactive edits.",
+    )
+    motion_scan.add_argument(
+        "--sample-interval",
+        type=float,
+        default=DEFAULT_MOTION_SCAN_INTERVAL,
+        help="Seconds between dense motion samples.",
+    )
+    motion_scan.add_argument(
+        "--motion-detect-mode",
+        choices=MOTION_DETECT_MODES,
+        default="smart",
+        help="Motion decision mode. smart adapts to the scene baseline.",
+    )
+    motion_scan.add_argument(
+        "--motion-engine",
+        choices=MOTION_SCAN_ENGINES,
+        default="auto",
+        help="Motion scan backend. 'auto' prefers Jetson GStreamer decode and falls back to ffmpeg.",
+    )
+    motion_scan.add_argument(
+        "--max-samples",
+        type=int,
+        help="Maximum number of motion samples to evaluate.",
+    )
+    motion_scan.add_argument(
+        "--motion-size",
+        default=DEFAULT_MOTION_SIZE,
+        help="Motion frame size, as WIDTHxHEIGHT. Smaller is cheaper.",
+    )
+    motion_scan.add_argument(
+        "--motion-threshold",
+        type=float,
+        default=DEFAULT_MOTION_THRESHOLD,
+        help="Minimum mean grayscale delta needed to count as motion.",
+    )
+    motion_scan.add_argument(
+        "--motion-min-changed-pct",
+        type=float,
+        default=DEFAULT_MOTION_MIN_CHANGED_PCT,
+        help="Minimum percent of pixels with meaningful change to count as motion.",
+    )
+    motion_scan.add_argument(
+        "--motion-zone",
+        help="Optional 4x4 motion zone like C3 or B3:D4. Leave unset for the full frame.",
+    )
+    motion_scan.add_argument(
+        "--group-gap",
+        type=float,
+        default=DEFAULT_MOTION_SCAN_GROUP_GAP,
+        help="Maximum seconds between hit samples that belong to the same motion candidate.",
+    )
+    motion_scan.add_argument(
+        "--pre-roll",
+        type=float,
+        default=DEFAULT_MOTION_SCAN_PRE_ROLL,
+        help="Seconds to include before each grouped motion window.",
+    )
+    motion_scan.add_argument(
+        "--post-roll",
+        type=float,
+        default=DEFAULT_MOTION_SCAN_POST_ROLL,
+        help="Seconds to include after each grouped motion window.",
+    )
+    motion_scan.add_argument(
+        "--evidence-frames",
+        type=int,
+        default=DEFAULT_MOTION_EVIDENCE_FRAMES,
+        help="Source-resolution frames to save around each motion candidate.",
+    )
+    motion_scan.add_argument(
+        "--evidence-frame-step",
+        type=float,
+        default=DEFAULT_MOTION_EVIDENCE_FRAME_STEP,
+        help="Seconds between saved evidence frames around each candidate peak.",
+    )
+    motion_scan.add_argument(
+        "--output-dir",
+        type=Path,
+        help="Directory for motion scan output. Defaults to motion-scan under the session directory.",
+    )
+    motion_scan.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print planned motion samples without scanning.",
+    )
+    motion_scan.add_argument(
+        "--interactive",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Prompt to choose a recent session when the target is omitted.",
+    )
+    motion_scan.set_defaults(func=command_motion_scan)
+
+    motion_live = subparsers.add_parser(
+        "motion-live",
+        help="Follow a growing session and save frames for fast motion candidates.",
+    )
+    motion_live.add_argument(
+        "session_dir",
+        nargs="?",
+        type=Path,
+        help="Session directory with a growing timeshift.ts file. Defaults to an interactive picker or the latest session.",
+    )
+    motion_live.add_argument(
+        "--ffmpeg-bin",
+        default="ffmpeg",
+        help="FFmpeg binary to use for tail frame extraction.",
+    )
+    motion_live.add_argument(
+        "--motion-profile",
+        help="Saved motion profile to use before any interactive edits.",
+    )
+    motion_live.add_argument(
+        "--sample-interval",
+        type=float,
+        default=DEFAULT_MOTION_SCAN_INTERVAL,
+        help="Seconds between live motion samples.",
+    )
+    motion_live.add_argument(
+        "--tail-offset",
+        type=float,
+        default=DEFAULT_MOTION_LIVE_TAIL_OFFSET,
+        help="Seconds behind the live tail to sample.",
+    )
+    motion_live.add_argument(
+        "--motion-detect-mode",
+        choices=MOTION_DETECT_MODES,
+        default="smart",
+        help="Motion decision mode. smart adapts to the scene baseline.",
+    )
+    motion_live.add_argument(
+        "--motion-engine",
+        choices=MOTION_SCAN_ENGINES,
+        default="auto",
+        help="Accepted for profile compatibility; live tail following currently uses FFmpeg frame grabs.",
+    )
+    motion_live.add_argument(
+        "--max-samples",
+        type=int,
+        help="Stop after this many live samples.",
+    )
+    motion_live.add_argument(
+        "--motion-size",
+        default=DEFAULT_MOTION_SIZE,
+        help="Motion frame size, as WIDTHxHEIGHT. Smaller is cheaper.",
+    )
+    motion_live.add_argument(
+        "--motion-threshold",
+        type=float,
+        default=DEFAULT_MOTION_THRESHOLD,
+        help="Minimum mean grayscale delta needed to count as motion.",
+    )
+    motion_live.add_argument(
+        "--motion-min-changed-pct",
+        type=float,
+        default=DEFAULT_MOTION_MIN_CHANGED_PCT,
+        help="Minimum percent of pixels with meaningful change to count as motion.",
+    )
+    motion_live.add_argument(
+        "--motion-zone",
+        help="Optional 4x4 motion zone like C3 or B3:D4. Leave unset for the full frame.",
+    )
+    motion_live.add_argument(
+        "--group-gap",
+        type=float,
+        default=DEFAULT_MOTION_SCAN_GROUP_GAP,
+        help="Maximum seconds between hit samples that belong to the same motion candidate.",
+    )
+    motion_live.add_argument(
+        "--pre-roll",
+        type=float,
+        default=DEFAULT_MOTION_SCAN_PRE_ROLL,
+        help="Seconds to include before each grouped motion window.",
+    )
+    motion_live.add_argument(
+        "--post-roll",
+        type=float,
+        default=DEFAULT_MOTION_SCAN_POST_ROLL,
+        help="Seconds to include after each grouped motion window.",
+    )
+    motion_live.add_argument(
+        "--evidence-frames",
+        type=int,
+        default=DEFAULT_MOTION_EVIDENCE_FRAMES,
+        help="Source-resolution frames to save around each motion candidate.",
+    )
+    motion_live.add_argument(
+        "--evidence-frame-step",
+        type=float,
+        default=DEFAULT_MOTION_EVIDENCE_FRAME_STEP,
+        help="Seconds between saved evidence frames around each candidate peak.",
+    )
+    motion_live.add_argument(
+        "--idle-sleep",
+        type=float,
+        default=0.2,
+        help="Seconds to wait when no new tail sample point is available.",
+    )
+    motion_live.add_argument(
+        "--once",
+        action="store_true",
+        help="Run one available live sample and exit.",
+    )
+    motion_live.add_argument(
+        "--interactive",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Prompt to choose a recent session and motion profile when arguments are omitted.",
+    )
+    motion_live.set_defaults(func=command_motion_live)
 
     motion_tune = subparsers.add_parser(
         "motion-tune",

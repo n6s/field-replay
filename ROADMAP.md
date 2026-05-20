@@ -48,8 +48,10 @@ These notes are not commitments. They are the current product leanings and backl
 
 - On old laptops, prefer continuous DVR, fixed-cadence vision, cooldowns, promoted frames, and event-dense review.
 - Use motion and VOX to prioritize extra samples, not to hide quiet-looking intervals entirely.
-- On stronger future hardware, improve cadence, resolution, and camera count without changing the basic evidence model.
-- More advanced object tracking, OCR, or multi-camera correlation can come later, after the operator dashboard is useful with humble hardware.
+- On Jetson Orin-class hardware, prefer NVIDIA decode/inference paths: NVDEC/VIC/GStreamer for dense motion candidate windows, then DeepStream/TensorRT detectors, trackers, and OCR over those windows.
+- Keep CPU handoffs narrow. Full-resolution frames should stay in NVMM/GPU memory until a candidate crop, metadata record, or promoted evidence frame is actually needed.
+- On stronger future hardware, improve cadence, resolution, model count, and camera count without changing the basic evidence model.
+- More advanced object tracking, OCR, or multi-camera correlation should feed the same timeline and evidence logs rather than becoming a separate workflow.
 
 ## Possible Command Ideas
 
