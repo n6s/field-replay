@@ -26,6 +26,7 @@ These notes are not commitments. They are the current product leanings and backl
 - Vision remains a second set of eyes. Promoted frames with detected labels are central because human review can quickly explain model mistakes.
 - Audio should start with reliable activity markers, then add tentative speech-to-text hints for bib numbers and callsigns rather than full transcripts.
 - Motion should be a hint, not a gate. Outdoors it is too finicky to decide whether the system is allowed to look.
+- For Jetson transit detection, the operator goal is class-agnostic: promote coherent subjects that enter, move meaningfully through the frame, and exit or continue onward. Parked objects, background texture, and small local human motion should fall away through track displacement, duration, and transit scoring; detector classes such as person, bicycle, or car should be implementation hints, not things the operator must choose.
 - RFID ingest remains useful if a reader and tag-to-bib lookup table exist, but it should land in the same timeline rather than becoming a separate workflow.
 - Manual marks can be useful for unusual events, but the normal operator path should not require duplicate logging inside `field-replay`.
 

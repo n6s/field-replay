@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import math
 import os
 import re
 import shlex
@@ -64,6 +65,12 @@ DEFAULT_MOTION_SCAN_POST_ROLL = 0.5
 DEFAULT_MOTION_EVIDENCE_FRAMES = 5
 DEFAULT_MOTION_EVIDENCE_FRAME_STEP = 0.1
 DEFAULT_MOTION_LIVE_TAIL_OFFSET = 2.0
+DEFAULT_MOTION_BOX_LIMIT = 5
+DEFAULT_SUBJECT_CLASSES = "car,bicycle,person"
+DEFAULT_SUBJECT_CONFIDENCE = 0.35
+DEFAULT_SUBJECT_MIN_MOVEMENT_PCT = 2.0
+DEFAULT_SUBJECT_MIN_AREA_PCT = 0.05
+DEFAULT_SUBJECT_CROP_PADDING = 0.35
 MOTION_DETECT_MODES = ("smart", "fixed")
 MOTION_SCAN_ENGINES = ("auto", "gstreamer-jetson", "ffmpeg")
 DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
@@ -3631,15 +3638,18 @@ def probe_media_video_info(ffmpeg_bin: str, source_path: Path) -> dict:
         return {}
     stream = streams[0]
     fps = None
+    nominal_fps = None
     for key in ("avg_frame_rate", "r_frame_rate"):
         fps = parse_frame_rate(stream.get(key))
         if fps and fps > 0:
             break
+    nominal_fps = parse_frame_rate(stream.get("r_frame_rate"))
     return {
         "codec_name": stream.get("codec_name"),
         "width": stream.get("width"),
         "height": stream.get("height"),
         "frame_rate": fps,
+        "nominal_frame_rate": nominal_fps,
     }
 
 
@@ -4774,6 +4784,422 @@ def compute_motion_metrics(
     return mean_diff, changed_pct
 
 
+def motion_plane_dimensions(
+    *,
+    motion_size: str,
+    motion_zone: str | None,
+    zone_cropped_plane: bool,
+) -> tuple[int, int]:
+    dimensions = parse_scale_dimensions(motion_size)
+    if not dimensions:
+        raise ValueError(
+            f"invalid motion size: {motion_size!r}; expected WxH like 160x90"
+        )
+    width, height = dimensions
+    if not motion_zone or not zone_cropped_plane:
+        return width, height
+    _, _, crop_width, crop_height = motion_zone_pixel_rect(
+        motion_zone,
+        width=width,
+        height=height,
+        grid_size=DEFAULT_MOTION_ZONE_GRID,
+    )
+    return crop_width, crop_height
+
+
+def source_box_from_motion_box(
+    box: dict,
+    *,
+    source_info: dict,
+    motion_size: str,
+    motion_zone: str | None,
+    zone_cropped_plane: bool,
+) -> dict | None:
+    source_width = source_info.get("width")
+    source_height = source_info.get("height")
+    if not isinstance(source_width, int) or not isinstance(source_height, int):
+        return None
+    motion_dimensions = parse_scale_dimensions(motion_size)
+    if not motion_dimensions:
+        return None
+    motion_width, motion_height = motion_dimensions
+    box_x = int(box.get("x") or 0)
+    box_y = int(box.get("y") or 0)
+    box_width = int(box.get("w") or 0)
+    box_height = int(box.get("h") or 0)
+    if box_width <= 0 or box_height <= 0:
+        return None
+
+    if zone_cropped_plane:
+        crop_x, crop_y, _, _ = motion_zone_pixel_rect(
+            motion_zone,
+            width=motion_width,
+            height=motion_height,
+            grid_size=DEFAULT_MOTION_ZONE_GRID,
+        )
+        padded_x1 = crop_x + box_x
+        padded_y1 = crop_y + box_y
+        padded_x2 = crop_x + box_x + box_width
+        padded_y2 = crop_y + box_y + box_height
+        scale = min(motion_width / source_width, motion_height / source_height)
+        scaled_width = source_width * scale
+        scaled_height = source_height * scale
+        pad_x = (motion_width - scaled_width) / 2.0
+        pad_y = (motion_height - scaled_height) / 2.0
+        source_x1 = (padded_x1 - pad_x) / scale
+        source_y1 = (padded_y1 - pad_y) / scale
+        source_x2 = (padded_x2 - pad_x) / scale
+        source_y2 = (padded_y2 - pad_y) / scale
+    else:
+        zone_x, zone_y, zone_width, zone_height = motion_zone_pixel_rect(
+            motion_zone,
+            width=source_width,
+            height=source_height,
+            grid_size=DEFAULT_MOTION_ZONE_GRID,
+        )
+        source_x1 = zone_x + (box_x / motion_width) * zone_width
+        source_y1 = zone_y + (box_y / motion_height) * zone_height
+        source_x2 = zone_x + ((box_x + box_width) / motion_width) * zone_width
+        source_y2 = zone_y + ((box_y + box_height) / motion_height) * zone_height
+
+    x1 = int(max(0, min(source_width, round(source_x1))))
+    y1 = int(max(0, min(source_height, round(source_y1))))
+    x2 = int(max(0, min(source_width, round(source_x2))))
+    y2 = int(max(0, min(source_height, round(source_y2))))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return {"x": x1, "y": y1, "w": x2 - x1, "h": y2 - y1}
+
+
+def expanded_source_box(
+    box: dict,
+    *,
+    source_info: dict,
+    padding_ratio: float = 0.65,
+    minimum_size: int = 96,
+) -> dict | None:
+    source_width = source_info.get("width")
+    source_height = source_info.get("height")
+    if not isinstance(source_width, int) or not isinstance(source_height, int):
+        return None
+    x = int(box.get("x") or 0)
+    y = int(box.get("y") or 0)
+    width = int(box.get("w") or 0)
+    height = int(box.get("h") or 0)
+    if width <= 0 or height <= 0:
+        return None
+    pad_x = max(int(round(width * padding_ratio)), (minimum_size - width) // 2)
+    pad_y = max(int(round(height * padding_ratio)), (minimum_size - height) // 2)
+    x1 = max(0, x - pad_x)
+    y1 = max(0, y - pad_y)
+    x2 = min(source_width, x + width + pad_x)
+    y2 = min(source_height, y + height + pad_y)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return {"x": x1, "y": y1, "w": x2 - x1, "h": y2 - y1}
+
+
+def box_center(box: dict) -> tuple[float, float]:
+    return (
+        float(box.get("x") or 0.0) + (float(box.get("w") or 0.0) / 2.0),
+        float(box.get("y") or 0.0) + (float(box.get("h") or 0.0) / 2.0),
+    )
+
+
+def box_iou(left: dict, right: dict) -> float:
+    left_x1 = float(left.get("x") or 0.0)
+    left_y1 = float(left.get("y") or 0.0)
+    left_x2 = left_x1 + float(left.get("w") or 0.0)
+    left_y2 = left_y1 + float(left.get("h") or 0.0)
+    right_x1 = float(right.get("x") or 0.0)
+    right_y1 = float(right.get("y") or 0.0)
+    right_x2 = right_x1 + float(right.get("w") or 0.0)
+    right_y2 = right_y1 + float(right.get("h") or 0.0)
+    intersect_x1 = max(left_x1, right_x1)
+    intersect_y1 = max(left_y1, right_y1)
+    intersect_x2 = min(left_x2, right_x2)
+    intersect_y2 = min(left_y2, right_y2)
+    intersect_width = max(intersect_x2 - intersect_x1, 0.0)
+    intersect_height = max(intersect_y2 - intersect_y1, 0.0)
+    intersection = intersect_width * intersect_height
+    left_area = max(left_x2 - left_x1, 0.0) * max(left_y2 - left_y1, 0.0)
+    right_area = max(right_x2 - right_x1, 0.0) * max(right_y2 - right_y1, 0.0)
+    union = left_area + right_area - intersection
+    if union <= 0:
+        return 0.0
+    return intersection / union
+
+
+def union_source_boxes(boxes: Sequence[dict], *, source_info: dict) -> dict | None:
+    source_width = source_info.get("width")
+    source_height = source_info.get("height")
+    if not isinstance(source_width, int) or not isinstance(source_height, int):
+        return None
+    valid_boxes = [
+        box
+        for box in boxes
+        if int(box.get("w") or 0) > 0 and int(box.get("h") or 0) > 0
+    ]
+    if not valid_boxes:
+        return None
+    x1 = max(0, min(int(box.get("x") or 0) for box in valid_boxes))
+    y1 = max(0, min(int(box.get("y") or 0) for box in valid_boxes))
+    x2 = min(
+        source_width,
+        max(int(box.get("x") or 0) + int(box.get("w") or 0) for box in valid_boxes),
+    )
+    y2 = min(
+        source_height,
+        max(int(box.get("y") or 0) + int(box.get("h") or 0) for box in valid_boxes),
+    )
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return {"x": x1, "y": y1, "w": x2 - x1, "h": y2 - y1}
+
+
+def append_unique_box(boxes: list[dict], box: dict) -> None:
+    key = (box.get("x"), box.get("y"), box.get("w"), box.get("h"))
+    for existing in boxes:
+        existing_key = (
+            existing.get("x"),
+            existing.get("y"),
+            existing.get("w"),
+            existing.get("h"),
+        )
+        if key == existing_key:
+            return
+    boxes.append(box)
+
+
+def append_motion_component_boxes(
+    boxes: list[dict],
+    component_indices: Sequence[int],
+    *,
+    width: int,
+    height: int,
+    min_area: int,
+) -> None:
+    if not component_indices:
+        return
+    xs = [index % width for index in component_indices]
+    ys = [index // width for index in component_indices]
+    min_x = min(xs)
+    max_x = max(xs)
+    min_y = min(ys)
+    max_y = max(ys)
+    box_width = max_x - min_x + 1
+    box_height = max_y - min_y + 1
+    area = len(component_indices)
+
+    too_wide = box_width >= max(24, int(width * 0.45))
+    enough_height = box_height >= max(8, int(height * 0.08))
+    if not too_wide or not enough_height:
+        boxes.append(
+            {
+                "x": min_x,
+                "y": min_y,
+                "w": box_width,
+                "h": box_height,
+                "area": area,
+            }
+        )
+        return
+
+    by_column: dict[int, list[int]] = {}
+    for index in component_indices:
+        x = index % width
+        y = index // width
+        by_column.setdefault(x, []).append(y)
+
+    active_threshold = max(3, int(box_height * 0.12))
+    active_columns = [
+        x for x in range(min_x, max_x + 1) if len(by_column.get(x, [])) >= active_threshold
+    ]
+    runs: list[tuple[int, int]] = []
+    if active_columns:
+        run_start = active_columns[0]
+        previous = active_columns[0]
+        for x in active_columns[1:]:
+            if x <= previous + 2:
+                previous = x
+                continue
+            runs.append((run_start, previous))
+            run_start = previous = x
+        runs.append((run_start, previous))
+
+    split_boxes: list[dict] = []
+    min_run_width = max(4, int(width * 0.025))
+    for run_start, run_end in runs:
+        if (run_end - run_start + 1) < min_run_width:
+            continue
+        run_ys: list[int] = []
+        run_area = 0
+        for x in range(run_start, run_end + 1):
+            values = by_column.get(x, [])
+            run_area += len(values)
+            run_ys.extend(values)
+        if run_area < min_area or not run_ys:
+            continue
+        split_boxes.append(
+            {
+                "x": run_start,
+                "y": min(run_ys),
+                "w": run_end - run_start + 1,
+                "h": max(run_ys) - min(run_ys) + 1,
+                "area": run_area,
+            }
+        )
+
+    if split_boxes:
+        boxes.extend(split_boxes)
+        return
+
+    boxes.append(
+        {
+            "x": min_x,
+            "y": min_y,
+            "w": box_width,
+            "h": box_height,
+            "area": area,
+        }
+    )
+
+
+def detect_motion_boxes(
+    previous_frame: bytes | None,
+    current_frame: bytes,
+    *,
+    width: int,
+    height: int,
+    pixel_delta_threshold: int = DEFAULT_MOTION_PIXEL_DELTA,
+    limit: int = DEFAULT_MOTION_BOX_LIMIT,
+) -> list[dict]:
+    if previous_frame is None or len(previous_frame) != len(current_frame):
+        return []
+    if width <= 0 or height <= 0 or len(current_frame) != width * height:
+        return []
+
+    changed = bytearray(width * height)
+    for index, (previous_value, current_value) in enumerate(
+        zip(previous_frame, current_frame)
+    ):
+        if abs(current_value - previous_value) >= pixel_delta_threshold:
+            changed[index] = 1
+
+    visited = bytearray(width * height)
+    boxes: list[dict] = []
+    min_area = max(4, int(width * height * 0.00008))
+    for start_index, is_changed in enumerate(changed):
+        if not is_changed or visited[start_index]:
+            continue
+        stack = [start_index]
+        visited[start_index] = 1
+        min_x = max_x = start_index % width
+        min_y = max_y = start_index // width
+        area = 0
+        component_indices: list[int] = []
+        while stack:
+            index = stack.pop()
+            area += 1
+            component_indices.append(index)
+            x = index % width
+            y = index // width
+            min_x = min(min_x, x)
+            max_x = max(max_x, x)
+            min_y = min(min_y, y)
+            max_y = max(max_y, y)
+            for neighbor in (
+                index - 1 if x > 0 else -1,
+                index + 1 if x < width - 1 else -1,
+                index - width if y > 0 else -1,
+                index + width if y < height - 1 else -1,
+            ):
+                if neighbor >= 0 and changed[neighbor] and not visited[neighbor]:
+                    visited[neighbor] = 1
+                    stack.append(neighbor)
+        if area < min_area:
+            continue
+        append_motion_component_boxes(
+            boxes,
+            component_indices,
+            width=width,
+            height=height,
+            min_area=min_area,
+        )
+    boxes.sort(key=lambda item: int(item.get("area") or 0), reverse=True)
+    return boxes[: max(limit, 0)]
+
+
+def motion_box_payload(
+    *,
+    previous_frame: bytes | None,
+    current_frame: bytes,
+    plane_width: int,
+    plane_height: int,
+    source_info: dict,
+    motion_size: str,
+    motion_zone: str | None,
+    zone_cropped_plane: bool,
+) -> dict:
+    motion_boxes = detect_motion_boxes(
+        previous_frame,
+        current_frame,
+        width=plane_width,
+        height=plane_height,
+    )
+    source_boxes = []
+    expanded_boxes = []
+    for box in motion_boxes:
+        source_box = source_box_from_motion_box(
+            box,
+            source_info=source_info,
+            motion_size=motion_size,
+            motion_zone=motion_zone,
+            zone_cropped_plane=zone_cropped_plane,
+        )
+        if source_box:
+            source_boxes.append(source_box)
+    union_box = union_source_boxes(source_boxes, source_info=source_info)
+    if union_box:
+        source_width = source_info.get("width") or 0
+        source_height = source_info.get("height") or 0
+        union_area = int(union_box.get("w") or 0) * int(union_box.get("h") or 0)
+        source_area = int(source_width) * int(source_height)
+        coherent_union = (
+            source_area > 0
+            and union_area <= source_area * 0.35
+            and int(union_box.get("w") or 0) <= int(source_width) * 0.8
+            and int(union_box.get("h") or 0) <= int(source_height) * 0.8
+        )
+        if coherent_union:
+            expanded_union = expanded_source_box(union_box, source_info=source_info)
+            expanded_area = (
+                int(expanded_union.get("w") or 0) * int(expanded_union.get("h") or 0)
+                if expanded_union
+                else 0
+            )
+            expanded_coherent = (
+                expanded_union
+                and expanded_area <= source_area * 0.35
+                and int(expanded_union.get("w") or 0) <= int(source_width) * 0.8
+                and int(expanded_union.get("h") or 0) <= int(source_height) * 0.8
+            )
+            if expanded_coherent:
+                append_unique_box(expanded_boxes, expanded_union)
+    for source_box in source_boxes:
+        expanded_box = expanded_source_box(source_box, source_info=source_info)
+        if expanded_box:
+            append_unique_box(expanded_boxes, expanded_box)
+    payload = {}
+    if motion_boxes:
+        payload["motion_boxes"] = motion_boxes
+    if source_boxes:
+        payload["source_boxes"] = source_boxes
+    if expanded_boxes:
+        payload["source_crop_boxes"] = expanded_boxes
+    return payload
+
+
 def evaluate_motion_gate(
     *,
     enabled: bool,
@@ -5152,6 +5578,7 @@ def motion_scan_output_paths(output_root: Path) -> dict[str, Path]:
     return {
         "root": output_root,
         "frames_dir": output_root / "frames",
+        "crops_dir": output_root / "crops",
         "events_jsonl": output_root / "events.jsonl",
         "events_log": output_root / "events.log",
         "debug_log": output_root / "motion-debug.jsonl",
@@ -5200,6 +5627,18 @@ def build_motion_scan_candidate(
     candidate["duration"] = round(
         max(float(candidate["t_end"]) - float(candidate["t_start"]), 0.0), 3
     )
+    peak_record = max(
+        records,
+        key=lambda record: motion_candidate_score(
+            record.get("mean_diff"),
+            record.get("changed_pct"),
+            current_threshold=motion_threshold,
+            min_changed_pct=min_changed_pct,
+        ),
+    )
+    for key in ("motion_boxes", "source_boxes", "source_crop_boxes"):
+        if peak_record.get(key):
+            candidate[key] = peak_record[key]
     return candidate
 
 
@@ -5282,6 +5721,9 @@ def merge_motion_scan_candidates(
         current["mean_diff"] = peak.get("mean_diff")
         current["changed_pct"] = peak.get("changed_pct")
         current["reason"] = peak.get("reason")
+        for key in ("motion_boxes", "source_boxes", "source_crop_boxes"):
+            if peak.get(key):
+                current[key] = peak.get(key)
         current["score"] = max(current_score, candidate_score)
         current["raw_t_start"] = min(
             float(current.get("raw_t_start") or current.get("t_start") or 0.0),
@@ -5394,6 +5836,51 @@ def save_motion_evidence_frames(
     return peak_reference, frame_references
 
 
+def save_motion_candidate_crops(
+    *,
+    ffmpeg_path: str,
+    source_path: Path,
+    session_dir: Path,
+    runtime_paths: dict[str, Path],
+    candidate_label: str,
+    candidate: dict,
+) -> tuple[str | None, list[str]]:
+    crop_boxes = candidate.get("source_crop_boxes") or []
+    if not isinstance(crop_boxes, list) or not crop_boxes:
+        return None, []
+    ensure_directory(runtime_paths["crops_dir"])
+    crop_references: list[str] = []
+    peak_crop_reference: str | None = None
+    peak = float(candidate.get("t") or 0.0)
+    for index, crop_box in enumerate(crop_boxes[:DEFAULT_MOTION_BOX_LIMIT], start=1):
+        if not isinstance(crop_box, dict):
+            continue
+        x = int(crop_box.get("x") or 0)
+        y = int(crop_box.get("y") or 0)
+        width = int(crop_box.get("w") or 0)
+        height = int(crop_box.get("h") or 0)
+        if width <= 0 or height <= 0:
+            continue
+        crop_path = runtime_paths["crops_dir"] / (
+            f"{candidate_label}-{index:02d}-{int(round(peak * 1000)):09d}.jpg"
+        )
+        try:
+            extract_frame_at_time(
+                ffmpeg_path,
+                source_path,
+                peak,
+                crop_path,
+                frame_filter=f"crop={width}:{height}:{x}:{y}",
+            )
+        except RuntimeError:
+            continue
+        reference = relative_to_session(crop_path, session_dir)
+        crop_references.append(reference)
+        if peak_crop_reference is None:
+            peak_crop_reference = reference
+    return peak_crop_reference, crop_references
+
+
 def write_motion_candidate_event(
     *,
     ffmpeg_path: str,
@@ -5418,6 +5905,14 @@ def write_motion_candidate_event(
         frame_step=frame_step,
         duration_seconds=duration_seconds,
     )
+    peak_crop_reference, crop_references = save_motion_candidate_crops(
+        ffmpeg_path=ffmpeg_path,
+        source_path=source.source_path,
+        session_dir=source.session_dir,
+        runtime_paths=runtime_paths,
+        candidate_label=candidate_label,
+        candidate=candidate,
+    )
     payload = {
         "t": round(float(candidate["t"]), 3),
         "k": "motion",
@@ -5432,12 +5927,22 @@ def write_motion_candidate_event(
         "sample_count": candidate.get("sample_count"),
         "score": round(float(candidate.get("score") or 0.0), 3),
     }
+    if candidate.get("motion_boxes"):
+        payload["motion_boxes"] = candidate.get("motion_boxes")
+    if candidate.get("source_boxes"):
+        payload["source_boxes"] = candidate.get("source_boxes")
+    if candidate.get("source_crop_boxes"):
+        payload["source_crop_boxes"] = candidate.get("source_crop_boxes")
     if candidate.get("merged_count"):
         payload["merged_count"] = candidate.get("merged_count")
     if peak_frame_reference:
         payload["f"] = peak_frame_reference
     if frame_references:
         payload["frames"] = frame_references
+    if peak_crop_reference:
+        payload["crop"] = peak_crop_reference
+    if crop_references:
+        payload["crops"] = crop_references
     append_jsonl(runtime_paths["events_jsonl"], payload)
     append_text_line(
         runtime_paths["events_log"],
@@ -5477,6 +5982,7 @@ def collect_ffmpeg_motion_scan_records(
     *,
     ffmpeg_path: str,
     source_path: Path,
+    source_info: dict,
     sample_points: Sequence[float],
     motion_size: str,
     motion_zone: str | None,
@@ -5489,6 +5995,11 @@ def collect_ffmpeg_motion_scan_records(
     hit_records: list[dict] = []
     sample_count = 0
     adaptive_state = MotionAdaptiveState() if motion_detect_mode == "smart" else None
+    plane_width, plane_height = motion_plane_dimensions(
+        motion_size=motion_size,
+        motion_zone=motion_zone,
+        zone_cropped_plane=True,
+    )
     for offset_seconds in sample_points:
         try:
             current_frame = extract_motion_plane_at_time(
@@ -5499,9 +6010,10 @@ def collect_ffmpeg_motion_scan_records(
                 motion_zone=motion_zone,
                 motion_zone_grid=DEFAULT_MOTION_ZONE_GRID,
             )
+            comparison_frame = previous_frame
             result = evaluate_motion_gate(
                 enabled=True,
-                previous_frame=previous_frame,
+                previous_frame=comparison_frame,
                 current_frame=current_frame,
                 mean_threshold=motion_threshold,
                 min_changed_pct=min_changed_pct,
@@ -5518,6 +6030,19 @@ def collect_ffmpeg_motion_scan_records(
                 motion_zone=motion_zone,
                 result=result,
             )
+            if result.triggered:
+                record.update(
+                    motion_box_payload(
+                        previous_frame=comparison_frame,
+                        current_frame=current_frame,
+                        plane_width=plane_width,
+                        plane_height=plane_height,
+                        source_info=source_info,
+                        motion_size=motion_size,
+                        motion_zone=motion_zone,
+                        zone_cropped_plane=True,
+                    )
+                )
             record["detect_mode"] = motion_detect_mode
             records.append(record)
             if result.triggered:
@@ -5670,6 +6195,11 @@ def collect_gstreamer_motion_scan_records(
     adaptive_state = MotionAdaptiveState() if motion_detect_mode == "smart" else None
     next_sample_time = 0.0
     fallback_time = 0.0
+    plane_width, plane_height = motion_plane_dimensions(
+        motion_size=motion_size,
+        motion_zone=motion_zone,
+        zone_cropped_plane=False,
+    )
     pipeline.set_state(Gst.State.PLAYING)
     try:
         while True:
@@ -5698,9 +6228,10 @@ def collect_gstreamer_motion_scan_records(
                 current_frame = bytes(map_info.data)
             finally:
                 buffer.unmap(map_info)
+            comparison_frame = previous_frame
             result = evaluate_motion_gate(
                 enabled=True,
-                previous_frame=previous_frame,
+                previous_frame=comparison_frame,
                 current_frame=current_frame,
                 mean_threshold=motion_threshold,
                 min_changed_pct=min_changed_pct,
@@ -5717,6 +6248,19 @@ def collect_gstreamer_motion_scan_records(
                 motion_zone=motion_zone,
                 result=result,
             )
+            if result.triggered:
+                record.update(
+                    motion_box_payload(
+                        previous_frame=comparison_frame,
+                        current_frame=current_frame,
+                        plane_width=plane_width,
+                        plane_height=plane_height,
+                        source_info=source_info,
+                        motion_size=motion_size,
+                        motion_zone=motion_zone,
+                        zone_cropped_plane=False,
+                    )
+                )
             record["detect_mode"] = motion_detect_mode
             records.append(record)
             if result.triggered:
@@ -5986,6 +6530,7 @@ def command_motion_scan(args: argparse.Namespace) -> int:
             records, hit_records, sample_count = collect_ffmpeg_motion_scan_records(
                 ffmpeg_path=ffmpeg_path,
                 source_path=source.source_path,
+                source_info=source_info,
                 sample_points=sample_points,
                 motion_size=args.motion_size,
                 motion_zone=motion_zone,
@@ -6003,6 +6548,7 @@ def command_motion_scan(args: argparse.Namespace) -> int:
             records, hit_records, sample_count = collect_ffmpeg_motion_scan_records(
                 ffmpeg_path=ffmpeg_path,
                 source_path=source.source_path,
+                source_info=source_info,
                 sample_points=sample_points,
                 motion_size=args.motion_size,
                 motion_zone=motion_zone,
@@ -7110,6 +7656,29 @@ def ask_ollama_for_detections(
     timeout_seconds: float,
     keepalive: str,
 ) -> tuple[list[str], str, dict[str, str]]:
+    response_text = request_ollama_vision_response(
+        image_paths=image_paths,
+        model=model,
+        ollama_host=ollama_host,
+        prompt=prompt,
+        timeout_seconds=timeout_seconds,
+        keepalive=keepalive,
+    )
+    detections, status_by_detection = normalize_vision_detection_statuses(
+        extract_json_object(response_text)
+    )
+    return detections, response_text, status_by_detection
+
+
+def request_ollama_vision_response(
+    *,
+    image_paths: Sequence[Path],
+    model: str,
+    ollama_host: str,
+    prompt: str,
+    timeout_seconds: float,
+    keepalive: str,
+) -> str:
     encoded_images = [
         base64.b64encode(image_path.read_bytes()).decode("ascii")
         for image_path in image_paths
@@ -7144,11 +7713,821 @@ def ask_ollama_for_detections(
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"ollama returned invalid JSON: {exc}") from exc
 
-    response_text = str(response_payload.get("response") or "")
-    detections, status_by_detection = normalize_vision_detection_statuses(
-        extract_json_object(response_text)
+    return str(response_payload.get("response") or "")
+
+
+def number_scan_output_paths(output_root: Path) -> dict[str, Path]:
+    return {
+        "root": output_root,
+        "events_jsonl": output_root / "events.jsonl",
+        "events_log": output_root / "events.log",
+        "debug_log": output_root / "number-debug.jsonl",
+        "summary_json": output_root / "summary.json",
+        "summary_text": output_root / "summary.txt",
+    }
+
+
+def default_number_scan_prompt() -> str:
+    return (
+        "Read race identifiers from this crop. Return only numbers or short "
+        "alphanumeric identifiers that are clearly printed on the moving subject: "
+        "runner bibs on shirts or shorts, bicycle race plates, helmet numbers, "
+        "or race car door and side-panel numbers. Ignore timestamps, dates, road "
+        "signs, lane markings, parked vehicles, spectators, and background text. "
+        "Do not guess when the identifier is blurred, cropped off, or ambiguous. "
+        "Do not copy placeholder or example values. Return only JSON with one key "
+        "named numbers whose value is an array of strings. If no race identifier "
+        "is clearly readable, "
+        'return {"numbers":[]}.'
     )
-    return detections, response_text, status_by_detection
+
+
+def normalize_door_number_text(value: object) -> str | None:
+    text = str(value).strip().upper()
+    if not text:
+        return None
+    text = text.replace("O", "0").replace("I", "1").replace("L", "1")
+    text = re.sub(r"[^A-Z0-9]+", "", text)
+    if re.fullmatch(r"\d{1,4}", text):
+        return text
+    if re.fullmatch(r"[A-Z]{0,2}\d{1,4}[A-Z]{0,2}", text):
+        return text
+    return None
+
+
+def normalize_number_scan_results(response_text: str) -> list[str]:
+    payload = extract_json_object(response_text)
+    raw_values = payload.get("numbers")
+    if not isinstance(raw_values, list):
+        raw_values = payload.get("detections")
+    if not isinstance(raw_values, list):
+        raw_values = payload.get("labels")
+    if not isinstance(raw_values, list):
+        raw_values = []
+    numbers: list[str] = []
+    for raw_value in raw_values:
+        if isinstance(raw_value, dict):
+            candidate = None
+            for key in ("number", "n", "label", "text", "id", "detection"):
+                value = raw_value.get(key)
+                if value not in (None, ""):
+                    candidate = value
+                    break
+            raw_value = candidate
+        normalized = normalize_door_number_text(raw_value)
+        if normalized and normalized not in numbers:
+            numbers.append(normalized)
+    return numbers
+
+
+def motion_events_path_for_source(source: ExportSource, motion_dir: Path | None) -> Path:
+    if motion_dir:
+        candidate = motion_dir.expanduser()
+        if candidate.is_dir():
+            return candidate / "events.jsonl"
+        return candidate
+    subject_events = source.session_dir / "subject-scan" / "events.jsonl"
+    if subject_events.exists():
+        return subject_events
+    return source.session_dir / "motion-scan" / "events.jsonl"
+
+
+def number_scan_crop_paths(
+    *,
+    session_dir: Path,
+    motion_event: dict,
+    max_crops_per_event: int,
+) -> list[Path]:
+    raw_references = motion_event.get("crops")
+    if not isinstance(raw_references, list):
+        raw_references = []
+    if not raw_references and motion_event.get("crop"):
+        raw_references = [motion_event.get("crop")]
+    crop_paths: list[Path] = []
+    seen: set[Path] = set()
+    for raw_reference in raw_references[: max(max_crops_per_event, 0)]:
+        crop_path = session_asset_path(session_dir, str(raw_reference or ""))
+        if not crop_path or not crop_path.exists() or crop_path in seen:
+            continue
+        seen.add(crop_path)
+        crop_paths.append(crop_path)
+    return crop_paths
+
+
+def number_scan_event_log_line(payload: dict) -> str:
+    return (
+        f"{payload['w']} identifier {payload['l']} "
+        f"t={format_duration(payload.get('t'))} "
+        f"subject={payload.get('subject', '-')} "
+        f"source={payload.get('source_event', payload.get('motion_event', '-'))} "
+        f"crop={payload.get('crop', '-')}"
+    )
+
+
+def subject_scan_output_paths(output_root: Path) -> dict[str, Path]:
+    return {
+        "root": output_root,
+        "frames_dir": output_root / "frames",
+        "crops_dir": output_root / "crops",
+        "kitti_dir": output_root / "deepstream-kitti",
+        "events_jsonl": output_root / "events.jsonl",
+        "events_log": output_root / "events.log",
+        "debug_log": output_root / "subject-debug.jsonl",
+        "summary_json": output_root / "summary.json",
+        "summary_text": output_root / "summary.txt",
+        "deepstream_config": output_root / "deepstream-app.txt",
+        "infer_config": output_root / "config_infer_primary.txt",
+        "deepstream_log": output_root / "deepstream.log",
+    }
+
+
+def deepstream_sample_root() -> Path:
+    return Path("/opt/nvidia/deepstream/deepstream-7.1/samples")
+
+
+def deepstream_trafficcamnet_available() -> tuple[bool, str]:
+    if not shutil.which("deepstream-app"):
+        return False, "deepstream-app is missing"
+    samples = deepstream_sample_root()
+    required = [
+        samples / "configs/deepstream-app/config_infer_primary.txt",
+        samples / "models/Primary_Detector/resnet18_trafficcamnet_pruned.onnx",
+        samples / "models/Primary_Detector/labels.txt",
+        samples / "models/Primary_Detector/cal_trt.bin",
+    ]
+    missing = [str(path) for path in required if not path.exists()]
+    if missing:
+        return False, "missing DeepStream TrafficCamNet assets: " + ", ".join(missing)
+    return True, "TrafficCamNet assets found"
+
+
+def prepare_subject_deepstream_configs(
+    *,
+    source: ExportSource,
+    source_info: dict,
+    runtime_paths: dict[str, Path],
+) -> None:
+    samples = deepstream_sample_root()
+    infer_template = samples / "configs/deepstream-app/config_infer_primary.txt"
+    infer_text = infer_template.read_text()
+    engine_path = runtime_paths["root"] / "trafficcamnet_b1_int8.engine"
+    infer_text = infer_text.replace(
+        "../../models/",
+        str(samples / "models") + "/",
+    )
+    infer_text = re.sub(
+        r"model-engine-file=.*",
+        f"model-engine-file={engine_path}",
+        infer_text,
+    )
+    infer_text = re.sub(r"batch-size=.*", "batch-size=1", infer_text, count=1)
+    runtime_paths["infer_config"].write_text(infer_text)
+
+    width = int(source_info.get("width") or 1920)
+    height = int(source_info.get("height") or 1080)
+    app_text = f"""[application]
+enable-perf-measurement=1
+perf-measurement-interval-sec=5
+gie-kitti-output-dir={runtime_paths['kitti_dir']}
+
+[tiled-display]
+enable=0
+rows=1
+columns=1
+width=1280
+height=720
+
+[source0]
+enable=1
+type=2
+uri=file://{source.source_path}
+
+[sink0]
+enable=1
+type=1
+sync=0
+source-id=0
+
+[osd]
+enable=0
+
+[streammux]
+live-source=0
+batch-size=1
+batched-push-timeout=40000
+width={width}
+height={height}
+
+[primary-gie]
+enable=1
+batch-size=1
+bbox-border-color0=1;0;0;1
+bbox-border-color1=0;1;1;1
+bbox-border-color2=0;0;1;1
+bbox-border-color3=0;1;0;1
+interval=0
+gie-unique-id=1
+config-file={runtime_paths['infer_config']}
+
+[tests]
+file-loop=0
+"""
+    runtime_paths["deepstream_config"].write_text(app_text)
+
+
+def run_deepstream_subject_detector(runtime_paths: dict[str, Path]) -> None:
+    command = ["deepstream-app", "-c", str(runtime_paths["deepstream_config"])]
+    with runtime_paths["deepstream_log"].open("w", encoding="utf-8") as log_handle:
+        result = subprocess.run(
+            command,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+        )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"deepstream-app exited {result.returncode}; see {runtime_paths['deepstream_log']}"
+        )
+
+
+def parse_deepstream_frame_index(path: Path) -> int | None:
+    match = re.search(r"_(\d+)\.txt$", path.name)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def load_deepstream_kitti_detections(
+    *,
+    kitti_dir: Path,
+    source_info: dict,
+    allowed_classes: set[str],
+    min_confidence: float,
+    min_area_pct: float,
+) -> list[dict]:
+    source_width = int(source_info.get("width") or 0)
+    source_height = int(source_info.get("height") or 0)
+    frame_rate = float(
+        source_info.get("nominal_frame_rate") or source_info.get("frame_rate") or 0.0
+    )
+    if source_width <= 0 or source_height <= 0 or frame_rate <= 0:
+        return []
+    detections: list[dict] = []
+    min_area = source_width * source_height * (max(min_area_pct, 0.0) / 100.0)
+    for kitti_path in sorted(kitti_dir.glob("*.txt")):
+        frame_index = parse_deepstream_frame_index(kitti_path)
+        if frame_index is None:
+            continue
+        try:
+            lines = kitti_path.read_text().splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            parts = line.split()
+            if len(parts) < 16:
+                continue
+            label = parts[0].lower()
+            if allowed_classes and label not in allowed_classes:
+                continue
+            try:
+                x1, y1, x2, y2 = (float(parts[index]) for index in range(4, 8))
+                confidence = float(parts[15])
+            except ValueError:
+                continue
+            width = max(x2 - x1, 0.0)
+            height = max(y2 - y1, 0.0)
+            if confidence < min_confidence or (width * height) < min_area:
+                continue
+            box = {
+                "x": int(round(max(0.0, min(source_width, x1)))),
+                "y": int(round(max(0.0, min(source_height, y1)))),
+                "w": int(round(min(source_width, x2) - max(0.0, x1))),
+                "h": int(round(min(source_height, y2) - max(0.0, y1))),
+            }
+            if box["w"] <= 0 or box["h"] <= 0:
+                continue
+            detections.append(
+                {
+                    "frame": frame_index,
+                    "t": frame_index / frame_rate,
+                    "label": label,
+                    "confidence": round(confidence, 4),
+                    "box": box,
+                }
+            )
+    return detections
+
+
+def link_subject_tracks(
+    detections: Sequence[dict],
+    *,
+    frame_rate: float,
+    source_info: dict,
+    min_movement_pct: float,
+    max_gap_seconds: float = 0.75,
+) -> list[dict]:
+    source_width = float(source_info.get("width") or 1)
+    source_height = float(source_info.get("height") or 1)
+    diagonal = math.hypot(source_width, source_height)
+    max_gap_frames = max(1, int(round(max_gap_seconds * max(frame_rate, 1.0))))
+    tracks: list[dict] = []
+    next_id = 1
+    for detection in sorted(detections, key=lambda item: (item["frame"], item["label"])):
+        best_track = None
+        best_score = -1.0
+        for track in tracks:
+            if track["label"] != detection["label"]:
+                continue
+            gap = int(detection["frame"]) - int(track["last_frame"])
+            if gap <= 0 or gap > max_gap_frames:
+                continue
+            iou = box_iou(track["last_box"], detection["box"])
+            previous_center = box_center(track["last_box"])
+            current_center = box_center(detection["box"])
+            center_distance = math.hypot(
+                current_center[0] - previous_center[0],
+                current_center[1] - previous_center[1],
+            )
+            distance_score = 1.0 / (1.0 + center_distance / max(diagonal, 1.0))
+            score = iou + (0.25 * distance_score)
+            if score > best_score:
+                best_score = score
+                best_track = track
+        if best_track is None:
+            tracks.append(
+                {
+                    "id": next_id,
+                    "label": detection["label"],
+                    "detections": [detection],
+                    "first_frame": detection["frame"],
+                    "last_frame": detection["frame"],
+                    "last_box": detection["box"],
+                }
+            )
+            next_id += 1
+            continue
+        best_track["detections"].append(detection)
+        best_track["last_frame"] = detection["frame"]
+        best_track["last_box"] = detection["box"]
+
+    useful_tracks: list[dict] = []
+    min_movement = diagonal * (max(min_movement_pct, 0.0) / 100.0)
+    for track in tracks:
+        track_detections = track["detections"]
+        if len(track_detections) < 2:
+            continue
+        first_center = box_center(track_detections[0]["box"])
+        last_center = box_center(track_detections[-1]["box"])
+        movement = math.hypot(
+            last_center[0] - first_center[0],
+            last_center[1] - first_center[1],
+        )
+        if movement < min_movement:
+            continue
+        best_detection = max(
+            track_detections,
+            key=lambda item: (
+                float(item.get("confidence") or 0.0),
+                int(item["box"].get("w") or 0) * int(item["box"].get("h") or 0),
+            ),
+        )
+        useful_tracks.append(
+            {
+                "id": track["id"],
+                "label": track["label"],
+                "t": best_detection["t"],
+                "t_start": track_detections[0]["t"],
+                "t_end": track_detections[-1]["t"],
+                "frame": best_detection["frame"],
+                "box": best_detection["box"],
+                "confidence": best_detection["confidence"],
+                "movement_px": round(movement, 1),
+                "detection_count": len(track_detections),
+            }
+        )
+    useful_tracks.sort(key=lambda item: float(item.get("t") or 0.0))
+    return useful_tracks
+
+
+def save_subject_event_artifacts(
+    *,
+    ffmpeg_path: str,
+    source: ExportSource,
+    runtime_paths: dict[str, Path],
+    subject: dict,
+    source_info: dict,
+    padding_ratio: float,
+) -> tuple[str | None, str | None, dict | None]:
+    label = f"subject-{int(subject['id']):04d}"
+    offset_seconds = float(subject.get("t") or 0.0)
+    frame_path = runtime_paths["frames_dir"] / (
+        f"{label}-{int(round(offset_seconds * 1000)):09d}.jpg"
+    )
+    crop_path = runtime_paths["crops_dir"] / (
+        f"{label}-{int(round(offset_seconds * 1000)):09d}.jpg"
+    )
+    frame_reference = None
+    crop_reference = None
+    crop_box = expanded_source_box(
+        subject["box"],
+        source_info=source_info,
+        padding_ratio=padding_ratio,
+        minimum_size=160,
+    )
+    try:
+        extract_frame_at_time(
+            ffmpeg_path,
+            source.source_path,
+            offset_seconds,
+            frame_path,
+        )
+        frame_reference = relative_to_session(frame_path, source.session_dir)
+    except RuntimeError:
+        pass
+    if crop_box:
+        try:
+            extract_frame_at_time(
+                ffmpeg_path,
+                source.source_path,
+                offset_seconds,
+                crop_path,
+                frame_filter=(
+                    f"crop={crop_box['w']}:{crop_box['h']}:"
+                    f"{crop_box['x']}:{crop_box['y']}"
+                ),
+            )
+            crop_reference = relative_to_session(crop_path, source.session_dir)
+        except RuntimeError:
+            crop_box = None
+    return frame_reference, crop_reference, crop_box
+
+
+def subject_event_log_line(payload: dict) -> str:
+    return (
+        f"{payload['l']} {payload['subject']} "
+        f"{format_duration(payload.get('t_start'))}-{format_duration(payload.get('t_end'))} "
+        f"peak {format_duration(payload.get('t'))} conf {float(payload.get('confidence') or 0.0):.2f}"
+        + (f", crop {payload['crop']}" if payload.get("crop") else "")
+    )
+
+
+def command_subject_scan(args: argparse.Namespace) -> int:
+    config_path = args.config_file.expanduser()
+    config = load_config(config_path)
+    if not args.target and interactive_mode_enabled(args):
+        selected_target = select_export_target(
+            args,
+            config,
+            title="Choose a session or media file for subject scan",
+        )
+        if not selected_target:
+            print("no sessions found for subject scan", file=sys.stderr)
+            return 1
+        args.target = selected_target
+
+    try:
+        source = resolve_export_source(
+            args.recordings_dir.expanduser(),
+            str(args.target) if args.target else None,
+        )
+    except FileNotFoundError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+    ffmpeg_path = shutil.which(args.ffmpeg_bin)
+    if not ffmpeg_path:
+        print(f"ffmpeg binary not found: {args.ffmpeg_bin}", file=sys.stderr)
+        return 1
+    available, reason = deepstream_trafficcamnet_available()
+    if not available:
+        print(reason, file=sys.stderr)
+        return 1
+
+    source_info = probe_media_video_info(args.ffmpeg_bin, source.source_path)
+    if not source_info.get("frame_rate"):
+        print(f"could not determine frame rate: {source.source_path}", file=sys.stderr)
+        return 1
+    if args.output_dir:
+        output_root = args.output_dir.expanduser()
+    else:
+        output_root, output_notice = default_vision_output_root(source, "subject-scan")
+        if output_notice:
+            print(f"warning: {output_notice}", file=sys.stderr)
+    paths = subject_scan_output_paths(output_root)
+    for key in ("root", "frames_dir", "crops_dir", "kitti_dir"):
+        ensure_directory(paths[key])
+    for key in ("events_jsonl", "events_log", "debug_log", "summary_json", "summary_text", "deepstream_log"):
+        try:
+            paths[key].unlink()
+        except FileNotFoundError:
+            pass
+    for old_kitti in paths["kitti_dir"].glob("*.txt"):
+        try:
+            old_kitti.unlink()
+        except OSError:
+            pass
+
+    allowed_classes = {
+        item.strip().lower()
+        for item in (args.subject_classes or "").split(",")
+        if item.strip()
+    }
+    print(f"Subject scan source: {source.source_path}")
+    print(f"Subject output dir:  {output_root}")
+    print(f"Detector:            DeepStream TrafficCamNet")
+    print(f"Classes:             {', '.join(sorted(allowed_classes)) or 'all'}")
+    print(
+        f"Filter:              confidence>={args.min_confidence:g}, "
+        f"area>={args.min_area_pct:g}%, movement>={args.min_movement_pct:g}%"
+    )
+    prepare_subject_deepstream_configs(
+        source=source,
+        source_info=source_info,
+        runtime_paths=paths,
+    )
+    if args.dry_run:
+        print(f"DeepStream config:   {paths['deepstream_config']}")
+        return 0
+
+    try:
+        run_deepstream_subject_detector(paths)
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    detections = load_deepstream_kitti_detections(
+        kitti_dir=paths["kitti_dir"],
+        source_info=source_info,
+        allowed_classes=allowed_classes,
+        min_confidence=args.min_confidence,
+        min_area_pct=args.min_area_pct,
+    )
+    tracks = link_subject_tracks(
+        detections,
+        frame_rate=float(
+            source_info.get("nominal_frame_rate") or source_info["frame_rate"]
+        ),
+        source_info=source_info,
+        min_movement_pct=args.min_movement_pct,
+    )
+    if args.max_subjects is not None:
+        tracks = tracks[: max(args.max_subjects, 0)]
+    append_jsonl(
+        paths["debug_log"],
+        {
+            "source": str(source.source_path),
+            "detections": len(detections),
+            "tracks": len(tracks),
+            "classes": sorted(allowed_classes),
+        },
+    )
+
+    for index, subject in enumerate(tracks, start=1):
+        frame_reference, crop_reference, crop_box = save_subject_event_artifacts(
+            ffmpeg_path=ffmpeg_path,
+            source=source,
+            runtime_paths=paths,
+            subject=subject,
+            source_info=source_info,
+            padding_ratio=args.crop_padding,
+        )
+        payload = {
+            "t": round(float(subject["t"]), 3),
+            "k": "subject",
+            "l": f"subject-{index:04d}",
+            "s": "subject-scan",
+            "subject": subject["label"],
+            "track_id": subject["id"],
+            "t_start": round(float(subject["t_start"]), 3),
+            "t_end": round(float(subject["t_end"]), 3),
+            "frame_index": subject["frame"],
+            "box": subject["box"],
+            "crop_box": crop_box,
+            "confidence": subject["confidence"],
+            "movement_px": subject["movement_px"],
+            "detection_count": subject["detection_count"],
+        }
+        if frame_reference:
+            payload["f"] = frame_reference
+        if crop_reference:
+            payload["crop"] = crop_reference
+            payload["crops"] = [crop_reference]
+        append_jsonl(paths["events_jsonl"], payload)
+        append_text_line(paths["events_log"], subject_event_log_line(payload))
+
+    summary = {
+        "created_at": datetime.now().astimezone().isoformat(),
+        "source_path": str(source.source_path),
+        "source_width": source_info.get("width"),
+        "source_height": source_info.get("height"),
+        "frame_rate": source_info.get("frame_rate"),
+        "nominal_frame_rate": source_info.get("nominal_frame_rate"),
+        "detections": len(detections),
+        "subjects": len(tracks),
+        "classes": sorted(allowed_classes),
+        "min_confidence": args.min_confidence,
+        "min_area_pct": args.min_area_pct,
+        "min_movement_pct": args.min_movement_pct,
+    }
+    paths["summary_json"].write_text(json.dumps(summary, indent=2) + "\n")
+    paths["summary_text"].write_text(
+        "\n".join(
+            [
+                "Subject Scan Summary",
+                f"Source: {source.source_path}",
+                f"Detections: {len(detections)}",
+                f"Subjects: {len(tracks)}",
+                f"Output: {output_root}",
+            ]
+        )
+        + "\n"
+    )
+    print(f"Detections:          {len(detections)}")
+    print(f"Subjects:            {len(tracks)}")
+    print(f"Subject events:      {paths['events_log']}")
+    print(f"Subject debug:       {paths['debug_log']}")
+    return 0
+
+
+def command_number_scan(args: argparse.Namespace) -> int:
+    config_path = args.config_file.expanduser()
+    config = load_config(config_path)
+    if not args.target and interactive_mode_enabled(args):
+        selected_target = select_export_target(
+            args,
+            config,
+            title="Choose a session or media file for number scan",
+        )
+        if not selected_target:
+            print("no sessions found for number scan", file=sys.stderr)
+            return 1
+        args.target = selected_target
+
+    try:
+        source = resolve_export_source(
+            args.recordings_dir.expanduser(),
+            str(args.target) if args.target else None,
+        )
+    except FileNotFoundError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+
+    motion_events_path = motion_events_path_for_source(source, args.motion_dir)
+    motion_events = load_jsonl_records(motion_events_path)
+    if not motion_events:
+        print(f"no motion events found: {motion_events_path}", file=sys.stderr)
+        return 1
+
+    if args.output_dir:
+        output_root = args.output_dir.expanduser()
+    else:
+        output_root, output_notice = default_vision_output_root(source, "number-scan")
+        if output_notice:
+            print(f"warning: {output_notice}", file=sys.stderr)
+    paths = number_scan_output_paths(output_root)
+    ensure_directory(paths["root"])
+    for key in ("events_jsonl", "events_log", "debug_log", "summary_json", "summary_text"):
+        try:
+            paths[key].unlink()
+        except FileNotFoundError:
+            pass
+
+    candidates: list[tuple[dict, Path]] = []
+    max_total_crops = None if args.max_crops is None else max(args.max_crops, 0)
+    for motion_event in motion_events:
+        if max_total_crops is not None and len(candidates) >= max_total_crops:
+            break
+        for crop_path in number_scan_crop_paths(
+            session_dir=source.session_dir,
+            motion_event=motion_event,
+            max_crops_per_event=args.max_crops_per_event,
+        ):
+            if max_total_crops is not None and len(candidates) >= max_total_crops:
+                break
+            candidates.append((motion_event, crop_path))
+
+    print(f"Number scan source: {source.source_path}")
+    print(f"Source events:      {motion_events_path}")
+    print(f"Number output dir:  {output_root}")
+    print(f"Number model:       {args.model}")
+    print(f"Crops:              {len(candidates)}")
+    if args.dry_run:
+        for motion_event, crop_path in candidates[:20]:
+            print(
+                f"  {motion_event.get('l', 'motion')} "
+                f"{format_duration(motion_event.get('t'))} {crop_path}"
+            )
+        if len(candidates) > 20:
+            print(f"  ... {len(candidates) - 20} more")
+        return 0
+
+    prompt = args.prompt or default_number_scan_prompt()
+    promoted_count = 0
+    crop_count = 0
+    number_counts: dict[str, int] = {}
+    for motion_event, crop_path in candidates:
+        crop_count += 1
+        started_at = time.perf_counter()
+        now = datetime.now().astimezone()
+        crop_reference = relative_to_session(crop_path, source.session_dir)
+        try:
+            response_text = request_ollama_vision_response(
+                image_paths=[crop_path],
+                model=args.model,
+                ollama_host=args.ollama_host,
+                prompt=prompt,
+                timeout_seconds=args.timeout,
+                keepalive=args.keepalive,
+            )
+            elapsed_ms = int(round((time.perf_counter() - started_at) * 1000))
+            numbers = normalize_number_scan_results(response_text)
+            append_jsonl(
+                paths["debug_log"],
+                {
+                    "w": event_wall_time(now),
+                    "t": motion_event.get("t"),
+                    "motion_event": motion_event.get("l"),
+                    "crop": crop_reference,
+                    "model": args.model,
+                    "elapsed_ms": elapsed_ms,
+                    "response": response_text,
+                    "numbers": numbers,
+                },
+            )
+        except RuntimeError as exc:
+            elapsed_ms = int(round((time.perf_counter() - started_at) * 1000))
+            append_jsonl(
+                paths["debug_log"],
+                {
+                    "w": event_wall_time(now),
+                    "t": motion_event.get("t"),
+                    "motion_event": motion_event.get("l"),
+                    "crop": crop_reference,
+                    "model": args.model,
+                    "elapsed_ms": elapsed_ms,
+                    "error": str(exc),
+                },
+            )
+            continue
+
+        for number in numbers:
+            payload = {
+                "t": round(float(motion_event.get("t") or 0.0), 3),
+                "w": event_wall_time(now),
+                "k": "identifier",
+                "l": number,
+                "s": "number-scan",
+                "m": args.model,
+                "f": crop_reference,
+                "crop": crop_reference,
+                "source_event": motion_event.get("l"),
+                "motion_event": motion_event.get("l"),
+                "motion_source": motion_event.get("s"),
+                "motion_frame": motion_event.get("f"),
+                "subject": motion_event.get("subject"),
+            }
+            append_jsonl(paths["events_jsonl"], payload)
+            append_text_line(paths["events_log"], number_scan_event_log_line(payload))
+            promoted_count += 1
+            number_counts[number] = number_counts.get(number, 0) + 1
+            print(
+                f"{format_duration(payload['t'])} identifier {number} "
+                f"subject={payload.get('subject') or '-'} "
+                f"source={payload.get('source_event')} crop={crop_reference}",
+                flush=True,
+            )
+
+    summary = {
+        "created_at": datetime.now().astimezone().isoformat(),
+        "source_path": str(source.source_path),
+        "source_events_path": str(motion_events_path),
+        "source_events": len(motion_events),
+        "crops_scanned": crop_count,
+        "identifier_events": promoted_count,
+        "identifiers": number_counts,
+        "model": args.model,
+    }
+    paths["summary_json"].write_text(json.dumps(summary, indent=2) + "\n")
+    lines = [
+        "Number Scan Summary",
+        f"Source: {source.source_path}",
+        f"Source events: {len(motion_events)}",
+        f"Crops scanned: {crop_count}",
+        f"Identifier events: {promoted_count}",
+        f"Output: {output_root}",
+    ]
+    if number_counts:
+        lines.append("Numbers:")
+        for number, count in sorted(number_counts.items()):
+            lines.append(f"  {number}: {count}")
+    paths["summary_text"].write_text("\n".join(lines) + "\n")
+    print(f"Identifier events:  {promoted_count}")
+    print(f"Number log:         {paths['events_log']}")
+    print(f"Number debug:       {paths['debug_log']}")
+    return 0
 
 
 def event_detection_label(event: dict) -> str | None:
@@ -10487,6 +11866,142 @@ def build_parser() -> argparse.ArgumentParser:
         help="Prompt to choose a recent session when the target is omitted.",
     )
     motion_scan.set_defaults(func=command_motion_scan)
+
+    subject_scan = subparsers.add_parser(
+        "subject-scan",
+        help="Use DeepStream to find moving cars, bicycles, and people and save subject crops.",
+    )
+    subject_scan.add_argument(
+        "target",
+        nargs="?",
+        type=Path,
+        help="Optional session directory or media file. Defaults to an interactive picker or the latest session.",
+    )
+    subject_scan.add_argument(
+        "--ffmpeg-bin",
+        default="ffmpeg",
+        help="FFmpeg binary to use for source frame and crop extraction.",
+    )
+    subject_scan.add_argument(
+        "--subject-classes",
+        default=DEFAULT_SUBJECT_CLASSES,
+        help="Comma-separated detector classes to keep. TrafficCamNet supports car,bicycle,person,road_sign.",
+    )
+    subject_scan.add_argument(
+        "--min-confidence",
+        type=float,
+        default=DEFAULT_SUBJECT_CONFIDENCE,
+        help="Minimum detector confidence to keep.",
+    )
+    subject_scan.add_argument(
+        "--min-area-pct",
+        type=float,
+        default=DEFAULT_SUBJECT_MIN_AREA_PCT,
+        help="Minimum subject box area as percent of the source frame.",
+    )
+    subject_scan.add_argument(
+        "--min-movement-pct",
+        type=float,
+        default=DEFAULT_SUBJECT_MIN_MOVEMENT_PCT,
+        help="Minimum track movement as percent of source-frame diagonal.",
+    )
+    subject_scan.add_argument(
+        "--crop-padding",
+        type=float,
+        default=DEFAULT_SUBJECT_CROP_PADDING,
+        help="Padding ratio around each detected subject crop.",
+    )
+    subject_scan.add_argument(
+        "--max-subjects",
+        type=int,
+        help="Maximum subject tracks to save.",
+    )
+    subject_scan.add_argument(
+        "--output-dir",
+        type=Path,
+        help="Directory for subject scan output. Defaults to subject-scan under the session directory.",
+    )
+    subject_scan.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Write planned DeepStream config without running detection.",
+    )
+    subject_scan.add_argument(
+        "--interactive",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Prompt to choose a recent session when the target is omitted.",
+    )
+    subject_scan.set_defaults(func=command_subject_scan)
+
+    number_scan = subparsers.add_parser(
+        "number-scan",
+        help="Read tentative race identifiers from subject or motion crop images.",
+    )
+    number_scan.add_argument(
+        "target",
+        nargs="?",
+        type=Path,
+        help="Optional session directory or media file. Defaults to an interactive picker or the latest session.",
+    )
+    number_scan.add_argument(
+        "--motion-dir",
+        type=Path,
+        help="Subject-scan or motion-scan directory/events.jsonl path. Defaults to subject-scan when present, then motion-scan.",
+    )
+    number_scan.add_argument(
+        "--model",
+        default=DEFAULT_VISION_MODEL,
+        help="Ollama vision model to query.",
+    )
+    number_scan.add_argument(
+        "--ollama-host",
+        default=DEFAULT_OLLAMA_HOST,
+        help="Base URL for the local Ollama server.",
+    )
+    number_scan.add_argument(
+        "--timeout",
+        type=float,
+        default=120.0,
+        help="Seconds to wait for each Ollama response.",
+    )
+    number_scan.add_argument(
+        "--keepalive",
+        default="5m",
+        help="How long Ollama should keep the model loaded between crops.",
+    )
+    number_scan.add_argument(
+        "--prompt",
+        help="Override the default race-identifier prompt.",
+    )
+    number_scan.add_argument(
+        "--max-crops",
+        type=int,
+        help="Maximum total crop images to send to the model.",
+    )
+    number_scan.add_argument(
+        "--max-crops-per-event",
+        type=int,
+        default=3,
+        help="Maximum crop images to inspect for each motion event.",
+    )
+    number_scan.add_argument(
+        "--output-dir",
+        type=Path,
+        help="Directory for number scan output. Defaults to number-scan under the session directory.",
+    )
+    number_scan.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print planned crop reads without calling Ollama.",
+    )
+    number_scan.add_argument(
+        "--interactive",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Prompt to choose a recent session when the target is omitted.",
+    )
+    number_scan.set_defaults(func=command_number_scan)
 
     motion_live = subparsers.add_parser(
         "motion-live",

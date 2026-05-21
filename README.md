@@ -392,11 +392,46 @@ To force a one-off scan with explicit settings:
 `motion-scan` writes grouped candidate windows to `motion-scan/events.jsonl`
 and a human-readable `events.log`. Both `motion-scan` and `motion-live` also
 save several source-resolution frames around each candidate peak and record
-those paths on the event. Treat those windows and frames as the cheap trigger
-stage for heavier number-reading passes: OCR at source resolution, YOLO vehicle
-cropping, or a Jetson-native DeepStream/TensorRT pipeline. On Jetson, this keeps
-the reliable DVR recording separate from inference and lets NVIDIA-accelerated
-detectors spend work only on road-constrained, high-motion windows.
+those paths on the event. Offline `motion-scan` additionally estimates moving
+regions from the dense motion plane, maps them back to source coordinates, and
+saves padded source crops under `motion-scan/crops/`; the primary crop path is
+recorded as `crop`, with all alternatives in `crops`. Treat those windows,
+frames, and crops as the cheap trigger stage for heavier number-reading passes:
+OCR at source resolution, YOLO vehicle cropping, or a Jetson-native
+DeepStream/TensorRT pipeline. On Jetson, this keeps the reliable DVR recording
+separate from inference and lets NVIDIA-accelerated detectors spend work only
+on road-constrained, high-motion windows.
+
+To ask the local vision model to read tentative identifiers from those crops:
+
+```bash
+./field-replay number-scan /home/roger/recordings/NORC-NS-narrow.mp4 \
+  --motion-dir /home/roger/recordings/motion-scan \
+  --max-crops-per-event 3
+```
+
+`number-scan` reads `subject-scan/events.jsonl` when present, otherwise
+`motion-scan/events.jsonl`, inspects the saved crop images, and writes
+tentative identifier events to `number-scan/events.jsonl`, `events.log`, and
+`number-debug.jsonl`. Treat these reads as candidates for human review; blurred,
+partial, or tiny bibs, bike plates, or car door numbers can still be missed or
+misread.
+
+For Jetson detector experiments, `subject-scan` runs the local DeepStream
+TrafficCamNet detector and saves crops for detected moving subjects rather than
+raw changed-pixel regions:
+
+```bash
+./field-replay subject-scan /home/roger/recordings/NORC-NS-narrow.mp4 \
+  --subject-classes car,bicycle,person
+```
+
+It writes `subject-scan/events.jsonl`, `events.log`, `subject-debug.jsonl`,
+`frames/`, and `crops/`. This is the intended direction for the general field
+workflow: detect and track moving subjects such as cars, bicycles, and people,
+then run identifier reading only on those subject crops. The current
+TrafficCamNet path is still experimental; detector false positives and track
+fragmentation should be reviewed before relying on it for unattended reads.
 
 `--motion-engine auto` prefers Jetson GStreamer decode when `/dev/v4l2-nvdec`,
 `nvv4l2decoder`, `nvvidconv`, Python GStreamer bindings, and `appsink` are
@@ -478,6 +513,9 @@ A typical session folder looks like:
 - `archive.mkv`: finalized recording after stop
 - `session.json`: session metadata
 - `vision-live/` or `vision-scan/`: vision evidence and diagnostics when used
+- `motion-scan/` or `motion-live/`: motion candidates, evidence frames, and offline crops when used
+- `subject-scan/`: DeepStream subject detections and crops when used
+- `number-scan/`: tentative identifier reads from subject or motion crop images when used
 
 Vision output currently includes:
 
