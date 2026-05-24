@@ -28,11 +28,14 @@ The repo is intentionally small:
 - `h264_nvenc` is the preferred encoder when available; the tool falls back to other encoders such as `libx264`.
 - V4L2 H.264 passthrough via `--video-codec-mode copy` is important for low-CPU capture, but cannot burn the timestamp overlay.
 - Vision features are a second set of eyes, not authoritative timing or bib proof.
+- The field deployment target is Jetson Orin NX 16 GB class hardware. Prefer NVIDIA-native Jetson paths for field acceleration: JetPack/L4T multimedia, GStreamer, `nvv4l2h264enc`, `nvv4l2decoder`, NVDEC/VIC, DeepStream, and TensorRT.
+- Roger's Pop!_OS workstation has an NVIDIA GeForce RTX 4060 Ti 8 GB and should be used as the local NVIDIA development/prototyping box. Prefer desktop dGPU equivalents there: FFmpeg `h264_nvenc`, CUDA/NVDEC, GStreamer `nvcodec`, TensorRT, and DeepStream dGPU containers.
+- Keep Jetson-specific and desktop-dGPU-specific assumptions distinct. Do not expect `/dev/v4l2-nvenc`, `/dev/v4l2-nvdec`, or Jetson-only plugins on the RTX workstation; do not assume desktop CUVID/mpv behavior maps cleanly to Jetson.
 
 ## Session and config data
 
 - Saved profiles live in `~/.config/field-replay/config.json` by default.
-- Recordings default to `~/recordings`.
+- Recordings default to `~/recordings`; on Roger's workstation, prefer `/mnt/storage` for bulky recordings, sample clips, DeepStream outputs, and generated experiment artifacts.
 - A normal session contains `timeshift.ts`, a finalized `archive.*`, and `session.json`.
 - Vision output directories such as `vision-live/`, `vision-scan/`, and `vision-scan-sweep/` may contain:
   - `events.log`

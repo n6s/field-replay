@@ -48,6 +48,9 @@ These notes are not commitments. They are the current product leanings and backl
 
 - On old laptops, prefer continuous DVR, fixed-cadence vision, cooldowns, promoted frames, and event-dense review.
 - Use motion and VOX to prioritize extra samples, not to hide quiet-looking intervals entirely.
+- Treat Jetson Orin NX 16 GB as the preferred field hardware target. Optimize field workflows around saved profiles and NVIDIA acceleration without making the live operator remember backend details.
+- Treat Roger's RTX 4060 Ti 8 GB workstation as the local development target for NVIDIA experiments. Use dGPU DeepStream/TensorRT/CUDA/NVDEC/NVENC there, then keep Jetson deployment paths separate where JetPack/L4T devices and plugins differ.
+- Keep large workstation artifacts on `/mnt/storage`: recordings, training/evaluation clips, generated TensorRT engines when practical, and DeepStream experiment outputs.
 - On Jetson Orin-class hardware, prefer NVIDIA decode/inference paths: NVDEC/VIC/GStreamer for dense motion candidate windows, then DeepStream/TensorRT detectors, trackers, and OCR over those windows.
 - Keep CPU handoffs narrow. Full-resolution frames should stay in NVMM/GPU memory until a candidate crop, metadata record, or promoted evidence frame is actually needed.
 - On stronger future hardware, improve cadence, resolution, model count, and camera count without changing the basic evidence model.

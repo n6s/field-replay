@@ -32,6 +32,36 @@ What to treat as current assumptions:
 - the vision workflow is useful as a second set of eyes, not as gospel
 - saved frame review in `eog` is now a first-class workflow, not just debugging
 
+## NVIDIA Development Targets
+
+The field target is a Jetson Orin NX 16 GB class system. Favor NVIDIA-native
+decode, encode, and inference paths there: JetPack/L4T multimedia, GStreamer,
+NVDEC/VIC, `nvv4l2h264enc`, `nvv4l2decoder`, DeepStream, and TensorRT.
+Keep the DVR recording path reliable first, then use accelerated motion,
+detection, tracking, OCR, or promoted-frame passes as evidence helpers.
+
+Roger's Pop!_OS workstation with an NVIDIA GeForce RTX 4060 Ti 8 GB is the
+local development and prototyping box for this stack. Use the desktop dGPU
+equivalents there: FFmpeg `h264_nvenc`, CUDA/NVDEC, GStreamer `nvcodec`,
+TensorRT, and DeepStream dGPU containers. Do not expect Jetson-only device
+nodes such as `/dev/v4l2-nvenc` or `/dev/v4l2-nvdec` on the workstation.
+
+The workstation currently has a DeepStream 8.0 samples image prepared for local
+experiments:
+
+```bash
+docker run --rm -it --gpus all \
+  -e NVIDIA_DRIVER_CAPABILITIES=compute,utility,video,graphics \
+  -v "$PWD":/workspace/field_replay \
+  -w /workspace/field_replay \
+  field-replay-deepstream:8.0-samples bash
+```
+
+Use `/mnt/storage` for bulky local artifacts on the workstation: recordings,
+sample clips, sweep outputs, model test data, and generated experiment files.
+The root filesystem is intentionally not the place for large datasets or long
+recording runs.
+
 ## Suggested System Requirements
 
 These are practical guesses based on current use and local benchmarking, not hard enforcement rules.
