@@ -46,6 +46,39 @@ equivalents there: FFmpeg `h264_nvenc`, CUDA/NVDEC, GStreamer `nvcodec`,
 TensorRT, and DeepStream dGPU containers. Do not expect Jetson-only device
 nodes such as `/dev/v4l2-nvenc` or `/dev/v4l2-nvdec` on the workstation.
 
+### Product Detection Direction
+
+The target operator workflow is deliberately simpler than the current
+experiment surface: aim one or more fixed cameras, start a session, and review
+meaningful passing subjects plus any tentative readable identifiers. The
+operator should not normally choose detector classes, motion thresholds, OCR
+engines, or tracker settings.
+
+The intended NVIDIA pipeline is:
+
+```text
+continuous DVR -> broad DeepStream/TensorRT detector -> NvDCF tracks
+               -> transit scoring -> promoted crops -> identifier reading
+```
+
+A promoted subject should make meaningful directional progress through the
+scene: a runner, bicycle, moving vehicle, pedestrian, pet, aircraft, or other
+coherent moving target. Parked vehicles, race staff lingering in one area,
+swaying wires or vegetation, shadows, and local background flutter should not
+be promoted merely because pixels changed.
+
+Race type may later be an optional bias (`general`, `running`, `cycling`, or
+`motor`) for prioritization and identifier crop selection, but it must not hide
+other significant moving subjects. A general home observation mode should
+remain useful for pedestrians, pets, passing vehicles, aircraft, and
+unclassified coherent motion.
+
+`TrafficCamNet`, motion scans, and Ollama-based reads are currently laboratory
+paths used to validate evidence handling. The eventual primary detector should
+be a broader YOLO-class TensorRT/DeepStream model paired with NvDCF tracking;
+experimental paths should be hidden or removed once that route is demonstrated
+on field footage.
+
 The workstation currently has a DeepStream 8.0 samples image prepared for local
 experiments:
 
@@ -417,9 +450,10 @@ tentative identifier events to `number-scan/events.jsonl`, `events.log`, and
 partial, or tiny bibs, bike plates, or car door numbers can still be missed or
 misread.
 
-For Jetson detector experiments, `subject-scan` runs the local DeepStream
-TrafficCamNet detector and saves crops for detected moving subjects rather than
-raw changed-pixel regions:
+For Jetson detector experiments, `subject-scan` currently runs the local
+DeepStream TrafficCamNet detector as a temporary scaffold, passes its objects
+through the installed NvDCF tracker, and saves crops only for tracks with
+meaningful directional transit rather than raw changed-pixel regions:
 
 ```bash
 ./field-replay subject-scan /home/roger/recordings/NORC-NS-narrow.mp4 \
@@ -427,11 +461,20 @@ raw changed-pixel regions:
 ```
 
 It writes `subject-scan/events.jsonl`, `events.log`, `subject-debug.jsonl`,
-`frames/`, and `crops/`. This is the intended direction for the general field
-workflow: detect and track moving subjects such as cars, bicycles, and people,
-then run identifier reading only on those subject crops. The current
-TrafficCamNet path is still experimental; detector false positives and track
-fragmentation should be reviewed before relying on it for unattended reads.
+`frames/`, `crops/`, and DeepStream track diagnostics. Its temporary
+`deepstream-model/` directory holds staged detector assets and the generated
+TensorRT engine so repeated tests in the same output directory do not rebuild
+the engine at event-start latency. By default it uses
+`nvdcf-perf`, requires net movement of at least `2%` of the frame diagonal,
+and requires track directionality of at least `0.65`, which begins filtering
+parked or locally wandering detections. This is a lab command toward the
+general field workflow: a broader detector should replace TrafficCamNet while
+retaining NvDCF tracks and transit scoring before identifier reading. Review
+detector coverage, false positives, and fragmented tracks before relying on it
+for unattended reads. During this evaluation phase, if NvDCF produces no
+tracks at all while the detector did see objects, the command reports that
+condition and uses its provisional association fallback so fast-subject misses
+remain visible rather than being silently discarded.
 
 `--motion-engine auto` prefers Jetson GStreamer decode when `/dev/v4l2-nvdec`,
 `nvv4l2decoder`, `nvvidconv`, Python GStreamer bindings, and `appsink` are

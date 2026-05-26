@@ -69,8 +69,11 @@ DEFAULT_MOTION_BOX_LIMIT = 5
 DEFAULT_SUBJECT_CLASSES = "car,bicycle,person"
 DEFAULT_SUBJECT_CONFIDENCE = 0.35
 DEFAULT_SUBJECT_MIN_MOVEMENT_PCT = 2.0
+DEFAULT_SUBJECT_MIN_DIRECTIONALITY = 0.65
 DEFAULT_SUBJECT_MIN_AREA_PCT = 0.05
 DEFAULT_SUBJECT_CROP_PADDING = 0.35
+DEFAULT_SUBJECT_TRACKER = "nvdcf-perf"
+SUBJECT_TRACKERS = ("nvdcf-perf", "none")
 MOTION_DETECT_MODES = ("smart", "fixed")
 MOTION_SCAN_ENGINES = ("auto", "gstreamer-jetson", "ffmpeg")
 DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
@@ -7829,7 +7832,9 @@ def subject_scan_output_paths(output_root: Path) -> dict[str, Path]:
         "root": output_root,
         "frames_dir": output_root / "frames",
         "crops_dir": output_root / "crops",
+        "model_dir": output_root / "deepstream-model",
         "kitti_dir": output_root / "deepstream-kitti",
+        "track_kitti_dir": output_root / "deepstream-tracks",
         "events_jsonl": output_root / "events.jsonl",
         "events_log": output_root / "events.log",
         "debug_log": output_root / "subject-debug.jsonl",
@@ -7861,20 +7866,58 @@ def deepstream_trafficcamnet_available() -> tuple[bool, str]:
     return True, "TrafficCamNet assets found"
 
 
+def deepstream_tracker_assets(tracker_name: str) -> tuple[Path, Path] | None:
+    if tracker_name == "none":
+        return None
+    tracker_configs = {
+        "nvdcf-perf": "config_tracker_NvDCF_perf.yml",
+    }
+    config_name = tracker_configs.get(tracker_name)
+    if not config_name:
+        return None
+    samples = deepstream_sample_root()
+    return (
+        samples.parent / "lib/libnvds_nvmultiobjecttracker.so",
+        samples / "configs/deepstream-app" / config_name,
+    )
+
+
+def deepstream_tracker_available(tracker_name: str) -> tuple[bool, str]:
+    if tracker_name == "none":
+        return True, "tracker disabled"
+    assets = deepstream_tracker_assets(tracker_name)
+    if not assets:
+        return False, f"unsupported DeepStream tracker: {tracker_name}"
+    missing = [str(path) for path in assets if not path.exists()]
+    if missing:
+        return False, "missing DeepStream tracker assets: " + ", ".join(missing)
+    return True, f"DeepStream tracker {tracker_name} assets found"
+
+
 def prepare_subject_deepstream_configs(
     *,
     source: ExportSource,
     source_info: dict,
     runtime_paths: dict[str, Path],
+    tracker_name: str,
+    stage_model_assets: bool,
 ) -> None:
     samples = deepstream_sample_root()
     infer_template = samples / "configs/deepstream-app/config_infer_primary.txt"
     infer_text = infer_template.read_text()
-    engine_path = runtime_paths["root"] / "trafficcamnet_b1_int8.engine"
-    infer_text = infer_text.replace(
-        "../../models/",
-        str(samples / "models") + "/",
-    )
+    source_model_dir = samples / "models/Primary_Detector"
+    model_dir = runtime_paths["model_dir"]
+    ensure_directory(model_dir)
+    for asset_name in (
+        "resnet18_trafficcamnet_pruned.onnx",
+        "labels.txt",
+        "cal_trt.bin",
+    ):
+        local_asset = model_dir / asset_name
+        if stage_model_assets and not local_asset.exists():
+            shutil.copy2(source_model_dir / asset_name, local_asset)
+    engine_path = model_dir / "resnet18_trafficcamnet_pruned.onnx_b1_gpu0_int8.engine"
+    infer_text = infer_text.replace("../../models/Primary_Detector", str(model_dir))
     infer_text = re.sub(
         r"model-engine-file=.*",
         f"model-engine-file={engine_path}",
@@ -7885,10 +7928,28 @@ def prepare_subject_deepstream_configs(
 
     width = int(source_info.get("width") or 1920)
     height = int(source_info.get("height") or 1080)
+    tracked_output = ""
+    tracker_section = ""
+    tracker_assets = deepstream_tracker_assets(tracker_name)
+    if tracker_assets:
+        tracker_lib, tracker_config = tracker_assets
+        tracked_output = f"kitti-track-output-dir={runtime_paths['track_kitti_dir']}\n"
+        tracker_section = f"""
+[tracker]
+enable=1
+tracker-width=960
+tracker-height=544
+ll-lib-file={tracker_lib}
+ll-config-file={tracker_config}
+gpu-id=0
+display-tracking-id=0
+"""
+
     app_text = f"""[application]
 enable-perf-measurement=1
 perf-measurement-interval-sec=5
 gie-kitti-output-dir={runtime_paths['kitti_dir']}
+{tracked_output}
 
 [tiled-display]
 enable=0
@@ -7928,6 +7989,7 @@ bbox-border-color3=0;1;0;1
 interval=0
 gie-unique-id=1
 config-file={runtime_paths['infer_config']}
+{tracker_section}
 
 [tests]
 file-loop=0
@@ -7966,8 +8028,9 @@ def load_deepstream_kitti_detections(
     kitti_dir: Path,
     source_info: dict,
     allowed_classes: set[str],
-    min_confidence: float,
+    min_confidence: float | None,
     min_area_pct: float,
+    tracked_output: bool = False,
 ) -> list[dict]:
     source_width = int(source_info.get("width") or 0)
     source_height = int(source_info.get("height") or 0)
@@ -7988,19 +8051,28 @@ def load_deepstream_kitti_detections(
             continue
         for line in lines:
             parts = line.split()
-            if len(parts) < 16:
+            if len(parts) < (17 if tracked_output else 16):
                 continue
             label = parts[0].lower()
             if allowed_classes and label not in allowed_classes:
                 continue
             try:
-                x1, y1, x2, y2 = (float(parts[index]) for index in range(4, 8))
-                confidence = float(parts[15])
+                if tracked_output:
+                    track_id = int(parts[1])
+                    x1, y1, x2, y2 = (float(parts[index]) for index in range(5, 9))
+                    confidence = float(parts[16])
+                else:
+                    track_id = None
+                    x1, y1, x2, y2 = (float(parts[index]) for index in range(4, 8))
+                    confidence = float(parts[15])
             except ValueError:
                 continue
             width = max(x2 - x1, 0.0)
             height = max(y2 - y1, 0.0)
-            if confidence < min_confidence or (width * height) < min_area:
+            if (
+                min_confidence is not None
+                and confidence < min_confidence
+            ) or (width * height) < min_area:
                 continue
             box = {
                 "x": int(round(max(0.0, min(source_width, x1)))),
@@ -8017,9 +8089,110 @@ def load_deepstream_kitti_detections(
                     "label": label,
                     "confidence": round(confidence, 4),
                     "box": box,
+                    "track_id": track_id,
                 }
             )
     return detections
+
+
+def subject_track_summary(
+    track: dict,
+    *,
+    source_info: dict,
+    min_movement_pct: float,
+    min_directionality: float,
+) -> dict:
+    source_width = float(source_info.get("width") or 1)
+    source_height = float(source_info.get("height") or 1)
+    diagonal = math.hypot(source_width, source_height)
+    detections = sorted(track["detections"], key=lambda item: int(item["frame"]))
+    centers = [box_center(detection["box"]) for detection in detections]
+    net_movement = math.hypot(
+        centers[-1][0] - centers[0][0],
+        centers[-1][1] - centers[0][1],
+    )
+    path_movement = sum(
+        math.hypot(current[0] - previous[0], current[1] - previous[1])
+        for previous, current in zip(centers, centers[1:])
+    )
+    movement_pct = (net_movement / max(diagonal, 1.0)) * 100.0
+    directionality = net_movement / max(path_movement, 1.0)
+    duration_seconds = max(
+        float(detections[-1]["t"]) - float(detections[0]["t"]),
+        0.0,
+    )
+    best_detection = max(
+        detections,
+        key=lambda item: (
+            float(item.get("confidence") or 0.0),
+            int(item["box"].get("w") or 0) * int(item["box"].get("h") or 0),
+        ),
+    )
+    suppression_reason = None
+    if movement_pct < min_movement_pct:
+        suppression_reason = "insufficient-displacement"
+    elif directionality < min_directionality:
+        suppression_reason = "low-directionality"
+    return {
+        "id": track["id"],
+        "label": track["label"],
+        "t": best_detection["t"],
+        "t_start": detections[0]["t"],
+        "t_end": detections[-1]["t"],
+        "duration_seconds": round(duration_seconds, 3),
+        "frame": best_detection["frame"],
+        "box": best_detection["box"],
+        "confidence": best_detection["confidence"],
+        "movement_px": round(net_movement, 1),
+        "movement_pct": round(movement_pct, 3),
+        "path_movement_px": round(path_movement, 1),
+        "directionality": round(directionality, 3),
+        "transit_score": round(movement_pct * directionality, 3),
+        "detection_count": len(detections),
+        "promoted": suppression_reason is None,
+        "suppression_reason": suppression_reason,
+    }
+
+
+def summarize_subject_tracks(
+    raw_tracks: Sequence[dict],
+    *,
+    source_info: dict,
+    min_movement_pct: float,
+    min_directionality: float,
+) -> tuple[list[dict], list[dict]]:
+    scored = [
+        subject_track_summary(
+            track,
+            source_info=source_info,
+            min_movement_pct=min_movement_pct,
+            min_directionality=min_directionality,
+        )
+        for track in raw_tracks
+        if len(track.get("detections") or []) >= 2
+    ]
+    promoted = [track for track in scored if track["promoted"]]
+    promoted.sort(key=lambda item: float(item.get("t") or 0.0))
+    return promoted, scored
+
+
+def deepstream_native_subject_tracks(detections: Sequence[dict]) -> list[dict]:
+    raw_tracks: dict[tuple[str, int], dict] = {}
+    for detection in detections:
+        track_id = detection.get("track_id")
+        if not isinstance(track_id, int):
+            continue
+        key = (str(detection["label"]), track_id)
+        track = raw_tracks.setdefault(
+            key,
+            {
+                "id": track_id,
+                "label": detection["label"],
+                "detections": [],
+            },
+        )
+        track["detections"].append(detection)
+    return list(raw_tracks.values())
 
 
 def link_subject_tracks(
@@ -8027,7 +8200,6 @@ def link_subject_tracks(
     *,
     frame_rate: float,
     source_info: dict,
-    min_movement_pct: float,
     max_gap_seconds: float = 0.75,
 ) -> list[dict]:
     source_width = float(source_info.get("width") or 1)
@@ -8073,44 +8245,7 @@ def link_subject_tracks(
         best_track["detections"].append(detection)
         best_track["last_frame"] = detection["frame"]
         best_track["last_box"] = detection["box"]
-
-    useful_tracks: list[dict] = []
-    min_movement = diagonal * (max(min_movement_pct, 0.0) / 100.0)
-    for track in tracks:
-        track_detections = track["detections"]
-        if len(track_detections) < 2:
-            continue
-        first_center = box_center(track_detections[0]["box"])
-        last_center = box_center(track_detections[-1]["box"])
-        movement = math.hypot(
-            last_center[0] - first_center[0],
-            last_center[1] - first_center[1],
-        )
-        if movement < min_movement:
-            continue
-        best_detection = max(
-            track_detections,
-            key=lambda item: (
-                float(item.get("confidence") or 0.0),
-                int(item["box"].get("w") or 0) * int(item["box"].get("h") or 0),
-            ),
-        )
-        useful_tracks.append(
-            {
-                "id": track["id"],
-                "label": track["label"],
-                "t": best_detection["t"],
-                "t_start": track_detections[0]["t"],
-                "t_end": track_detections[-1]["t"],
-                "frame": best_detection["frame"],
-                "box": best_detection["box"],
-                "confidence": best_detection["confidence"],
-                "movement_px": round(movement, 1),
-                "detection_count": len(track_detections),
-            }
-        )
-    useful_tracks.sort(key=lambda item: float(item.get("t") or 0.0))
-    return useful_tracks
+    return tracks
 
 
 def save_subject_event_artifacts(
@@ -8121,8 +8256,9 @@ def save_subject_event_artifacts(
     subject: dict,
     source_info: dict,
     padding_ratio: float,
+    event_label: str | None = None,
 ) -> tuple[str | None, str | None, dict | None]:
-    label = f"subject-{int(subject['id']):04d}"
+    label = event_label or f"subject-{int(subject['id']):04d}"
     offset_seconds = float(subject.get("t") or 0.0)
     frame_path = runtime_paths["frames_dir"] / (
         f"{label}-{int(round(offset_seconds * 1000)):09d}.jpg"
@@ -8170,7 +8306,10 @@ def subject_event_log_line(payload: dict) -> str:
     return (
         f"{payload['l']} {payload['subject']} "
         f"{format_duration(payload.get('t_start'))}-{format_duration(payload.get('t_end'))} "
-        f"peak {format_duration(payload.get('t'))} conf {float(payload.get('confidence') or 0.0):.2f}"
+        f"peak {format_duration(payload.get('t'))} "
+        f"move {float(payload.get('movement_pct') or 0.0):.2f}% "
+        f"direction {float(payload.get('directionality') or 0.0):.2f} "
+        f"score {float(payload.get('transit_score') or 0.0):.2f}"
         + (f", crop {payload['crop']}" if payload.get("crop") else "")
     )
 
@@ -8205,6 +8344,13 @@ def command_subject_scan(args: argparse.Namespace) -> int:
     if not available:
         print(reason, file=sys.stderr)
         return 1
+    tracker_available, tracker_reason = deepstream_tracker_available(args.tracker)
+    if not tracker_available:
+        print(tracker_reason, file=sys.stderr)
+        return 1
+    if not 0.0 <= args.min_directionality <= 1.0:
+        print("min-directionality must be between 0 and 1", file=sys.stderr)
+        return 1
 
     source_info = probe_media_video_info(args.ffmpeg_bin, source.source_path)
     if not source_info.get("frame_rate"):
@@ -8217,7 +8363,14 @@ def command_subject_scan(args: argparse.Namespace) -> int:
         if output_notice:
             print(f"warning: {output_notice}", file=sys.stderr)
     paths = subject_scan_output_paths(output_root)
-    for key in ("root", "frames_dir", "crops_dir", "kitti_dir"):
+    for key in (
+        "root",
+        "frames_dir",
+        "crops_dir",
+        "model_dir",
+        "kitti_dir",
+        "track_kitti_dir",
+    ):
         ensure_directory(paths[key])
     for key in ("events_jsonl", "events_log", "debug_log", "summary_json", "summary_text", "deepstream_log"):
         try:
@@ -8225,6 +8378,11 @@ def command_subject_scan(args: argparse.Namespace) -> int:
         except FileNotFoundError:
             pass
     for old_kitti in paths["kitti_dir"].glob("*.txt"):
+        try:
+            old_kitti.unlink()
+        except OSError:
+            pass
+    for old_kitti in paths["track_kitti_dir"].glob("*.txt"):
         try:
             old_kitti.unlink()
         except OSError:
@@ -8237,16 +8395,20 @@ def command_subject_scan(args: argparse.Namespace) -> int:
     }
     print(f"Subject scan source: {source.source_path}")
     print(f"Subject output dir:  {output_root}")
-    print(f"Detector:            DeepStream TrafficCamNet")
+    print(f"Detector:            DeepStream TrafficCamNet (temporary scaffold)")
+    print(f"Tracker:             {args.tracker}")
     print(f"Classes:             {', '.join(sorted(allowed_classes)) or 'all'}")
     print(
-        f"Filter:              confidence>={args.min_confidence:g}, "
-        f"area>={args.min_area_pct:g}%, movement>={args.min_movement_pct:g}%"
+        f"Transit filter:      area>={args.min_area_pct:g}%, "
+        f"movement>={args.min_movement_pct:g}%, "
+        f"directionality>={args.min_directionality:g}"
     )
     prepare_subject_deepstream_configs(
         source=source,
         source_info=source_info,
         runtime_paths=paths,
+        tracker_name=args.tracker,
+        stage_model_assets=not args.dry_run,
     )
     if args.dry_run:
         print(f"DeepStream config:   {paths['deepstream_config']}")
@@ -8265,13 +8427,50 @@ def command_subject_scan(args: argparse.Namespace) -> int:
         min_confidence=args.min_confidence,
         min_area_pct=args.min_area_pct,
     )
-    tracks = link_subject_tracks(
-        detections,
-        frame_rate=float(
-            source_info.get("nominal_frame_rate") or source_info["frame_rate"]
-        ),
+    if args.tracker == "none":
+        tracked_detections = []
+        raw_tracks = link_subject_tracks(
+            detections,
+            frame_rate=float(
+                source_info.get("nominal_frame_rate") or source_info["frame_rate"]
+            ),
+            source_info=source_info,
+        )
+        track_source = "python-association"
+    else:
+        tracked_detections = load_deepstream_kitti_detections(
+            kitti_dir=paths["track_kitti_dir"],
+            source_info=source_info,
+            allowed_classes=allowed_classes,
+            min_confidence=None,
+            min_area_pct=args.min_area_pct,
+            tracked_output=True,
+        )
+        if tracked_detections:
+            raw_tracks = deepstream_native_subject_tracks(tracked_detections)
+            track_source = f"deepstream-{args.tracker}"
+        elif detections:
+            print(
+                f"warning: {args.tracker} emitted no tracks; "
+                "using provisional detector association fallback",
+                file=sys.stderr,
+            )
+            raw_tracks = link_subject_tracks(
+                detections,
+                frame_rate=float(
+                    source_info.get("nominal_frame_rate") or source_info["frame_rate"]
+                ),
+                source_info=source_info,
+            )
+            track_source = f"deepstream-{args.tracker}-empty/python-association-fallback"
+        else:
+            raw_tracks = []
+            track_source = f"deepstream-{args.tracker}"
+    tracks, scored_tracks = summarize_subject_tracks(
+        raw_tracks,
         source_info=source_info,
         min_movement_pct=args.min_movement_pct,
+        min_directionality=args.min_directionality,
     )
     if args.max_subjects is not None:
         tracks = tracks[: max(args.max_subjects, 0)]
@@ -8280,12 +8479,26 @@ def command_subject_scan(args: argparse.Namespace) -> int:
         {
             "source": str(source.source_path),
             "detections": len(detections),
+            "tracked_detections": len(tracked_detections),
+            "raw_tracks": len(raw_tracks),
             "tracks": len(tracks),
+            "track_source": track_source,
+            "tracker": args.tracker,
             "classes": sorted(allowed_classes),
         },
     )
+    for track in scored_tracks:
+        append_jsonl(
+            paths["debug_log"],
+            {
+                "kind": "track-score",
+                "track_source": track_source,
+                **track,
+            },
+        )
 
     for index, subject in enumerate(tracks, start=1):
+        event_label = f"subject-{index:04d}"
         frame_reference, crop_reference, crop_box = save_subject_event_artifacts(
             ffmpeg_path=ffmpeg_path,
             source=source,
@@ -8293,11 +8506,12 @@ def command_subject_scan(args: argparse.Namespace) -> int:
             subject=subject,
             source_info=source_info,
             padding_ratio=args.crop_padding,
+            event_label=event_label,
         )
         payload = {
             "t": round(float(subject["t"]), 3),
             "k": "subject",
-            "l": f"subject-{index:04d}",
+            "l": event_label,
             "s": "subject-scan",
             "subject": subject["label"],
             "track_id": subject["id"],
@@ -8308,6 +8522,12 @@ def command_subject_scan(args: argparse.Namespace) -> int:
             "crop_box": crop_box,
             "confidence": subject["confidence"],
             "movement_px": subject["movement_px"],
+            "movement_pct": subject["movement_pct"],
+            "path_movement_px": subject["path_movement_px"],
+            "directionality": subject["directionality"],
+            "transit_score": subject["transit_score"],
+            "duration_seconds": subject["duration_seconds"],
+            "track_source": track_source,
             "detection_count": subject["detection_count"],
         }
         if frame_reference:
@@ -8326,11 +8546,17 @@ def command_subject_scan(args: argparse.Namespace) -> int:
         "frame_rate": source_info.get("frame_rate"),
         "nominal_frame_rate": source_info.get("nominal_frame_rate"),
         "detections": len(detections),
+        "tracked_detections": len(tracked_detections),
+        "raw_tracks": len(raw_tracks),
         "subjects": len(tracks),
+        "suppressed_tracks": sum(1 for track in scored_tracks if not track["promoted"]),
+        "track_source": track_source,
+        "tracker": args.tracker,
         "classes": sorted(allowed_classes),
         "min_confidence": args.min_confidence,
         "min_area_pct": args.min_area_pct,
         "min_movement_pct": args.min_movement_pct,
+        "min_directionality": args.min_directionality,
     }
     paths["summary_json"].write_text(json.dumps(summary, indent=2) + "\n")
     paths["summary_text"].write_text(
@@ -8339,14 +8565,21 @@ def command_subject_scan(args: argparse.Namespace) -> int:
                 "Subject Scan Summary",
                 f"Source: {source.source_path}",
                 f"Detections: {len(detections)}",
+                f"Tracked detections: {len(tracked_detections)}",
+                f"Raw tracks: {len(raw_tracks)}",
                 f"Subjects: {len(tracks)}",
+                f"Suppressed tracks: {sum(1 for track in scored_tracks if not track['promoted'])}",
+                f"Tracker: {track_source}",
                 f"Output: {output_root}",
             ]
         )
         + "\n"
     )
     print(f"Detections:          {len(detections)}")
+    print(f"Tracked detections:  {len(tracked_detections)}")
+    print(f"Raw tracks:          {len(raw_tracks)}")
     print(f"Subjects:            {len(tracks)}")
+    print(f"Suppressed tracks:   {sum(1 for track in scored_tracks if not track['promoted'])}")
     print(f"Subject events:      {paths['events_log']}")
     print(f"Subject debug:       {paths['debug_log']}")
     return 0
@@ -10765,6 +10998,7 @@ def command_doctor(args: argparse.Namespace) -> int:
     player = choose_player(args.player)
     jetson_player = shutil.which("nvgstplayer-1.0") or shutil.which("nvgstplayer")
     deepstream_ok, deepstream_status = deepstream_available()
+    nvdcf_ok, nvdcf_status = deepstream_tracker_available(DEFAULT_SUBJECT_TRACKER)
     source_ok, source_status = source_readiness(args)
     if uses_alsa_audio_input(args):
         audio_ok = alsa_device_exists(args.audio_device)
@@ -10785,6 +11019,8 @@ def command_doctor(args: argparse.Namespace) -> int:
         print(f"gst-decode-reason: {jetson_gstreamer_decode_unavailable_reason()}")
     print(f"deepstream:{' yes' if deepstream_ok else ' no'}")
     print(f"deepstream-status: {deepstream_status}")
+    print(f"nvdcf:    {'yes' if nvdcf_ok else 'no'}")
+    print(f"nvdcf-status: {nvdcf_status}")
     print(f"gst-player:{' '}{jetson_player or 'missing'}")
     print(f"video:    {args.video_codec_mode}")
     print(f"backend:  {capture_backend or 'missing'}")
@@ -11869,7 +12105,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     subject_scan = subparsers.add_parser(
         "subject-scan",
-        help="Use DeepStream to find moving cars, bicycles, and people and save subject crops.",
+        help="Experimentally promote directional transits from DeepStream subject tracks.",
     )
     subject_scan.add_argument(
         "target",
@@ -11885,7 +12121,7 @@ def build_parser() -> argparse.ArgumentParser:
     subject_scan.add_argument(
         "--subject-classes",
         default=DEFAULT_SUBJECT_CLASSES,
-        help="Comma-separated detector classes to keep. TrafficCamNet supports car,bicycle,person,road_sign.",
+        help="Comma-separated temporary TrafficCamNet classes to keep: car,bicycle,person,road_sign.",
     )
     subject_scan.add_argument(
         "--min-confidence",
@@ -11904,6 +12140,18 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_SUBJECT_MIN_MOVEMENT_PCT,
         help="Minimum track movement as percent of source-frame diagonal.",
+    )
+    subject_scan.add_argument(
+        "--min-directionality",
+        type=float,
+        default=DEFAULT_SUBJECT_MIN_DIRECTIONALITY,
+        help="Minimum net displacement divided by track path distance, from 0 to 1.",
+    )
+    subject_scan.add_argument(
+        "--tracker",
+        choices=SUBJECT_TRACKERS,
+        default=DEFAULT_SUBJECT_TRACKER,
+        help="DeepStream tracker to use. NvDCF is the Orin default; none uses provisional Python association.",
     )
     subject_scan.add_argument(
         "--crop-padding",
