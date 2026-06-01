@@ -450,6 +450,31 @@ tentative identifier events to `number-scan/events.jsonl`, `events.log`, and
 partial, or tiny bibs, bike plates, or car door numbers can still be missed or
 misread.
 
+For YOLO-class detector experiments without a prepared DeepStream/TensorRT pack,
+`yolo-scan` can run an ONNX YOLO model through OpenCV DNN, link detections into
+directional tracks, and save promoted frames and crops in the same evidence
+shape used by `subject-scan`:
+
+```bash
+./field-replay yolo-scan /home/roger/recordings/NORC-NS-narrow.mp4 \
+  --yolo-model /home/roger/recordings/field-replay-yolo-eval/models/yolov5n.onnx \
+  --yolo-labels /home/roger/recordings/field-replay-yolo-eval/models/coco.names \
+  --subject-classes person,bicycle,car,truck \
+  --output-dir /home/roger/recordings/NORC-NS-narrow-yolo-scan
+```
+
+The resulting `yolo-scan/events.jsonl` can feed `number-scan` directly:
+
+```bash
+./field-replay number-scan /home/roger/recordings/NORC-NS-narrow.mp4 \
+  --motion-dir /home/roger/recordings/NORC-NS-narrow-yolo-scan/events.jsonl
+```
+
+Treat this as an evaluation bridge, not the final Jetson deployment path. On the
+current Orin test system, the available OpenCV build did not have CUDA DNN
+enabled, so this path was useful for detector quality checks but slower than a
+DeepStream/TensorRT implementation.
+
 For Jetson detector experiments, `subject-scan` currently runs the local
 DeepStream TrafficCamNet detector as a temporary scaffold, passes its objects
 through the installed NvDCF tracker, and saves crops only for tracks with
@@ -460,11 +485,21 @@ meaningful directional transit rather than raw changed-pixel regions:
   --subject-classes car,bicycle,person
 ```
 
+To continue the YOLO path, point `--subject-model-dir` at a DeepStream detector
+pack directory containing `config_infer_primary.txt` and matching model assets:
+
+```bash
+./field-replay subject-scan /home/roger/recordings/NORC-NS-narrow.mp4 \
+  --subject-model-dir /home/roger/deepstream-models/yolo4all \
+  --subject-classes car,bicycle,person,truck
+```
+
 It writes `subject-scan/events.jsonl`, `events.log`, `subject-debug.jsonl`,
-`frames/`, `crops/`, and DeepStream track diagnostics. Its temporary
+`frames/`, `crops/`, and DeepStream track diagnostics. By default, the
 `deepstream-model/` directory holds staged detector assets and the generated
-TensorRT engine so repeated tests in the same output directory do not rebuild
-the engine at event-start latency. By default it uses
+TrafficCamNet TensorRT engine so repeated tests in the same output directory do
+not rebuild the engine at event-start latency. Custom `--subject-model-dir` packs
+should provide their own DeepStream inference assets. By default it uses
 `nvdcf-perf`, requires net movement of at least `2%` of the frame diagonal,
 and requires track directionality of at least `0.65`, which begins filtering
 parked or locally wandering detections. This is a lab command toward the
