@@ -215,10 +215,21 @@ point `assist` at a pack once:
   --subject-model-dir /home/roger/deepstream-models/yolo-field
 ```
 
-The pack must contain `config_infer_primary.txt` plus the model, labels, engine
-or ONNX assets, and any custom parser library referenced by that config. After a
-successful DeepStream assist run, the pack path is remembered in the normal
-operator config so later `./field-replay assist` runs can stay low-friction.
+Plain TensorRT/`nvinfer` packs must contain `config_infer_primary.txt` plus the
+model, labels, engine or ONNX assets, and any custom parser library referenced
+by that config. Triton/`nvinferserver` packs can instead include a
+`field-replay-pack.json` manifest:
+
+```json
+{
+  "infer_config": "config_triton_inferserver_primary_yolov3_onnx_custom.txt",
+  "plugin_type": 1
+}
+```
+
+After a successful DeepStream assist run, the pack path is remembered in the
+normal operator config so later `./field-replay assist` runs can stay
+low-friction.
 
 For a running session, the live assistant follows the growing DVR tail:
 

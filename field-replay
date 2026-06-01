@@ -73,6 +73,7 @@ DEFAULT_SUBJECT_MIN_DIRECTIONALITY = 0.65
 DEFAULT_SUBJECT_MIN_AREA_PCT = 0.05
 DEFAULT_SUBJECT_CROP_PADDING = 0.35
 DEFAULT_SUBJECT_INFER_CONFIG = "config_infer_primary.txt"
+DEFAULT_SUBJECT_PACK_MANIFEST = "field-replay-pack.json"
 DEFAULT_SUBJECT_TRACKER = "nvdcf-perf"
 SUBJECT_TRACKERS = ("nvdcf-perf", "none")
 DEFAULT_YOLO_MODEL = Path("~/recordings/field-replay-yolo-eval/models/yolov5n.onnx").expanduser()
@@ -7979,13 +7980,68 @@ def deepstream_subject_pack_available(detector_pack: Path) -> tuple[bool, str]:
         return False, f"subject detector pack not found: {detector_pack}"
     if not detector_pack.is_dir():
         return False, f"subject detector pack is not a directory: {detector_pack}"
-    infer_config = detector_pack / DEFAULT_SUBJECT_INFER_CONFIG
+    try:
+        pack_spec = deepstream_subject_pack_spec(detector_pack)
+    except ValueError as exc:
+        return False, str(exc)
+    infer_config = pack_spec["infer_config"]
     if not infer_config.exists():
         return (
             False,
             f"subject detector pack missing required file: {infer_config}",
         )
-    return True, f"subject detector pack found: {detector_pack}"
+    plugin_name = deepstream_plugin_type_label(pack_spec["plugin_type"])
+    return True, f"subject detector pack found: {detector_pack} ({plugin_name})"
+
+
+def deepstream_plugin_type_label(plugin_type: int) -> str:
+    if plugin_type == 1:
+        return "nvinferserver"
+    return "nvinfer"
+
+
+def normalize_deepstream_plugin_type(raw_value: object) -> int:
+    if isinstance(raw_value, str):
+        value = raw_value.strip().lower()
+        if value in {"0", "nvinfer"}:
+            return 0
+        if value in {"1", "nvinferserver", "triton"}:
+            return 1
+    if isinstance(raw_value, int) and raw_value in (0, 1):
+        return raw_value
+    raise ValueError(
+        "DeepStream subject pack manifest plugin_type must be 0/nvinfer or 1/nvinferserver"
+    )
+
+
+def deepstream_subject_pack_spec(detector_pack: Path) -> dict:
+    manifest_path = detector_pack / DEFAULT_SUBJECT_PACK_MANIFEST
+    manifest = {}
+    if manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text())
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"invalid DeepStream subject pack manifest: {manifest_path}: {exc}") from exc
+        if not isinstance(manifest, dict):
+            raise ValueError(f"DeepStream subject pack manifest must be a JSON object: {manifest_path}")
+
+    infer_config_name = manifest.get("infer_config", DEFAULT_SUBJECT_INFER_CONFIG)
+    if not isinstance(infer_config_name, str) or not infer_config_name.strip():
+        raise ValueError("DeepStream subject pack manifest infer_config must be a non-empty string")
+    plugin_type = normalize_deepstream_plugin_type(manifest.get("plugin_type", 0))
+    infer_config = detector_pack / infer_config_name
+
+    if not manifest and not infer_config.exists():
+        triton_candidates = sorted(detector_pack.glob("config_triton*.txt"))
+        triton_candidates.extend(sorted(detector_pack.glob("config_inferserver*.txt")))
+        if len(triton_candidates) == 1:
+            infer_config = triton_candidates[0]
+            plugin_type = 1
+
+    return {
+        "infer_config": infer_config,
+        "plugin_type": plugin_type,
+    }
 
 
 def normalize_deepstream_infer_asset_paths(
@@ -8061,6 +8117,7 @@ def prepare_subject_deepstream_configs(
     model_dir = runtime_paths["model_dir"]
     ensure_directory(model_dir)
     if subject_model_dir is None:
+        gie_plugin_type = 0
         samples = deepstream_sample_root()
         infer_template = samples / "configs/deepstream-app/config_infer_primary.txt"
         infer_text = infer_template.read_text()
@@ -8081,7 +8138,9 @@ def prepare_subject_deepstream_configs(
             infer_text,
         )
     else:
-        infer_template = subject_model_dir / DEFAULT_SUBJECT_INFER_CONFIG
+        pack_spec = deepstream_subject_pack_spec(subject_model_dir)
+        gie_plugin_type = pack_spec["plugin_type"]
+        infer_template = pack_spec["infer_config"]
         infer_text = infer_template.read_text()
         infer_text = normalize_deepstream_infer_asset_paths(
             infer_text,
@@ -8152,6 +8211,7 @@ bbox-border-color2=0;0;1;1
 bbox-border-color3=0;1;0;1
 interval=0
 gie-unique-id=1
+plugin-type={gie_plugin_type}
 config-file={runtime_paths['infer_config']}
 {tracker_section}
 
@@ -8921,8 +8981,11 @@ def command_subject_scan(args: argparse.Namespace) -> int:
         if getattr(args, "subject_model_dir", None) is not None
         else None
     )
+    subject_pack_spec = None
     if subject_model_dir is not None:
         available, reason = deepstream_subject_pack_available(subject_model_dir)
+        if available:
+            subject_pack_spec = deepstream_subject_pack_spec(subject_model_dir)
     else:
         available, reason = deepstream_trafficcamnet_available()
     if not available:
@@ -8982,7 +9045,8 @@ def command_subject_scan(args: argparse.Namespace) -> int:
     print(
         "Detector:            "
         + (
-            f"DeepStream subject pack: {subject_model_dir}"
+            f"DeepStream subject pack: {subject_model_dir} "
+            f"({deepstream_plugin_type_label(subject_pack_spec['plugin_type'])})"
             if subject_model_dir is not None
             else "DeepStream TrafficCamNet (temporary scaffold)"
         )
@@ -12921,7 +12985,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help=(
             "Optional DeepStream/TensorRT detector pack directory. "
-            "Must contain config_infer_primary.txt and referenced model assets."
+            "Must contain config_infer_primary.txt and referenced model assets, "
+            "or field-replay-pack.json for nvinferserver/Triton packs."
         ),
     )
     assist.add_argument(
@@ -13920,7 +13985,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help=(
             "Optional DeepStream detector pack directory for subject-scan. "
-            "Must contain config_infer_primary.txt and any referenced assets."
+            "Must contain config_infer_primary.txt and any referenced assets, "
+            "or field-replay-pack.json for nvinferserver/Triton packs."
         ),
     )
     subject_scan.add_argument(
