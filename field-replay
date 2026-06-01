@@ -85,6 +85,7 @@ DEFAULT_YOLO_SAMPLE_INTERVAL = 0.25
 MOTION_DETECT_MODES = ("smart", "fixed")
 MOTION_SCAN_ENGINES = ("auto", "gstreamer-jetson", "ffmpeg")
 DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
+DEFAULT_SPEECH_COMMAND = "spd-say"
 DEFAULT_MPV_CONFIG_DIR = Path("~/.config/mpv").expanduser()
 DEFAULT_VISION_SWEEP_VARIANTS = (
     "source",
@@ -1249,9 +1250,14 @@ def list_alsa_cards() -> list[tuple[str, str, str]]:
 
 
 def parse_hw_device(device_name: str) -> tuple[str, str] | None:
-    if not device_name.startswith("hw:") or "," not in device_name:
+    if "," not in device_name:
         return None
-    card_token, pcm_device = device_name[3:].split(",", 1)
+    if device_name.startswith("hw:"):
+        card_token, pcm_device = device_name[3:].split(",", 1)
+    elif device_name.startswith("plughw:"):
+        card_token, pcm_device = device_name[7:].split(",", 1)
+    else:
+        return None
     return card_token, pcm_device
 
 
@@ -1300,6 +1306,48 @@ def alsa_device_exists(device_name: str) -> bool:
         if device_pcm == requested_pcm and device_card in valid_card_tokens:
             return True
     return False
+
+
+def recovered_alsa_device_name(device: AudioDevice) -> str:
+    parsed = parse_hw_device(device.device)
+    if not parsed:
+        return device.device
+    card_token, pcm_device = parsed
+    return f"plughw:{card_token},{pcm_device}"
+
+
+def recover_missing_audio_device(device_name: str) -> str | None:
+    if alsa_device_exists(device_name):
+        return None
+    requested = parse_hw_device(device_name)
+    requested_pcm = requested[1] if requested else None
+    devices = list_alsa_capture_devices()
+    if not devices:
+        return None
+
+    def score(device: AudioDevice) -> tuple[int, int, str]:
+        parsed = parse_hw_device(device.device)
+        card_token, pcm_device = parsed or ("", "")
+        label = device.label.lower()
+        return (
+            1 if requested_pcm and pcm_device == requested_pcm else 0,
+            0 if "nvidia jetson orin nx ape" in label else 1,
+            card_token,
+        )
+
+    best = max(devices, key=score)
+    return recovered_alsa_device_name(best)
+
+
+def recover_audio_device(args: argparse.Namespace) -> str | None:
+    if not uses_alsa_audio_input(args):
+        return None
+    recovered = recover_missing_audio_device(args.audio_device)
+    if not recovered:
+        return None
+    original = args.audio_device
+    args.audio_device = recovered
+    return f"audio device {original} is missing; using {recovered}"
 
 
 def detect_supported_encoders(ffmpeg_bin: str) -> tuple[str | None, set[str]]:
@@ -2933,6 +2981,9 @@ def command_setup(args: argparse.Namespace) -> int:
     source_warning = recover_source_device(args)
     if source_warning:
         print(f"warning: {source_warning}", file=sys.stderr)
+    audio_warning = recover_audio_device(args)
+    if audio_warning:
+        print(f"warning: {audio_warning}", file=sys.stderr)
 
     for warning in normalize_record_timelapse_settings(args):
         print(f"warning: {warning}", file=sys.stderr)
@@ -3178,6 +3229,9 @@ def evidence_event_sources_for_session(session_dir: Path) -> list[tuple[str, Pat
         ("vision-live", session_dir / "vision-live" / "events.jsonl"),
         ("motion-scan", session_dir / "motion-scan" / "events.jsonl"),
         ("motion-live", session_dir / "motion-live" / "events.jsonl"),
+        ("yolo-scan", session_dir / "yolo-scan" / "events.jsonl"),
+        ("number-scan", session_dir / "number-scan" / "events.jsonl"),
+        ("number-live", session_dir / "number-live" / "events.jsonl"),
     ]
     seen_paths = {path for _, path in sources}
     for scan_dir in sorted(session_dir.glob("vision-scan-*")):
@@ -7835,6 +7889,36 @@ def number_scan_event_log_line(payload: dict) -> str:
     )
 
 
+def choose_speech_command(preferred: str | None) -> list[str] | None:
+    raw_command = preferred or DEFAULT_SPEECH_COMMAND
+    parts = shlex.split(raw_command)
+    if not parts:
+        return None
+    executable = parts[0]
+    resolved = shutil.which(executable)
+    if not resolved and Path(executable).expanduser().exists():
+        resolved = str(Path(executable).expanduser())
+    if not resolved:
+        return None
+    return [resolved, *parts[1:]]
+
+
+def speak_identifier(number: str, speech_command: Sequence[str] | None) -> bool:
+    if not speech_command:
+        return False
+    try:
+        subprocess.Popen(
+            [*speech_command, f"Possible {number}"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError:
+        return False
+    return True
+
+
 def subject_scan_output_paths(output_root: Path) -> dict[str, Path]:
     return {
         "root": output_root,
@@ -9169,6 +9253,14 @@ def command_number_scan(args: argparse.Namespace) -> int:
         return 0
 
     prompt = args.prompt or default_number_scan_prompt()
+    speech_command = choose_speech_command(args.speech_command) if args.speak else None
+    speech_warning_printed = False
+    if args.speak and not speech_command:
+        print(
+            f"warning: speech command not found: {args.speech_command}",
+            file=sys.stderr,
+        )
+        speech_warning_printed = True
     promoted_count = 0
     crop_count = 0
     number_counts: dict[str, int] = {}
@@ -9243,6 +9335,9 @@ def command_number_scan(args: argparse.Namespace) -> int:
                 f"source={payload.get('source_event')} crop={crop_reference}",
                 flush=True,
             )
+            if args.speak and not speak_identifier(number, speech_command) and not speech_warning_printed:
+                print("warning: could not speak identifier events", file=sys.stderr)
+                speech_warning_printed = True
 
     summary = {
         "created_at": datetime.now().astimezone().isoformat(),
@@ -9253,6 +9348,7 @@ def command_number_scan(args: argparse.Namespace) -> int:
         "identifier_events": promoted_count,
         "identifiers": number_counts,
         "model": args.model,
+        "speech": bool(args.speak and speech_command),
     }
     paths["summary_json"].write_text(json.dumps(summary, indent=2) + "\n")
     lines = [
@@ -9706,6 +9802,9 @@ def run_record_command(args: argparse.Namespace, *, launch_player: bool = False)
     source_warning = recover_source_device(args)
     if source_warning:
         print(f"warning: {source_warning}", file=sys.stderr)
+    audio_warning = recover_audio_device(args)
+    if audio_warning:
+        print(f"warning: {audio_warning}", file=sys.stderr)
 
     for warning in normalize_record_timelapse_settings(args):
         print(f"warning: {warning}", file=sys.stderr)
@@ -11488,6 +11587,266 @@ def source_readiness(args: argparse.Namespace) -> tuple[bool, str]:
     return False, f"{args.device} (missing)"
 
 
+def profile_source_readiness(profile: dict) -> tuple[str, str]:
+    if is_rtsp_source(profile):
+        source = str(profile.get("rtsp_url") or "").strip()
+        return ("ok" if source else "fail"), f"RTSP {source or '(missing)'}"
+    device = str(profile.get("device") or "")
+    if device and Path(device).exists():
+        return "ok", device
+    recovered = recover_missing_video_device(device) if device else None
+    if recovered:
+        return "warn", f"{device} -> {recovered}"
+    return "fail", f"{device or '(missing video device)'}"
+
+
+def profile_audio_readiness(profile: dict) -> tuple[str, str]:
+    if not profile.get("audio", True):
+        return "off", "disabled"
+    if is_rtsp_source(profile):
+        return "ok", "embedded stream audio"
+    device = str(profile.get("audio_device") or "")
+    if device and alsa_device_exists(device):
+        return "ok", device
+    recovered = recover_missing_audio_device(device) if device else None
+    if recovered:
+        return "warn", f"{device} -> {recovered}"
+    return "fail", f"{device or '(missing audio device)'}"
+
+
+def readiness_marker(status: str) -> str:
+    return {
+        "ok": "OK",
+        "warn": "FIX",
+        "fail": "MISS",
+        "off": "OFF",
+    }.get(status, status.upper())
+
+
+def print_ui_profile_status(config: dict) -> None:
+    profiles = config.get("profiles", {})
+    if not profiles:
+        print("No recording profiles saved. Run `./field-replay setup` first.")
+        return
+    print("Recording profiles")
+    for name, profile in sorted(profiles.items()):
+        source_status, source_label = profile_source_readiness(profile)
+        audio_status, audio_label = profile_audio_readiness(profile)
+        marker = " [last]" if name == config.get("last_profile") else ""
+        print(f"  {name}{marker}")
+        print(f"    video {readiness_marker(source_status):4} {source_label}")
+        print(f"    audio {readiness_marker(audio_status):4} {audio_label}")
+        print(
+            "    mode  "
+            f"{profile.get('video_size', '?')} @ {profile.get('framerate', '?')} fps, "
+            f"{profile.get('capture_backend', DEFAULT_CAPTURE_BACKEND)}"
+        )
+
+
+def print_ui_recent_sessions(args: argparse.Namespace, config: dict) -> None:
+    sessions = recent_sessions(args, config)[:5]
+    print()
+    print("Recent sessions")
+    if not sessions:
+        print("  none found")
+        return
+    for index, session in enumerate(sessions, start=1):
+        print(f"  {index}. {session_display_label(session)}")
+
+
+def field_replay_command_prefix(args: argparse.Namespace) -> list[str]:
+    executable = Path(__file__).resolve()
+    command = [str(executable)]
+    if args.config_file != DEFAULT_CONFIG_PATH:
+        command.extend(["--config-file", str(args.config_file)])
+    if args.recordings_dir != DEFAULT_RECORDINGS_DIR:
+        command.extend(["--recordings-dir", str(args.recordings_dir)])
+    return command
+
+
+def choose_ui_profile(config: dict, preferred_profile: str | None = None) -> str | None:
+    profiles = config.get("profiles", {})
+    if not profiles:
+        return None
+    default_value = preferred_profile or config.get("last_profile")
+    if default_value not in profiles:
+        default_value = sorted(profiles)[0]
+    options = [(name, name) for name in sorted(profiles)]
+    return prompt_menu("Choose recording profile", options, default_value=default_value)
+
+
+def choose_ui_session(args: argparse.Namespace, config: dict) -> Path | None:
+    sessions = recent_sessions(args, config)
+    if not sessions:
+        return None
+    options = [(str(path), session_display_label(path)) for path in sessions[:10]]
+    choice = prompt_menu("Choose session", options, default_value=str(sessions[0]))
+    return Path(choice) if choice else None
+
+
+def command_assist(args: argparse.Namespace) -> int:
+    config_path = args.config_file.expanduser()
+    config = load_config(config_path)
+    target = str(args.target) if args.target else None
+    if not target and interactive_mode_enabled(args):
+        selected_target = select_export_target(
+            args,
+            config,
+            title="Choose a session or media file for assist",
+        )
+        if not selected_target:
+            print("no sessions found for assist", file=sys.stderr)
+            return 1
+        target = selected_target
+
+    try:
+        source = resolve_export_source(args.recordings_dir.expanduser(), target)
+    except FileNotFoundError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+
+    if (source.session_dir / "session.json").exists() or (
+        source.session_dir / DEFAULT_TIMESHIFT_NAME
+    ).exists():
+        yolo_output_root, yolo_notice = default_vision_output_root(source, "yolo-scan")
+        number_output_root, number_notice = default_vision_output_root(source, "number-scan")
+    else:
+        yolo_output_root = source.source_path.with_name(f"{source.source_path.stem}-yolo-scan")
+        number_output_root = source.source_path.with_name(f"{source.source_path.stem}-number-scan")
+        yolo_notice = None
+        number_notice = None
+    if yolo_notice:
+        print(f"warning: {yolo_notice}", file=sys.stderr)
+    if number_notice:
+        print(f"warning: {number_notice}", file=sys.stderr)
+
+    prefix = field_replay_command_prefix(args)
+    yolo_command = [
+        *prefix,
+        "yolo-scan",
+        str(source.source_path if source.session_dir == source.source_path.parent else source.session_dir),
+        "--ffmpeg-bin",
+        args.ffmpeg_bin,
+        "--yolo-model",
+        str(args.yolo_model.expanduser()),
+        "--yolo-labels",
+        str(args.yolo_labels.expanduser()),
+        "--subject-classes",
+        args.subject_classes,
+        "--sample-interval",
+        f"{args.sample_interval:g}",
+        "--output-dir",
+        str(yolo_output_root),
+        "--no-interactive",
+    ]
+    if args.max_samples is not None:
+        yolo_command.extend(["--max-samples", str(args.max_samples)])
+
+    number_command = [
+        *prefix,
+        "number-scan",
+        str(source.source_path if source.session_dir == source.source_path.parent else source.session_dir),
+        "--motion-dir",
+        str(yolo_output_root / "events.jsonl"),
+        "--output-dir",
+        str(number_output_root),
+        "--max-crops-per-event",
+        str(args.max_crops_per_event),
+        "--speech-command",
+        args.speech_command,
+        "--no-interactive",
+    ]
+    if args.speak:
+        number_command.append("--speak")
+    else:
+        number_command.append("--no-speak")
+    if args.max_crops is not None:
+        number_command.extend(["--max-crops", str(args.max_crops)])
+
+    print("Assist source:       " + str(source.source_path))
+    print("Subject output:      " + str(yolo_output_root))
+    print("Identifier output:   " + str(number_output_root))
+    print("Speech:              " + ("enabled" if args.speak else "disabled"))
+    if args.dry_run:
+        print("YOLO:", shlex.join(yolo_command))
+        print("Numbers:", shlex.join(number_command))
+        return 0
+
+    print("Running YOLO assist:", shlex.join(yolo_command))
+    status = subprocess.call(yolo_command)
+    if status != 0:
+        return status
+    print("Reading identifiers:", shlex.join(number_command))
+    status = subprocess.call(number_command)
+    if status == 0:
+        config["last_session_dir"] = str(source.session_dir)
+        save_config(config_path, config)
+    return status
+
+
+def command_ui(args: argparse.Namespace) -> int:
+    config_path = args.config_file.expanduser()
+    config = load_config(config_path)
+    print("Field Replay Dashboard")
+    print("======================")
+    print_ui_profile_status(config)
+    print_ui_recent_sessions(args, config)
+    print()
+    print("Field target: DVR first. Detection and number reads are assistive evidence.")
+
+    if not interactive_mode_enabled(args):
+        return 0
+
+    actions = [
+        ("record", "Start recording and launch DVR playback"),
+        ("watch", "Open DVR playback for a recent session"),
+        ("assist", "Run YOLO scan, then number scan, on a recent session"),
+        ("setup", "Open recording setup"),
+        ("quit", "Quit"),
+    ]
+    while True:
+        print()
+        action = prompt_menu(
+            "Action",
+            actions,
+            default_value="record",
+            allow_cancel=True,
+            cancel_label="Quit",
+        )
+        if action in {None, "quit"}:
+            return 0
+        prefix = field_replay_command_prefix(args)
+        if action == "setup":
+            return subprocess.call([*prefix, "setup"])
+        if action == "record":
+            profile_name = choose_ui_profile(config, args.profile)
+            if not profile_name:
+                print("No saved profile available. Run setup first.", file=sys.stderr)
+                continue
+            command = [*prefix, "go", "--profile", profile_name, "--no-interactive"]
+            print("Starting:", shlex.join(command))
+            return subprocess.call(command)
+        if action == "watch":
+            session = choose_ui_session(args, config)
+            if not session:
+                print("No recent session found.", file=sys.stderr)
+                continue
+            command = [*prefix, "watch", str(session), "--player", args.player or "mpv"]
+            print("Opening:", shlex.join(command))
+            status = subprocess.call(command)
+            if status != 0:
+                return status
+            continue
+        if action == "assist":
+            session = choose_ui_session(args, config)
+            if not session:
+                print("No recent session found.", file=sys.stderr)
+                continue
+            command = [*prefix, "assist", str(session), "--no-interactive"]
+            print("Running:", shlex.join(command))
+            return subprocess.call(command)
+
+
 def command_doctor(args: argparse.Namespace) -> int:
     for warning in auto_select_video_codec_mode(args):
         print(f"warning: {warning}", file=sys.stderr)
@@ -11512,8 +11871,14 @@ def command_doctor(args: argparse.Namespace) -> int:
     nvdcf_ok, nvdcf_status = deepstream_tracker_available(DEFAULT_SUBJECT_TRACKER)
     source_ok, source_status = source_readiness(args)
     if uses_alsa_audio_input(args):
-        audio_ok = alsa_device_exists(args.audio_device)
-        audio_status = f"{args.audio_device} ({'ok' if audio_ok else 'missing'})"
+        audio_recovered = recover_missing_audio_device(args.audio_device)
+        audio_ok = alsa_device_exists(args.audio_device) or bool(audio_recovered)
+        if alsa_device_exists(args.audio_device):
+            audio_status = f"{args.audio_device} (ok)"
+        elif audio_recovered:
+            audio_status = f"{args.audio_device} (missing; recoverable as {audio_recovered})"
+        else:
+            audio_status = f"{args.audio_device} (missing)"
     else:
         audio_ok = True
         audio_status = "embedded stream audio (connectivity not checked)" if args.audio else "disabled"
@@ -12010,6 +12375,104 @@ def build_parser() -> argparse.ArgumentParser:
         help="Prompt to choose a recent session when no target is given.",
     )
     watch.set_defaults(func=command_watch)
+
+    ui = subparsers.add_parser(
+        "ui",
+        help="Open the operator dashboard for recording, DVR playback, and assistive review.",
+    )
+    ui.add_argument(
+        "--profile",
+        help="Preferred recording profile when starting capture from the dashboard.",
+    )
+    ui.add_argument(
+        "--player",
+        help="Preferred DVR player. Defaults to mpv from the dashboard.",
+    )
+    ui.add_argument(
+        "--interactive",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Prompt for dashboard actions after showing field readiness.",
+    )
+    ui.set_defaults(func=command_ui)
+
+    assist = subparsers.add_parser(
+        "assist",
+        help="Run the configured subject-detection and identifier-reading assist pass.",
+    )
+    assist.add_argument(
+        "target",
+        nargs="?",
+        type=Path,
+        help="Optional session directory or media file. Defaults to a prompted or latest session.",
+    )
+    assist.add_argument(
+        "--ffmpeg-bin",
+        default="ffmpeg",
+        help="FFmpeg binary to use for source frame and crop extraction.",
+    )
+    assist.add_argument(
+        "--yolo-model",
+        type=Path,
+        default=DEFAULT_YOLO_MODEL,
+        help="YOLO ONNX model path.",
+    )
+    assist.add_argument(
+        "--yolo-labels",
+        type=Path,
+        default=DEFAULT_YOLO_LABELS,
+        help="Class label file matching --yolo-model.",
+    )
+    assist.add_argument(
+        "--subject-classes",
+        default=DEFAULT_YOLO_CLASSES,
+        help="Comma-separated subject classes to keep.",
+    )
+    assist.add_argument(
+        "--sample-interval",
+        type=float,
+        default=DEFAULT_YOLO_SAMPLE_INTERVAL,
+        help="Seconds between sampled frames for the subject pass.",
+    )
+    assist.add_argument(
+        "--max-samples",
+        type=int,
+        help="Maximum number of sampled frames to evaluate.",
+    )
+    assist.add_argument(
+        "--max-crops",
+        type=int,
+        help="Maximum total crops to send to the identifier reader.",
+    )
+    assist.add_argument(
+        "--max-crops-per-event",
+        type=int,
+        default=3,
+        help="Maximum crop images to inspect for each promoted subject.",
+    )
+    assist.add_argument(
+        "--speak",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Speak promoted identifier candidates aloud.",
+    )
+    assist.add_argument(
+        "--speech-command",
+        default=DEFAULT_SPEECH_COMMAND,
+        help="Speech command for --speak, such as spd-say or espeak-ng.",
+    )
+    assist.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print planned assist commands without running detection.",
+    )
+    assist.add_argument(
+        "--interactive",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Prompt to choose a recent session when the target is omitted.",
+    )
+    assist.set_defaults(func=command_assist)
 
     export = subparsers.add_parser(
         "export", help="Create a share-friendly MP4 from a recent session."
@@ -12870,6 +13333,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--output-dir",
         type=Path,
         help="Directory for number scan output. Defaults to number-scan under the session directory.",
+    )
+    number_scan.add_argument(
+        "--speak",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Speak promoted identifier candidates aloud as they are logged.",
+    )
+    number_scan.add_argument(
+        "--speech-command",
+        default=DEFAULT_SPEECH_COMMAND,
+        help="Speech command for --speak, such as spd-say or espeak-ng.",
     )
     number_scan.add_argument(
         "--dry-run",

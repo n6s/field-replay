@@ -175,6 +175,34 @@ If you want live vision features, also install and run Ollama separately.
 
 ## Core Workflow
 
+### Field dashboard
+
+For event use, start with the operator dashboard:
+
+```bash
+./field-replay ui
+```
+
+The dashboard shows saved recording profiles, video/audio readiness, recent
+sessions, and simple actions for starting capture, opening DVR playback, and
+running the current YOLO-plus-number assist pass. Lower-level commands remain
+available for setup and debugging, but field operation should center on one
+command and saved profiles rather than long argument lists.
+
+When the dashboard runs the assist pass, identifier candidates are spoken aloud
+with the local speech command when available, while also being written to the
+normal event logs for review.
+
+For a one-shot assist pass without opening the dashboard:
+
+```bash
+./field-replay assist
+```
+
+`assist` selects a recent session when needed, runs the current YOLO subject
+pass, feeds promoted crops into identifier reading, speaks candidate numbers,
+and writes the normal `yolo-scan/` and `number-scan/` event logs.
+
 ### 1. Check the environment
 
 ```bash
@@ -467,7 +495,8 @@ The resulting `yolo-scan/events.jsonl` can feed `number-scan` directly:
 
 ```bash
 ./field-replay number-scan /home/roger/recordings/NORC-NS-narrow.mp4 \
-  --motion-dir /home/roger/recordings/NORC-NS-narrow-yolo-scan/events.jsonl
+  --motion-dir /home/roger/recordings/NORC-NS-narrow-yolo-scan/events.jsonl \
+  --speak
 ```
 
 Treat this as an evaluation bridge, not the final Jetson deployment path. On the
@@ -664,6 +693,11 @@ A profile currently remembers:
 - direct-to-DVR timelapse mode, interval, and playback fps
 - preferred encoder
 - recordings directory
+
+If a saved ALSA audio alias is stale, such as `hw:Capture,0` disappearing after
+USB device order changes, recording now tries to recover to an available
+capture device and reports the substitution before starting. `doctor` and `ui`
+also show recoverable audio aliases so this can be fixed before the event.
 
 Useful current defaults:
 
