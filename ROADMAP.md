@@ -60,6 +60,7 @@ These notes are not commitments. They are the current product leanings and backl
 - Keep CPU handoffs narrow. Full-resolution frames should stay in NVMM/GPU memory until a candidate crop, metadata record, or promoted evidence frame is actually needed.
 - Current Orin experiment finding (2026-05-25): DeepStream 7.1 plus NvDCF produced native person/bicycle tracks on the marathon clip, but the stock `nvdcf-perf` profile produced no tracked objects for a 30-second fast-car sample even though TrafficCamNet emitted car boxes. Preserve the visible fallback while evaluating tracker settings and the broader detector; do not treat stock NvDCF configuration as field-ready yet.
 - Current Orin deployment finding (2026-05-25): first TensorRT engine construction took several minutes, while subsequent execution with a serialized engine was faster than real time. Prepare deployable engines before live event use.
+- Current Orin Triton finding (2026-06-01): `nvinferserver` is installed and usable. NVIDIA's Triton YOLOv3 ONNX sample was staged at `/home/roger/deepstream-models/triton-yolov3`, completed against the 20-second marathon clip, and emitted KITTI detections. It averaged only about `4.4 FPS`, so it proves the `nvinferserver`/metadata path but is not field-ready. Next work should focus on a faster TensorRT-native broad YOLO detector pack rather than reviving the failed repo-local YOLOv5 custom-parser experiment.
 - On stronger future hardware, improve cadence, resolution, model count, and camera count without changing the basic evidence model.
 - More advanced object tracking, OCR, or multi-camera correlation should feed the same timeline and evidence logs rather than becoming a separate workflow.
 
@@ -76,7 +77,7 @@ These notes are not commitments. They are the current product leanings and backl
 
 1. Preserve the DVR-first recording and near-live review path. (DONE)
 2. Use the installed Orin DeepStream/NvDCF path to evaluate tracked transit behavior on existing clips. (IN PROGRESS: native track consumption, transit scoring, and a failure-visible fallback are wired; fast-car tracker coverage remains unresolved.)
-3. Replace narrow TrafficCamNet experimentation with a broad YOLO-class DeepStream/TensorRT detector suitable for race and general observation use.
+3. Replace narrow TrafficCamNet experimentation with a broad YOLO-class DeepStream/TensorRT detector suitable for race and general observation use. (IN PROGRESS: `nvinferserver` pack support is wired and a slow Triton YOLOv3 sample works; a faster field-ready TensorRT YOLO pack is still needed.)
 4. Refine transit scoring against an evaluation set for purposeful passers versus parked, milling, and swaying nuisance motion.
 5. Add a stricter unclassified coherent-motion lane for meaningful targets outside detector labels.
 6. Attach identifier reading to selected high-quality track crops and measure false reads.

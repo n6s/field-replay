@@ -61,6 +61,27 @@ continuous DVR -> broad DeepStream/TensorRT detector -> NvDCF tracks
                -> transit scoring -> promoted crops -> identifier reading
 ```
 
+Current Jetson handoff as of 2026-06-01:
+
+- DeepStream 7.1 is installed on the Orin target.
+- `nvinfer` and `nvinferserver` are both available.
+- NVIDIA's Triton YOLOv3 ONNX sample was staged at
+  `/home/roger/deepstream-models/triton-yolov3`.
+- That staged pack includes `field-replay-pack.json`, so `field-replay` knows
+  to generate `plugin-type=1` and run it through `nvinferserver`.
+- The sample completed against
+  `/home/roger/recordings/field-replay-yolo-eval/NORC-NS-narrow-20s.mp4` and
+  emitted KITTI detection files under the pack's `streamscl/` directory.
+- The sample averaged only about `4.4 FPS`, so treat it as a compatibility
+  proof, not the final field detector.
+- The failed repo-local YOLOv5 custom-parser attempt and the failed
+  `/home/roger/deepstream-models/yolo-field` pack were removed. Do not restart
+  from that path unless there is a specific reason.
+
+Next NVIDIA work should start from the working `nvinferserver`/Triton proof and
+move toward a faster TensorRT-native broad YOLO subject pack that can feed the
+existing `subject-scan`/`assist` evidence path.
+
 A promoted subject should make meaningful directional progress through the
 scene: a runner, bicycle, moving vehicle, pedestrian, pet, aircraft, or other
 coherent moving target. Parked vehicles, race staff lingering in one area,
@@ -212,7 +233,7 @@ point `assist` at a pack once:
 ```bash
 ./field-replay assist /home/roger/recordings/NORC-NS-narrow.mp4 \
   --subject-engine deepstream \
-  --subject-model-dir /home/roger/deepstream-models/yolo-field
+  --subject-model-dir /home/roger/deepstream-models/triton-yolov3
 ```
 
 Plain TensorRT/`nvinfer` packs must contain `config_infer_primary.txt` plus the
