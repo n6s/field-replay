@@ -185,9 +185,10 @@ For event use, start with the operator dashboard:
 
 The dashboard shows saved recording profiles, video/audio readiness, recent
 sessions, and simple actions for starting capture, opening DVR playback, and
-running the current YOLO-plus-number assist pass. Lower-level commands remain
-available for setup and debugging, but field operation should center on one
-command and saved profiles rather than long argument lists.
+running either the current YOLO-plus-number offline assist pass or the live
+assistant for an active DVR session. Lower-level commands remain available for
+setup and debugging, but field operation should center on one command and saved
+profiles rather than long argument lists.
 
 When the dashboard runs the assist pass, identifier candidates are spoken aloud
 with the local speech command when available, while also being written to the
@@ -202,6 +203,20 @@ For a one-shot assist pass without opening the dashboard:
 `assist` selects a recent session when needed, runs the current YOLO subject
 pass, feeds promoted crops into identifier reading, speaks candidate numbers,
 and writes the normal `yolo-scan/` and `number-scan/` event logs.
+
+For a running session, the live assistant follows the growing DVR tail:
+
+```bash
+./field-replay assist-live
+```
+
+`assist-live` samples the active `timeshift.ts` a little behind live, promotes
+YOLO subject tracks that make directional progress through the frame, reads
+tentative race identifiers from the promoted crops, prints them, speaks them
+when a local speech command is available, and appends evidence under
+`yolo-live/` and `number-live/`. The default operator path is still the
+dashboard; this command exists so a second terminal tab can be dedicated to the
+live assistant during field testing.
 
 ### 1. Check the environment
 
@@ -504,6 +519,18 @@ current Orin test system, the available OpenCV build did not have CUDA DNN
 enabled, so this path was useful for detector quality checks but slower than a
 DeepStream/TensorRT implementation.
 
+For near-real-time field trials with the same OpenCV YOLO bridge:
+
+```bash
+./field-replay assist-live
+```
+
+That command is append-only for the active session. It does not erase prior
+`yolo-live/` or `number-live/` evidence if restarted, which is important when
+the operator is recovering during a live event. It is still a bridge: the
+desired production path is a persistent Jetson DeepStream/TensorRT detector and
+tracker feeding the same promoted subject and identifier event logs.
+
 For Jetson detector experiments, `subject-scan` currently runs the local
 DeepStream TrafficCamNet detector as a temporary scaffold, passes its objects
 through the installed NvDCF tracker, and saves crops only for tracks with
@@ -622,7 +649,9 @@ A typical session folder looks like:
 - `vision-live/` or `vision-scan/`: vision evidence and diagnostics when used
 - `motion-scan/` or `motion-live/`: motion candidates, evidence frames, and offline crops when used
 - `subject-scan/`: DeepStream subject detections and crops when used
+- `yolo-scan/` or `yolo-live/`: YOLO subject detections and crops when used
 - `number-scan/`: tentative identifier reads from subject or motion crop images when used
+- `number-live/`: tentative live identifier reads from promoted live subject crops
 
 Vision output currently includes:
 

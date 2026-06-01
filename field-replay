@@ -3230,6 +3230,7 @@ def evidence_event_sources_for_session(session_dir: Path) -> list[tuple[str, Pat
         ("motion-scan", session_dir / "motion-scan" / "events.jsonl"),
         ("motion-live", session_dir / "motion-live" / "events.jsonl"),
         ("yolo-scan", session_dir / "yolo-scan" / "events.jsonl"),
+        ("yolo-live", session_dir / "yolo-live" / "events.jsonl"),
         ("number-scan", session_dir / "number-scan" / "events.jsonl"),
         ("number-live", session_dir / "number-live" / "events.jsonl"),
     ]
@@ -11684,6 +11685,419 @@ def choose_ui_session(args: argparse.Namespace, config: dict) -> Path | None:
     return Path(choice) if choice else None
 
 
+def prepare_yolo_opencv_net(args: argparse.Namespace):
+    model_path = args.yolo_model.expanduser()
+    labels_path = args.yolo_labels.expanduser()
+    if not model_path.exists():
+        raise RuntimeError(f"YOLO model not found: {model_path}")
+    if not labels_path.exists():
+        raise RuntimeError(f"YOLO labels not found: {labels_path}")
+    try:
+        import cv2
+    except ImportError as exc:
+        raise RuntimeError("python OpenCV module is missing; install python3-opencv") from exc
+
+    labels = load_yolo_labels(labels_path)
+    try:
+        net = cv2.dnn.readNetFromONNX(str(model_path))
+    except cv2.error as exc:
+        raise RuntimeError(f"could not load YOLO ONNX model: {exc}") from exc
+
+    backend = "opencv-dnn-cpu"
+    if args.yolo_backend == "cuda" or (
+        args.yolo_backend == "auto" and opencv_dnn_has_cuda()
+    ):
+        try:
+            net.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
+            net.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
+            backend = "opencv-dnn-cuda"
+        except cv2.error as exc:
+            if args.yolo_backend == "cuda":
+                raise RuntimeError(f"OpenCV CUDA DNN backend unavailable: {exc}") from exc
+    return net, labels, backend, model_path, labels_path
+
+
+def command_assist_live(args: argparse.Namespace) -> int:
+    config_path = args.config_file.expanduser()
+    config = load_config(config_path)
+    if not args.session_dir and interactive_mode_enabled(args):
+        selected_target = select_session_target(
+            args,
+            config,
+            title="Choose a live session for assist",
+        )
+        if not selected_target:
+            print("no sessions found for live assist", file=sys.stderr)
+            return 1
+        args.session_dir = Path(selected_target)
+
+    try:
+        session_dir = resolve_session_dir(
+            args.recordings_dir.expanduser(),
+            str(args.session_dir) if args.session_dir else None,
+        )
+    except FileNotFoundError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+
+    timeshift_path = session_dir / DEFAULT_TIMESHIFT_NAME
+    if not timeshift_path.exists():
+        print(f"live assist requires a growing DVR file: {timeshift_path}", file=sys.stderr)
+        return 1
+
+    ffmpeg_path = shutil.which(args.ffmpeg_bin)
+    if not ffmpeg_path:
+        print(f"ffmpeg binary not found: {args.ffmpeg_bin}", file=sys.stderr)
+        return 1
+    if args.sample_interval <= 0:
+        print("sample-interval must be greater than 0", file=sys.stderr)
+        return 1
+    if args.yolo_input_size <= 0:
+        print("yolo-input-size must be greater than 0", file=sys.stderr)
+        return 1
+    if not 0.0 <= args.min_directionality <= 1.0:
+        print("min-directionality must be between 0 and 1", file=sys.stderr)
+        return 1
+
+    try:
+        import cv2
+        net, labels, backend, model_path, labels_path = prepare_yolo_opencv_net(args)
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    source_info = probe_media_video_info(args.ffmpeg_bin, timeshift_path)
+    if not source_info.get("frame_rate"):
+        print(f"could not determine frame rate: {timeshift_path}", file=sys.stderr)
+        return 1
+
+    source = ExportSource(session_dir, timeshift_path, "DVR timeshift")
+    yolo_root = args.yolo_output_dir.expanduser() if args.yolo_output_dir else session_dir / "yolo-live"
+    number_root = (
+        args.number_output_dir.expanduser()
+        if args.number_output_dir
+        else session_dir / "number-live"
+    )
+    yolo_paths = yolo_scan_output_paths(yolo_root)
+    number_paths = number_scan_output_paths(number_root)
+    for key in ("root", "frames_dir", "crops_dir"):
+        ensure_directory(yolo_paths[key])
+    ensure_directory(number_paths["root"])
+    scratch_frame = yolo_root / ".sample-frame.jpg"
+
+    allowed_classes = {
+        item.strip().lower()
+        for item in (args.subject_classes or "").split(",")
+        if item.strip()
+    }
+    frame_rate = float(source_info.get("nominal_frame_rate") or source_info["frame_rate"])
+    min_area = (
+        int(source_info.get("width") or 0)
+        * int(source_info.get("height") or 0)
+        * (max(args.min_area_pct, 0.0) / 100.0)
+    )
+    prompt = args.prompt or default_number_scan_prompt()
+    speech_command = choose_speech_command(args.speech_command) if args.speak else None
+    speech_warning_printed = False
+    if args.speak and not speech_command:
+        print(
+            f"warning: speech command not found: {args.speech_command}",
+            file=sys.stderr,
+        )
+        speech_warning_printed = True
+
+    print(f"Live assist session: {session_dir}")
+    print(f"DVR source:          {timeshift_path}")
+    print(f"Subject output:      {yolo_root}")
+    print(f"Identifier output:   {number_root}")
+    print(f"YOLO model:          {model_path}")
+    print(f"YOLO labels:         {labels_path}")
+    print(f"Backend:             {backend}")
+    print(f"Cadence:             {args.sample_interval:g}s, tail {args.tail_offset:g}s")
+    print("Speech:              " + ("enabled" if args.speak else "disabled"))
+    if args.dry_run:
+        return 0
+
+    config["last_session_dir"] = str(session_dir)
+    save_config(config_path, config)
+
+    processed_offsets: set[float] = set()
+    detections: list[dict] = []
+    promoted_track_keys: set[str] = set()
+    sample_count = 0
+    promoted_count = 0
+    identifier_count = 0
+    next_event_id = 1
+
+    try:
+        while args.max_samples is None or sample_count < max(args.max_samples, 0):
+            duration_seconds = ffprobe_duration_seconds(timeshift_path) or 0.0
+            if duration_seconds <= 0:
+                if args.once:
+                    return 0
+                time.sleep(args.idle_sleep)
+                continue
+            offset_seconds = live_sample_offset(
+                duration_seconds,
+                tail_offset=args.tail_offset,
+                sample_interval=args.sample_interval,
+            )
+            rounded_offset = round(offset_seconds, 3)
+            if rounded_offset in processed_offsets:
+                if args.once:
+                    return 0
+                time.sleep(args.idle_sleep)
+                continue
+
+            now = datetime.now().astimezone()
+            try:
+                extract_frame_at_time(
+                    ffmpeg_path,
+                    timeshift_path,
+                    offset_seconds,
+                    scratch_frame,
+                )
+                frame = cv2.imread(str(scratch_frame))
+                if frame is None:
+                    raise RuntimeError("OpenCV could not read extracted sample frame")
+                frame_index = int(round(offset_seconds * frame_rate))
+                frame_detections = yolo_frame_detections(
+                    net=net,
+                    frame=frame,
+                    labels=labels,
+                    allowed_classes=allowed_classes,
+                    confidence_threshold=args.min_confidence,
+                    nms_threshold=args.yolo_nms,
+                    input_size=args.yolo_input_size,
+                    min_area=min_area,
+                )
+                for detection in frame_detections:
+                    detections.append(
+                        {
+                            "frame": frame_index,
+                            "t": offset_seconds,
+                            "label": detection["label"],
+                            "confidence": detection["confidence"],
+                            "box": detection["box"],
+                            "track_id": None,
+                        }
+                    )
+                raw_tracks = link_subject_tracks(
+                    detections,
+                    frame_rate=frame_rate,
+                    source_info=source_info,
+                )
+                tracks, scored_tracks = summarize_subject_tracks(
+                    raw_tracks,
+                    source_info=source_info,
+                    min_movement_pct=args.min_movement_pct,
+                    min_directionality=args.min_directionality,
+                )
+                append_jsonl(
+                    yolo_paths["debug_log"],
+                    {
+                        "w": event_wall_time(now),
+                        "t": rounded_offset,
+                        "sample": sample_count + 1,
+                        "detections": len(frame_detections),
+                        "total_detections": len(detections),
+                        "raw_tracks": len(raw_tracks),
+                        "promotable_tracks": len(tracks),
+                    },
+                )
+            except RuntimeError as exc:
+                append_jsonl(
+                    yolo_paths["debug_log"],
+                    {
+                        "w": event_wall_time(now),
+                        "t": rounded_offset,
+                        "error": str(exc),
+                    },
+                )
+                print(
+                    f"[assist-live] {format_duration(rounded_offset)} error: {exc}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                processed_offsets.add(rounded_offset)
+                sample_count += 1
+                if args.once:
+                    return 1
+                continue
+
+            for track in scored_tracks:
+                append_jsonl(
+                    yolo_paths["debug_log"],
+                    {
+                        "w": event_wall_time(now),
+                        "kind": "track-score",
+                        "track_source": "opencv-yolo-live-association",
+                        **track,
+                    },
+                )
+
+            for subject in tracks:
+                track_key = f"{subject['label']}:{subject['id']}"
+                if track_key in promoted_track_keys:
+                    continue
+                event_label = f"subject-live-{next_event_id:04d}"
+                next_event_id += 1
+                frame_reference, crop_reference, crop_box = save_subject_event_artifacts(
+                    ffmpeg_path=ffmpeg_path,
+                    source=source,
+                    runtime_paths=yolo_paths,
+                    subject=subject,
+                    source_info=source_info,
+                    padding_ratio=args.crop_padding,
+                    event_label=event_label,
+                )
+                payload = {
+                    "t": round(float(subject["t"]), 3),
+                    "w": event_wall_time(now),
+                    "k": "subject",
+                    "l": event_label,
+                    "s": "yolo-live",
+                    "subject": subject["label"],
+                    "track_id": subject["id"],
+                    "t_start": round(float(subject["t_start"]), 3),
+                    "t_end": round(float(subject["t_end"]), 3),
+                    "frame_index": subject["frame"],
+                    "box": subject["box"],
+                    "crop_box": crop_box,
+                    "confidence": subject["confidence"],
+                    "movement_px": subject["movement_px"],
+                    "movement_pct": subject["movement_pct"],
+                    "path_movement_px": subject["path_movement_px"],
+                    "directionality": subject["directionality"],
+                    "transit_score": subject["transit_score"],
+                    "duration_seconds": subject["duration_seconds"],
+                    "track_source": "opencv-yolo-live-association",
+                    "detection_count": subject["detection_count"],
+                    "model": str(model_path),
+                }
+                if frame_reference:
+                    payload["f"] = frame_reference
+                if crop_reference:
+                    payload["crop"] = crop_reference
+                    payload["crops"] = [crop_reference]
+                append_jsonl(yolo_paths["events_jsonl"], payload)
+                append_text_line(yolo_paths["events_log"], subject_event_log_line(payload))
+                promoted_track_keys.add(track_key)
+                promoted_count += 1
+                if args.verbose:
+                    print(subject_event_log_line(payload), flush=True)
+
+                crop_path = session_asset_path(session_dir, crop_reference)
+                if not args.read_identifiers or crop_path is None or not crop_path.exists():
+                    continue
+                started_at = time.perf_counter()
+                try:
+                    response_text = request_ollama_vision_response(
+                        image_paths=[crop_path],
+                        model=args.model,
+                        ollama_host=args.ollama_host,
+                        prompt=prompt,
+                        timeout_seconds=args.timeout,
+                        keepalive=args.keepalive,
+                    )
+                    elapsed_ms = int(round((time.perf_counter() - started_at) * 1000))
+                    numbers = normalize_number_scan_results(response_text)
+                    append_jsonl(
+                        number_paths["debug_log"],
+                        {
+                            "w": event_wall_time(now),
+                            "t": payload["t"],
+                            "source_event": payload["l"],
+                            "crop": crop_reference,
+                            "model": args.model,
+                            "elapsed_ms": elapsed_ms,
+                            "response": response_text,
+                            "numbers": numbers,
+                        },
+                    )
+                except RuntimeError as exc:
+                    elapsed_ms = int(round((time.perf_counter() - started_at) * 1000))
+                    append_jsonl(
+                        number_paths["debug_log"],
+                        {
+                            "w": event_wall_time(now),
+                            "t": payload["t"],
+                            "source_event": payload["l"],
+                            "crop": crop_reference,
+                            "model": args.model,
+                            "elapsed_ms": elapsed_ms,
+                            "error": str(exc),
+                        },
+                    )
+                    if args.verbose:
+                        print(
+                            f"[assist-live] identifier read failed for {payload['l']}: {exc}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    continue
+
+                for number in numbers:
+                    number_payload = {
+                        "t": payload["t"],
+                        "w": event_wall_time(datetime.now().astimezone()),
+                        "k": "identifier",
+                        "l": number,
+                        "s": "number-live",
+                        "m": args.model,
+                        "f": crop_reference,
+                        "crop": crop_reference,
+                        "source_event": payload["l"],
+                        "motion_event": payload["l"],
+                        "motion_source": payload["s"],
+                        "motion_frame": payload.get("f"),
+                        "subject": payload.get("subject"),
+                    }
+                    append_jsonl(number_paths["events_jsonl"], number_payload)
+                    append_text_line(
+                        number_paths["events_log"],
+                        number_scan_event_log_line(number_payload),
+                    )
+                    identifier_count += 1
+                    print(
+                        f"{event_wall_time(datetime.now().astimezone())} "
+                        f"identifier {number} t={format_duration(number_payload['t'])} "
+                        f"subject={number_payload.get('subject') or '-'}",
+                        flush=True,
+                    )
+                    if (
+                        args.speak
+                        and not speak_identifier(number, speech_command)
+                        and not speech_warning_printed
+                    ):
+                        print("warning: could not speak identifier events", file=sys.stderr)
+                        speech_warning_printed = True
+
+            if args.verbose and not frame_detections:
+                print(f"[assist-live] {format_duration(rounded_offset)} no subjects", flush=True)
+            processed_offsets.add(rounded_offset)
+            sample_count += 1
+            if args.once:
+                return 0
+    finally:
+        summary = {
+            "updated_at": datetime.now().astimezone().isoformat(),
+            "source_path": str(timeshift_path),
+            "samples": sample_count,
+            "subjects": promoted_count,
+            "identifier_events": identifier_count,
+            "model": str(model_path),
+            "number_model": args.model,
+            "backend": backend,
+            "sample_interval": args.sample_interval,
+            "tail_offset": args.tail_offset,
+        }
+        yolo_paths["summary_json"].write_text(json.dumps(summary, indent=2) + "\n")
+        number_paths["summary_json"].write_text(json.dumps(summary, indent=2) + "\n")
+
+    return 0
+
+
 def command_assist(args: argparse.Namespace) -> int:
     config_path = args.config_file.expanduser()
     config = load_config(config_path)
@@ -11800,6 +12214,7 @@ def command_ui(args: argparse.Namespace) -> int:
     actions = [
         ("record", "Start recording and launch DVR playback"),
         ("watch", "Open DVR playback for a recent session"),
+        ("assist-live", "Follow a live session, read identifiers, and speak them"),
         ("assist", "Run YOLO scan, then number scan, on a recent session"),
         ("setup", "Open recording setup"),
         ("quit", "Quit"),
@@ -11843,6 +12258,14 @@ def command_ui(args: argparse.Namespace) -> int:
                 print("No recent session found.", file=sys.stderr)
                 continue
             command = [*prefix, "assist", str(session), "--no-interactive"]
+            print("Running:", shlex.join(command))
+            return subprocess.call(command)
+        if action == "assist-live":
+            session = choose_ui_session(args, config)
+            if not session:
+                print("No recent session found.", file=sys.stderr)
+                continue
+            command = [*prefix, "assist-live", str(session), "--no-interactive"]
             print("Running:", shlex.join(command))
             return subprocess.call(command)
 
@@ -12473,6 +12896,184 @@ def build_parser() -> argparse.ArgumentParser:
         help="Prompt to choose a recent session when the target is omitted.",
     )
     assist.set_defaults(func=command_assist)
+
+    assist_live = subparsers.add_parser(
+        "assist-live",
+        help="Follow a growing DVR session with YOLO subject detection and spoken identifier reads.",
+    )
+    assist_live.add_argument(
+        "session_dir",
+        nargs="?",
+        type=Path,
+        help="Session directory with a growing timeshift.ts file. Defaults to a prompted or latest session.",
+    )
+    assist_live.add_argument(
+        "--ffmpeg-bin",
+        default="ffmpeg",
+        help="FFmpeg binary to use for source frame and crop extraction.",
+    )
+    assist_live.add_argument(
+        "--yolo-model",
+        type=Path,
+        default=DEFAULT_YOLO_MODEL,
+        help="YOLO ONNX model path.",
+    )
+    assist_live.add_argument(
+        "--yolo-labels",
+        type=Path,
+        default=DEFAULT_YOLO_LABELS,
+        help="Class label file matching --yolo-model.",
+    )
+    assist_live.add_argument(
+        "--subject-classes",
+        default=DEFAULT_YOLO_CLASSES,
+        help="Comma-separated subject classes to keep.",
+    )
+    assist_live.add_argument(
+        "--sample-interval",
+        type=float,
+        default=DEFAULT_YOLO_SAMPLE_INTERVAL,
+        help="Seconds between live YOLO samples.",
+    )
+    assist_live.add_argument(
+        "--tail-offset",
+        type=float,
+        default=DEFAULT_MOTION_LIVE_TAIL_OFFSET,
+        help="Seconds behind the live tail to sample.",
+    )
+    assist_live.add_argument(
+        "--max-samples",
+        type=int,
+        help="Stop after this many live sample points.",
+    )
+    assist_live.add_argument(
+        "--min-confidence",
+        type=float,
+        default=DEFAULT_YOLO_CONFIDENCE,
+        help="Minimum YOLO object confidence to keep.",
+    )
+    assist_live.add_argument(
+        "--yolo-nms",
+        type=float,
+        default=DEFAULT_YOLO_NMS_THRESHOLD,
+        help="YOLO non-maximum suppression IoU threshold.",
+    )
+    assist_live.add_argument(
+        "--yolo-input-size",
+        type=int,
+        default=DEFAULT_YOLO_INPUT_SIZE,
+        help="Square YOLO model input size in pixels.",
+    )
+    assist_live.add_argument(
+        "--yolo-backend",
+        choices=("auto", "cpu", "cuda"),
+        default="auto",
+        help="OpenCV DNN backend. auto uses CUDA only when this OpenCV build supports it.",
+    )
+    assist_live.add_argument(
+        "--min-area-pct",
+        type=float,
+        default=DEFAULT_SUBJECT_MIN_AREA_PCT,
+        help="Minimum subject box area as percent of the source frame.",
+    )
+    assist_live.add_argument(
+        "--min-movement-pct",
+        type=float,
+        default=DEFAULT_SUBJECT_MIN_MOVEMENT_PCT,
+        help="Minimum track movement as percent of source-frame diagonal.",
+    )
+    assist_live.add_argument(
+        "--min-directionality",
+        type=float,
+        default=DEFAULT_SUBJECT_MIN_DIRECTIONALITY,
+        help="Minimum net displacement divided by track path distance, from 0 to 1.",
+    )
+    assist_live.add_argument(
+        "--crop-padding",
+        type=float,
+        default=DEFAULT_SUBJECT_CROP_PADDING,
+        help="Padding ratio around each detected subject crop.",
+    )
+    assist_live.add_argument(
+        "--read-identifiers",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Read tentative race identifiers from promoted subject crops.",
+    )
+    assist_live.add_argument(
+        "--model",
+        default=DEFAULT_VISION_MODEL,
+        help="Ollama vision model to query for identifier reads.",
+    )
+    assist_live.add_argument(
+        "--ollama-host",
+        default=DEFAULT_OLLAMA_HOST,
+        help="Base URL for the local Ollama server.",
+    )
+    assist_live.add_argument(
+        "--timeout",
+        type=float,
+        default=120.0,
+        help="Seconds to wait for each Ollama identifier response.",
+    )
+    assist_live.add_argument(
+        "--keepalive",
+        default="5m",
+        help="How long Ollama should keep the model loaded between crops.",
+    )
+    assist_live.add_argument(
+        "--prompt",
+        help="Override the default race-identifier crop prompt.",
+    )
+    assist_live.add_argument(
+        "--speak",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Speak promoted identifier candidates aloud.",
+    )
+    assist_live.add_argument(
+        "--speech-command",
+        default=DEFAULT_SPEECH_COMMAND,
+        help="Speech command for --speak, such as spd-say or espeak-ng.",
+    )
+    assist_live.add_argument(
+        "--yolo-output-dir",
+        type=Path,
+        help="Directory for live YOLO subject output. Defaults to yolo-live under the session directory.",
+    )
+    assist_live.add_argument(
+        "--number-output-dir",
+        type=Path,
+        help="Directory for live identifier output. Defaults to number-live under the session directory.",
+    )
+    assist_live.add_argument(
+        "--idle-sleep",
+        type=float,
+        default=0.2,
+        help="Seconds to wait when no new tail sample point is available.",
+    )
+    assist_live.add_argument(
+        "--once",
+        action="store_true",
+        help="Run one available live sample and exit.",
+    )
+    assist_live.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print promoted subject and per-sample diagnostic chatter.",
+    )
+    assist_live.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print planned live assist settings without running detection.",
+    )
+    assist_live.add_argument(
+        "--interactive",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Prompt to choose a recent session when the target is omitted.",
+    )
+    assist_live.set_defaults(func=command_assist_live)
 
     export = subparsers.add_parser(
         "export", help="Create a share-friendly MP4 from a recent session."
