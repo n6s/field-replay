@@ -12277,7 +12277,6 @@ def command_ui(args: argparse.Namespace) -> int:
         ("assist-live", "Follow a live session, read identifiers, and speak them"),
         ("assist", "Run YOLO scan, then number scan, on a recent session"),
         ("setup", "Open recording setup"),
-        ("quit", "Quit"),
     ]
     while True:
         print()
@@ -12288,7 +12287,7 @@ def command_ui(args: argparse.Namespace) -> int:
             allow_cancel=True,
             cancel_label="Quit",
         )
-        if action in {None, "quit"}:
+        if action is None:
             return 0
         prefix = field_replay_command_prefix(args)
         if action == "setup":
