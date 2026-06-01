@@ -12134,34 +12134,82 @@ def command_assist(args: argparse.Namespace) -> int:
     if number_notice:
         print(f"warning: {number_notice}", file=sys.stderr)
 
+    configured_subject_model_dir = config.get("assist_subject_model_dir")
+    subject_model_dir = (
+        args.subject_model_dir.expanduser()
+        if args.subject_model_dir is not None
+        else Path(configured_subject_model_dir).expanduser()
+        if isinstance(configured_subject_model_dir, str) and configured_subject_model_dir
+        else None
+    )
+    subject_engine = args.subject_engine
+    deepstream_reason = None
+    if subject_model_dir is not None:
+        deepstream_available_for_pack, deepstream_reason = deepstream_subject_pack_available(
+            subject_model_dir
+        )
+    else:
+        deepstream_available_for_pack = False
+    if subject_engine == "deepstream" and not deepstream_available_for_pack:
+        print(
+            deepstream_reason
+            or "DeepStream subject detector pack is not configured; pass --subject-model-dir once",
+            file=sys.stderr,
+        )
+        return 1
+    use_deepstream_subjects = subject_engine == "deepstream" or (
+        subject_engine == "auto" and deepstream_available_for_pack
+    )
+
     prefix = field_replay_command_prefix(args)
-    yolo_command = [
-        *prefix,
-        "yolo-scan",
-        str(source.source_path if source.session_dir == source.source_path.parent else source.session_dir),
-        "--ffmpeg-bin",
-        args.ffmpeg_bin,
-        "--yolo-model",
-        str(args.yolo_model.expanduser()),
-        "--yolo-labels",
-        str(args.yolo_labels.expanduser()),
-        "--subject-classes",
-        args.subject_classes,
-        "--sample-interval",
-        f"{args.sample_interval:g}",
-        "--output-dir",
-        str(yolo_output_root),
-        "--no-interactive",
-    ]
+    subject_target = str(
+        source.source_path if source.session_dir == source.source_path.parent else source.session_dir
+    )
+    if use_deepstream_subjects:
+        subject_output_root = source.session_dir / "subject-scan"
+        yolo_command = [
+            *prefix,
+            "subject-scan",
+            subject_target,
+            "--ffmpeg-bin",
+            args.ffmpeg_bin,
+            "--subject-model-dir",
+            str(subject_model_dir),
+            "--subject-classes",
+            args.subject_classes,
+            "--output-dir",
+            str(subject_output_root),
+            "--no-interactive",
+        ]
+    else:
+        subject_output_root = yolo_output_root
+        yolo_command = [
+            *prefix,
+            "yolo-scan",
+            subject_target,
+            "--ffmpeg-bin",
+            args.ffmpeg_bin,
+            "--yolo-model",
+            str(args.yolo_model.expanduser()),
+            "--yolo-labels",
+            str(args.yolo_labels.expanduser()),
+            "--subject-classes",
+            args.subject_classes,
+            "--sample-interval",
+            f"{args.sample_interval:g}",
+            "--output-dir",
+            str(subject_output_root),
+            "--no-interactive",
+        ]
     if args.max_samples is not None:
         yolo_command.extend(["--max-samples", str(args.max_samples)])
 
     number_command = [
         *prefix,
         "number-scan",
-        str(source.source_path if source.session_dir == source.source_path.parent else source.session_dir),
+        subject_target,
         "--motion-dir",
-        str(yolo_output_root / "events.jsonl"),
+        str(subject_output_root / "events.jsonl"),
         "--output-dir",
         str(number_output_root),
         "--max-crops-per-event",
@@ -12178,15 +12226,25 @@ def command_assist(args: argparse.Namespace) -> int:
         number_command.extend(["--max-crops", str(args.max_crops)])
 
     print("Assist source:       " + str(source.source_path))
-    print("Subject output:      " + str(yolo_output_root))
+    print(
+        "Subject detector:    "
+        + (
+            f"DeepStream/TensorRT pack {subject_model_dir}"
+            if use_deepstream_subjects
+            else "OpenCV YOLO bridge"
+        )
+    )
+    if subject_engine == "auto" and subject_model_dir is not None and not use_deepstream_subjects:
+        print("DeepStream fallback: " + str(deepstream_reason))
+    print("Subject output:      " + str(subject_output_root))
     print("Identifier output:   " + str(number_output_root))
     print("Speech:              " + ("enabled" if args.speak else "disabled"))
     if args.dry_run:
-        print("YOLO:", shlex.join(yolo_command))
+        print("Subjects:", shlex.join(yolo_command))
         print("Numbers:", shlex.join(number_command))
         return 0
 
-    print("Running YOLO assist:", shlex.join(yolo_command))
+    print("Running subject assist:", shlex.join(yolo_command))
     status = subprocess.call(yolo_command)
     if status != 0:
         return status
@@ -12194,6 +12252,8 @@ def command_assist(args: argparse.Namespace) -> int:
     status = subprocess.call(number_command)
     if status == 0:
         config["last_session_dir"] = str(source.session_dir)
+        if use_deepstream_subjects and subject_model_dir is not None:
+            config["assist_subject_model_dir"] = str(subject_model_dir)
         save_config(config_path, config)
     return status
 
@@ -12850,6 +12910,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--subject-classes",
         default=DEFAULT_YOLO_CLASSES,
         help="Comma-separated subject classes to keep.",
+    )
+    assist.add_argument(
+        "--subject-engine",
+        choices=("auto", "opencv-yolo", "deepstream"),
+        default="auto",
+        help="Subject detector engine. auto uses a configured DeepStream pack when available, otherwise OpenCV YOLO.",
+    )
+    assist.add_argument(
+        "--subject-model-dir",
+        type=Path,
+        help=(
+            "Optional DeepStream/TensorRT detector pack directory. "
+            "Must contain config_infer_primary.txt and referenced model assets."
+        ),
     )
     assist.add_argument(
         "--sample-interval",

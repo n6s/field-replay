@@ -204,6 +204,22 @@ For a one-shot assist pass without opening the dashboard:
 pass, feeds promoted crops into identifier reading, speaks candidate numbers,
 and writes the normal `yolo-scan/` and `number-scan/` event logs.
 
+When a DeepStream/TensorRT detector pack has been configured, `assist` uses it
+as the subject detector automatically and falls back to the OpenCV YOLO bridge
+only when no usable pack is available. To stage that path during development,
+point `assist` at a pack once:
+
+```bash
+./field-replay assist /home/roger/recordings/NORC-NS-narrow.mp4 \
+  --subject-engine deepstream \
+  --subject-model-dir /home/roger/deepstream-models/yolo-field
+```
+
+The pack must contain `config_infer_primary.txt` plus the model, labels, engine
+or ONNX assets, and any custom parser library referenced by that config. After a
+successful DeepStream assist run, the pack path is remembered in the normal
+operator config so later `./field-replay assist` runs can stay low-friction.
+
 For a running session, the live assistant follows the growing DVR tail:
 
 ```bash
