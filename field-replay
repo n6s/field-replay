@@ -84,6 +84,9 @@ DEFAULT_YOLO_CONFIDENCE = 0.25
 DEFAULT_YOLO_NMS_THRESHOLD = 0.45
 DEFAULT_YOLO_INPUT_SIZE = 640
 DEFAULT_YOLO_SAMPLE_INTERVAL = 0.25
+DEFAULT_YOLO_LIVE_MIN_MOVEMENT_PCT = 1.0
+DEFAULT_YOLO_LIVE_MIN_DIRECTIONALITY = 0.55
+DEFAULT_YOLO_LIVE_TRACK_WINDOW = 8.0
 MOTION_DETECT_MODES = ("smart", "fixed")
 MOTION_SCAN_ENGINES = ("auto", "gstreamer-jetson", "ffmpeg")
 DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
@@ -8127,12 +8130,12 @@ def choose_speech_command(preferred: str | None) -> list[str] | None:
     return [resolved, *parts[1:]]
 
 
-def speak_identifier(number: str, speech_command: Sequence[str] | None) -> bool:
+def speak_text(text: str, speech_command: Sequence[str] | None) -> bool:
     if not speech_command:
         return False
     try:
         subprocess.Popen(
-            [*speech_command, f"Possible {number}"],
+            [*speech_command, text],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -8141,6 +8144,10 @@ def speak_identifier(number: str, speech_command: Sequence[str] | None) -> bool:
     except OSError:
         return False
     return True
+
+
+def speak_identifier(number: str, speech_command: Sequence[str] | None) -> bool:
+    return speak_text(f"Possible {number}", speech_command)
 
 
 def subject_scan_output_paths(output_root: Path) -> dict[str, Path]:
@@ -8835,7 +8842,10 @@ def yolo_frame_detections(
         crop=False,
     )
     net.setInput(blob)
-    output = net.forward()
+    try:
+        output = net.forward()
+    except cv2.error as exc:
+        raise RuntimeError(f"YOLO inference failed: {exc}") from exc
     rows = output.reshape(-1, output.shape[-1])
     boxes: list[list[int]] = []
     confidences: list[float] = []
@@ -12095,6 +12105,9 @@ def command_assist_live(args: argparse.Namespace) -> int:
     if args.yolo_input_size <= 0:
         print("yolo-input-size must be greater than 0", file=sys.stderr)
         return 1
+    if args.track_window <= 0:
+        print("track-window must be greater than 0", file=sys.stderr)
+        return 1
     if not 0.0 <= args.min_directionality <= 1.0:
         print("min-directionality must be between 0 and 1", file=sys.stderr)
         return 1
@@ -12154,6 +12167,12 @@ def command_assist_live(args: argparse.Namespace) -> int:
     print(f"YOLO labels:         {labels_path}")
     print(f"Backend:             {backend}")
     print(f"Cadence:             {args.sample_interval:g}s, tail {args.tail_offset:g}s")
+    print(f"Track window:        {args.track_window:g}s")
+    print(
+        f"Transit filter:      area>={args.min_area_pct:g}%, "
+        f"movement>={args.min_movement_pct:g}%, "
+        f"directionality>={args.min_directionality:g}"
+    )
     print("Speech:              " + ("enabled" if args.speak else "disabled"))
     if args.dry_run:
         return 0
@@ -12222,6 +12241,12 @@ def command_assist_live(args: argparse.Namespace) -> int:
                             "track_id": None,
                         }
                     )
+                window_start = offset_seconds - args.track_window
+                detections = [
+                    detection
+                    for detection in detections
+                    if float(detection.get("t") or 0.0) >= window_start
+                ]
                 raw_tracks = link_subject_tracks(
                     detections,
                     frame_rate=frame_rate,
@@ -12324,8 +12349,11 @@ def command_assist_live(args: argparse.Namespace) -> int:
                 append_text_line(yolo_paths["events_log"], subject_event_log_line(payload))
                 promoted_track_keys.add(track_key)
                 promoted_count += 1
-                if args.verbose:
-                    print(subject_event_log_line(payload), flush=True)
+                print(subject_event_log_line(payload), flush=True)
+                if args.speak and payload.get("subject"):
+                    if not speak_text(str(payload["subject"]), speech_command) and not speech_warning_printed:
+                        print("warning: could not speak live subject events", file=sys.stderr)
+                        speech_warning_printed = True
 
                 crop_path = session_asset_path(session_dir, crop_reference)
                 if not args.read_identifiers or crop_path is None or not crop_path.exists():
@@ -12431,6 +12459,10 @@ def command_assist_live(args: argparse.Namespace) -> int:
             "backend": backend,
             "sample_interval": args.sample_interval,
             "tail_offset": args.tail_offset,
+            "track_window": args.track_window,
+            "yolo_input_size": args.yolo_input_size,
+            "min_movement_pct": args.min_movement_pct,
+            "min_directionality": args.min_directionality,
         }
         yolo_paths["summary_json"].write_text(json.dumps(summary, indent=2) + "\n")
         number_paths["summary_json"].write_text(json.dumps(summary, indent=2) + "\n")
@@ -13546,14 +13578,20 @@ def build_parser() -> argparse.ArgumentParser:
     assist_live.add_argument(
         "--min-movement-pct",
         type=float,
-        default=DEFAULT_SUBJECT_MIN_MOVEMENT_PCT,
+        default=DEFAULT_YOLO_LIVE_MIN_MOVEMENT_PCT,
         help="Minimum track movement as percent of source-frame diagonal.",
     )
     assist_live.add_argument(
         "--min-directionality",
         type=float,
-        default=DEFAULT_SUBJECT_MIN_DIRECTIONALITY,
+        default=DEFAULT_YOLO_LIVE_MIN_DIRECTIONALITY,
         help="Minimum net displacement divided by track path distance, from 0 to 1.",
+    )
+    assist_live.add_argument(
+        "--track-window",
+        type=float,
+        default=DEFAULT_YOLO_LIVE_TRACK_WINDOW,
+        help="Seconds of recent live detections to keep for subject tracking.",
     )
     assist_live.add_argument(
         "--crop-padding",

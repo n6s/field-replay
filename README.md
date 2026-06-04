@@ -596,9 +596,14 @@ For near-real-time field trials with the same OpenCV YOLO bridge:
 
 That command is append-only for the active session. It does not erase prior
 `yolo-live/` or `number-live/` evidence if restarted, which is important when
-the operator is recovering during a live event. It is still a bridge: the
-desired production path is a persistent Jetson DeepStream/TensorRT detector and
-tracker feeding the same promoted subject and identifier event logs.
+the operator is recovering during a live event. Live assist keeps recent
+detection work bounded with an 8-second rolling track window and uses more
+sensitive live transit defaults than offline scans: at least `1%` net movement
+across the source-frame diagonal and at least `0.55` directionality. Promoted
+subject lines print immediately in the terminal and speak the subject label;
+identifier candidates are spoken as `Possible <number>`. It is still a bridge:
+the desired production path is a persistent Jetson DeepStream/TensorRT detector
+and tracker feeding the same promoted subject and identifier event logs.
 
 For Jetson detector experiments, `subject-scan` currently runs the local
 DeepStream TrafficCamNet detector as a temporary scaffold, passes its objects
