@@ -16,6 +16,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -3181,7 +3182,203 @@ def session_display_label(session_dir: Path) -> str:
             state = "unknown"
     root_label = str(session_dir.parent)
     target_label = session_target_summary(session_dir)
-    return f"{session_dir.name} [{target_label}; {state}; {root_label}]"
+    evidence_label = session_evidence_summary(session_dir)
+    detail_parts = [target_label, state, root_label]
+    if evidence_label:
+        detail_parts.append(evidence_label)
+    return f"{session_dir.name} [{'; '.join(detail_parts)}]"
+
+
+def count_event_log_records(path: Path, *, limit: int = 9999) -> tuple[int, bool]:
+    count = 0
+    try:
+        with path.open(encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                count += 1
+                if count >= limit:
+                    return count, True
+    except OSError:
+        return 0, False
+    return count, False
+
+
+def session_evidence_summary(session_dir: Path) -> str | None:
+    total = 0
+    capped = False
+    for _, events_path in evidence_event_sources_for_session(session_dir):
+        count, source_capped = count_event_log_records(events_path)
+        total += count
+        capped = capped or source_capped
+    if total <= 0:
+        return None
+    suffix = "+" if capped else ""
+    return f"evidence {total}{suffix}"
+
+
+def format_age(seconds: float) -> str:
+    seconds = max(seconds, 0.0)
+    if seconds < 60:
+        return f"{int(seconds)}s ago"
+    minutes = seconds / 60.0
+    if minutes < 60:
+        return f"{int(minutes)}m ago"
+    hours = minutes / 60.0
+    if hours < 24:
+        return f"{int(hours)}h ago"
+    days = hours / 24.0
+    return f"{int(days)}d ago"
+
+
+def file_age_label(path: Path, *, now: float | None = None) -> str | None:
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return None
+    if now is None:
+        now = time.time()
+    return format_age(now - mtime)
+
+
+def tail_text_lines(path: Path, *, limit: int = 50, block_size: int = 8192) -> list[str]:
+    if limit <= 0:
+        return []
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            position = handle.tell()
+            chunks: list[bytes] = []
+            newline_count = 0
+            while position > 0 and newline_count <= limit:
+                read_size = min(block_size, position)
+                position -= read_size
+                handle.seek(position)
+                chunk = handle.read(read_size)
+                chunks.append(chunk)
+                newline_count += chunk.count(b"\n")
+    except OSError:
+        return []
+    data = b"".join(reversed(chunks))
+    lines = [line.decode("utf-8", errors="replace").strip() for line in data.splitlines()]
+    return [line for line in lines if line][-limit:]
+
+
+def tail_jsonl_records(path: Path, *, limit: int = 50) -> list[dict]:
+    records: list[dict] = []
+    for line in tail_text_lines(path, limit=limit):
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            records.append(payload)
+    return records
+
+
+def event_subject_label(event: dict) -> str:
+    subject = event.get("subject")
+    label = event_detection_label(event)
+    if isinstance(subject, str) and subject.strip():
+        if label and label != subject:
+            return f"{subject.strip()} {label}"
+        return subject.strip()
+    return label or "event"
+
+
+def compact_counter_label(counter: Counter[str], *, limit: int = 3) -> str:
+    parts = [f"{label} {count}" for label, count in counter.most_common(limit)]
+    return ", ".join(parts) if parts else "none"
+
+
+def live_debug_status_lines(session_dir: Path, *, now: float) -> list[str]:
+    lines: list[str] = []
+    debug_specs = [
+        ("yolo-live", session_dir / "yolo-live" / "yolo-debug.jsonl"),
+        ("vision-live", session_dir / "vision-live" / "vision-debug.jsonl"),
+        ("motion-live", session_dir / "motion-live" / "motion-debug.jsonl"),
+        ("number-live", session_dir / "number-live" / "number-debug.jsonl"),
+    ]
+    for label, path in debug_specs:
+        age = file_age_label(path, now=now)
+        if age is None:
+            continue
+        records = tail_jsonl_records(path, limit=1000)
+        latest = records[-1] if records else {}
+        detail_parts = [f"debug updated {age}"]
+        sample_records = [
+            record
+            for record in records
+            if "sample" in record or "detections" in record or "error" in record
+        ]
+        sample = sample_records[-1] if sample_records else latest
+        if sample.get("error"):
+            detail_parts.append(f"last error {sample['error']}")
+        else:
+            if "t" in sample:
+                detail_parts.append(f"t={format_duration(sample.get('t'))}")
+            if "detections" in sample:
+                detail_parts.append(f"detections={sample.get('detections')}")
+            if "promotable_tracks" in sample:
+                detail_parts.append(f"promotable={sample.get('promotable_tracks')}")
+            if "numbers" in sample and isinstance(sample.get("numbers"), list):
+                detail_parts.append(f"numbers={len(sample['numbers'])}")
+        lines.append(f"  {label:11} {readiness_marker('ok'):4} " + ", ".join(detail_parts))
+
+        label_counts: Counter[str] = Counter()
+        suppression_counts: Counter[str] = Counter()
+        for record in records:
+            record_label = record.get("label") or record.get("subject")
+            if isinstance(record_label, str) and record_label.strip():
+                label_counts[record_label.strip()] += 1
+            reason = record.get("suppression_reason")
+            if isinstance(reason, str) and reason.strip():
+                suppression_counts[reason.strip()] += 1
+        if label_counts or suppression_counts:
+            detail = f"recent labels {compact_counter_label(label_counts)}"
+            if suppression_counts:
+                detail += f"; suppressed {compact_counter_label(suppression_counts)}"
+            lines.append(f"  {'':11}      {detail}")
+    return lines
+
+
+def print_ui_latest_activity(session_dir: Path) -> None:
+    now = time.time()
+    print()
+    print("Latest session activity")
+    timeshift_path = session_dir / DEFAULT_TIMESHIFT_NAME
+    if timeshift_path.exists():
+        try:
+            size_label = format_bytes(timeshift_path.stat().st_size)
+        except OSError:
+            size_label = "unknown size"
+        age = file_age_label(timeshift_path, now=now) or "unknown age"
+        print(f"  DVR         {readiness_marker('ok'):4} {timeshift_path} ({size_label}, updated {age})")
+    else:
+        print(f"  DVR         {readiness_marker('fail'):4} no {DEFAULT_TIMESHIFT_NAME} in {session_dir}")
+
+    matches = load_all_evidence_matches(session_dir)
+    if matches:
+        last = matches[-1]
+        source = last.get("_source", "?")
+        source_path = last.get("_path")
+        event_age = file_age_label(source_path, now=now) if isinstance(source_path, Path) else None
+        age_text = f", log updated {event_age}" if event_age else ""
+        print(
+            "  Evidence    "
+            f"{readiness_marker('ok'):4} {len(matches)} promoted, "
+            f"last {event_subject_label(last)} at {format_duration(last.get('t'))} "
+            f"from {source}{age_text}"
+        )
+    else:
+        print("  Evidence    OFF  no promoted events yet")
+
+    debug_lines = live_debug_status_lines(session_dir, now=now)
+    if debug_lines:
+        for line in debug_lines:
+            print(line)
+    else:
+        print("  Assist live OFF  no live debug log found")
 
 
 def select_watch_target(args: argparse.Namespace, config: dict) -> str | None:
@@ -3230,6 +3427,7 @@ def evidence_event_sources_for_session(session_dir: Path) -> list[tuple[str, Pat
         ("vision-live", session_dir / "vision-live" / "events.jsonl"),
         ("motion-scan", session_dir / "motion-scan" / "events.jsonl"),
         ("motion-live", session_dir / "motion-live" / "events.jsonl"),
+        ("subject-scan", session_dir / "subject-scan" / "events.jsonl"),
         ("yolo-scan", session_dir / "yolo-scan" / "events.jsonl"),
         ("yolo-live", session_dir / "yolo-live" / "events.jsonl"),
         ("number-scan", session_dir / "number-scan" / "events.jsonl"),
@@ -3296,6 +3494,22 @@ def label_heading(label: str) -> str:
     return "Bib" if is_bib_detection_label(label) else "Label"
 
 
+def evidence_event_display_text(event: dict) -> str:
+    display = event.get("w")
+    if isinstance(display, str) and display.strip():
+        return display.strip()
+    label = event_detection_label(event)
+    subject = event.get("subject")
+    if label and subject:
+        return f"{label} ({subject})"
+    if label:
+        return label
+    kind = event.get("k")
+    if isinstance(kind, str) and kind.strip():
+        return kind.strip()
+    return "event"
+
+
 def label_match_summary_lines(session_dir: Path, label: str, matches: Sequence[dict]) -> list[str]:
     first_match = matches[0]
     last_match = matches[-1]
@@ -3303,8 +3517,8 @@ def label_match_summary_lines(session_dir: Path, label: str, matches: Sequence[d
         f"Session:   {session_dir}",
         f"{label_heading(label)}:       {label}",
         f"Matches:   {len(matches)}",
-        f"First:     {first_match.get('w', '?')} ({format_duration(first_match.get('t'))})",
-        f"Last:      {last_match.get('w', '?')} ({format_duration(last_match.get('t'))})",
+        f"First:     {evidence_event_display_text(first_match)} ({format_duration(first_match.get('t'))})",
+        f"Last:      {evidence_event_display_text(last_match)} ({format_duration(last_match.get('t'))})",
     ]
     span_seconds = sighting_span_seconds(matches)
     if span_seconds >= 60.0:
@@ -3323,8 +3537,8 @@ def all_match_summary_lines(session_dir: Path, matches: Sequence[dict]) -> list[
         f"Session:   {session_dir}",
         "Scope:     all promoted frames",
         f"Matches:   {len(matches)}",
-        f"First:     {first_match.get('w', '?')} ({format_duration(first_match.get('t'))})",
-        f"Last:      {last_match.get('w', '?')} ({format_duration(last_match.get('t'))})",
+        f"First:     {evidence_event_display_text(first_match)} ({format_duration(first_match.get('t'))})",
+        f"Last:      {evidence_event_display_text(last_match)} ({format_duration(last_match.get('t'))})",
     ]
     span_seconds = sighting_span_seconds(matches)
     if span_seconds >= 60.0:
@@ -3335,8 +3549,16 @@ def all_match_summary_lines(session_dir: Path, matches: Sequence[dict]) -> list[
 def event_confidence_label(event: dict) -> str:
     confidence = event.get("c")
     if confidence is None or confidence == "":
+        confidence = event.get("confidence")
+    if confidence is None or confidence == "":
         return "n/a"
-    return f"{confidence}%"
+    try:
+        numeric = float(confidence)
+    except (TypeError, ValueError):
+        return str(confidence)
+    if 0.0 <= numeric <= 1.0:
+        return f"{numeric * 100:.1f}%"
+    return f"{numeric:g}%"
 
 
 def export_display_label(session_dir: Path) -> str | None:
@@ -7994,6 +8216,23 @@ def deepstream_subject_pack_available(detector_pack: Path) -> tuple[bool, str]:
     return True, f"subject detector pack found: {detector_pack} ({plugin_name})"
 
 
+def configured_assist_subject_model_dir(config: dict) -> Path | None:
+    configured = config.get("assist_subject_model_dir")
+    if isinstance(configured, str) and configured.strip():
+        return Path(configured).expanduser()
+    return None
+
+
+def assist_subject_detector_status(config: dict) -> tuple[str, str]:
+    subject_model_dir = configured_assist_subject_model_dir(config)
+    if subject_model_dir is None:
+        return "off", "OpenCV YOLO fallback; run assist-setup to configure DeepStream"
+    available, reason = deepstream_subject_pack_available(subject_model_dir)
+    if available:
+        return "ok", reason
+    return "warn", reason
+
+
 def deepstream_plugin_type_label(plugin_type: int) -> str:
     if plugin_type == 1:
         return "nvinferserver"
@@ -11060,7 +11299,7 @@ def command_find_bib(args: argparse.Namespace) -> int:
     print("Evidence")
     for match in matches[-args.limit :]:
         print(
-            f"  {match.get('w', '?')}  "
+            f"  {evidence_event_display_text(match)}  "
             f"t={format_duration(match.get('t'))}  "
             f"conf={event_confidence_label(match)}  "
             f"src={match.get('_source', '?')}  "
@@ -11081,7 +11320,7 @@ def run_review_bib_action(
         print("Evidence")
         for match in matches[-args.limit :]:
             print(
-                f"  {match.get('w', '?')}  "
+                f"  {evidence_event_display_text(match)}  "
                 f"t={format_duration(match.get('t'))}  "
                 f"conf={event_confidence_label(match)}  "
                 f"src={match.get('_source', '?')}  "
@@ -11692,20 +11931,25 @@ def print_ui_profile_status(config: dict) -> None:
     profiles = config.get("profiles", {})
     if not profiles:
         print("No recording profiles saved. Run `./field-replay setup` first.")
-        return
-    print("Recording profiles")
-    for name, profile in sorted(profiles.items()):
-        source_status, source_label = profile_source_readiness(profile)
-        audio_status, audio_label = profile_audio_readiness(profile)
-        marker = " [last]" if name == config.get("last_profile") else ""
-        print(f"  {name}{marker}")
-        print(f"    video {readiness_marker(source_status):4} {source_label}")
-        print(f"    audio {readiness_marker(audio_status):4} {audio_label}")
-        print(
-            "    mode  "
-            f"{profile.get('video_size', '?')} @ {profile.get('framerate', '?')} fps, "
-            f"{profile.get('capture_backend', DEFAULT_CAPTURE_BACKEND)}"
-        )
+    else:
+        print("Recording profiles")
+        for name, profile in sorted(profiles.items()):
+            source_status, source_label = profile_source_readiness(profile)
+            audio_status, audio_label = profile_audio_readiness(profile)
+            marker = " [last]" if name == config.get("last_profile") else ""
+            print(f"  {name}{marker}")
+            print(f"    video {readiness_marker(source_status):4} {source_label}")
+            print(f"    audio {readiness_marker(audio_status):4} {audio_label}")
+            print(
+                "    mode  "
+                f"{profile.get('video_size', '?')} @ {profile.get('framerate', '?')} fps, "
+                f"{profile.get('capture_backend', DEFAULT_CAPTURE_BACKEND)}"
+            )
+
+    detector_status, detector_label = assist_subject_detector_status(config)
+    print()
+    print("Assist subject detector")
+    print(f"  {readiness_marker(detector_status):4} {detector_label}")
 
 
 def print_ui_recent_sessions(args: argparse.Namespace, config: dict) -> None:
@@ -11717,6 +11961,7 @@ def print_ui_recent_sessions(args: argparse.Namespace, config: dict) -> None:
         return
     for index, session in enumerate(sessions, start=1):
         print(f"  {index}. {session_display_label(session)}")
+    print_ui_latest_activity(sessions[0])
 
 
 def field_replay_command_prefix(args: argparse.Namespace) -> list[str]:
@@ -11747,6 +11992,37 @@ def choose_ui_session(args: argparse.Namespace, config: dict) -> Path | None:
     options = [(str(path), session_display_label(path)) for path in sessions[:10]]
     choice = prompt_menu("Choose session", options, default_value=str(sessions[0]))
     return Path(choice) if choice else None
+
+
+def build_ui_assist_setup_command(
+    args: argparse.Namespace, config: dict
+) -> list[str] | None:
+    current = configured_assist_subject_model_dir(config)
+    mode = "set"
+    if current is not None:
+        mode = prompt_menu(
+            "Assist detector setup",
+            (
+                ("set", f"Set or update DeepStream pack [{current}]"),
+                ("clear", "Use OpenCV YOLO fallback"),
+            ),
+            default_value="set",
+            allow_cancel=True,
+            cancel_label="Back",
+        )
+        if mode is None:
+            return None
+    if mode == "clear":
+        return [*field_replay_command_prefix(args), "assist-setup", "--clear"]
+
+    raw_path = prompt_text(
+        "DeepStream detector pack path",
+        str(current) if current is not None else None,
+    ).strip()
+    if not raw_path:
+        print("No detector pack path entered.", file=sys.stderr)
+        return None
+    return [*field_replay_command_prefix(args), "assist-setup", raw_path]
 
 
 def prepare_yolo_opencv_net(args: argparse.Namespace):
@@ -12162,6 +12438,87 @@ def command_assist_live(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_assist_setup(args: argparse.Namespace) -> int:
+    config_path = args.config_file.expanduser()
+    config = load_config(config_path)
+    subject_model_dir = args.subject_model_dir
+
+    if args.clear:
+        print("Assist subject detector setup")
+        current = configured_assist_subject_model_dir(config)
+        print(f"  Current: {current or 'OpenCV YOLO fallback'}")
+        if args.dry_run:
+            print("  Plan:    clear configured DeepStream pack")
+            return 0
+        config.pop("assist_subject_model_dir", None)
+        if save_config(config_path, config):
+            print("  Saved:   OpenCV YOLO fallback")
+            return 0
+        return 1
+
+    if subject_model_dir is None and interactive_mode_enabled(args):
+        current = configured_assist_subject_model_dir(config)
+        mode = "set"
+        if current is not None:
+            mode = prompt_menu(
+                "Assist detector setup",
+                (
+                    ("set", f"Set or update DeepStream pack [{current}]"),
+                    ("clear", "Use OpenCV YOLO fallback"),
+                ),
+                default_value="set",
+                allow_cancel=True,
+                cancel_label="Cancel",
+            )
+            if mode is None:
+                return 0
+        if mode == "clear":
+            print("Assist subject detector setup")
+            print(f"  Current: {current or 'OpenCV YOLO fallback'}")
+            if args.dry_run:
+                print("  Plan:    clear configured DeepStream pack")
+                return 0
+            config.pop("assist_subject_model_dir", None)
+            if save_config(config_path, config):
+                print("  Saved:   OpenCV YOLO fallback")
+                return 0
+            return 1
+        raw_path = prompt_text(
+            "DeepStream detector pack path",
+            str(current) if current is not None else None,
+        ).strip()
+        if raw_path:
+            subject_model_dir = Path(raw_path)
+
+    if subject_model_dir is None:
+        print("assist-setup requires a detector pack path or --clear", file=sys.stderr)
+        return 1
+
+    subject_model_dir = subject_model_dir.expanduser()
+    print("Assist subject detector setup")
+    print(f"  Pack:    {subject_model_dir}")
+    available, reason = deepstream_subject_pack_available(subject_model_dir)
+    print(f"  Status:  {reason}")
+    if not available:
+        return 1
+
+    pack_spec = deepstream_subject_pack_spec(subject_model_dir)
+    print(
+        "  Plugin:  "
+        + deepstream_plugin_type_label(pack_spec["plugin_type"])
+    )
+    print(f"  Config:  {pack_spec['infer_config']}")
+    if args.dry_run:
+        print(f"  Plan:    save pack path in {config_path}")
+        return 0
+
+    config["assist_subject_model_dir"] = str(subject_model_dir)
+    if save_config(config_path, config):
+        print(f"  Saved:   {config_path}")
+        return 0
+    return 1
+
+
 def command_assist(args: argparse.Namespace) -> int:
     config_path = args.config_file.expanduser()
     config = load_config(config_path)
@@ -12183,28 +12540,25 @@ def command_assist(args: argparse.Namespace) -> int:
         print(exc, file=sys.stderr)
         return 1
 
-    if (source.session_dir / "session.json").exists() or (
+    is_session_source = (source.session_dir / "session.json").exists() or (
         source.session_dir / DEFAULT_TIMESHIFT_NAME
-    ).exists():
-        yolo_output_root, yolo_notice = default_vision_output_root(source, "yolo-scan")
-        number_output_root, number_notice = default_vision_output_root(source, "number-scan")
+    ).exists()
+    if is_session_source:
+        number_output_root, number_notice = default_vision_output_root(
+            source, "number-scan"
+        )
     else:
-        yolo_output_root = source.source_path.with_name(f"{source.source_path.stem}-yolo-scan")
-        number_output_root = source.source_path.with_name(f"{source.source_path.stem}-number-scan")
-        yolo_notice = None
+        number_output_root = source.source_path.with_name(
+            f"{source.source_path.stem}-number-scan"
+        )
         number_notice = None
-    if yolo_notice:
-        print(f"warning: {yolo_notice}", file=sys.stderr)
     if number_notice:
         print(f"warning: {number_notice}", file=sys.stderr)
 
-    configured_subject_model_dir = config.get("assist_subject_model_dir")
     subject_model_dir = (
         args.subject_model_dir.expanduser()
         if args.subject_model_dir is not None
-        else Path(configured_subject_model_dir).expanduser()
-        if isinstance(configured_subject_model_dir, str) and configured_subject_model_dir
-        else None
+        else configured_assist_subject_model_dir(config)
     )
     subject_engine = args.subject_engine
     deepstream_reason = None
@@ -12230,8 +12584,18 @@ def command_assist(args: argparse.Namespace) -> int:
         source.source_path if source.session_dir == source.source_path.parent else source.session_dir
     )
     if use_deepstream_subjects:
-        subject_output_root = source.session_dir / "subject-scan"
-        yolo_command = [
+        if is_session_source:
+            subject_output_root, subject_notice = default_vision_output_root(
+                source, "subject-scan"
+            )
+        else:
+            subject_output_root = source.source_path.with_name(
+                f"{source.source_path.stem}-subject-scan"
+            )
+            subject_notice = None
+        if subject_notice:
+            print(f"warning: {subject_notice}", file=sys.stderr)
+        subject_command = [
             *prefix,
             "subject-scan",
             subject_target,
@@ -12246,8 +12610,19 @@ def command_assist(args: argparse.Namespace) -> int:
             "--no-interactive",
         ]
     else:
+        if is_session_source:
+            yolo_output_root, yolo_notice = default_vision_output_root(
+                source, "yolo-scan"
+            )
+        else:
+            yolo_output_root = source.source_path.with_name(
+                f"{source.source_path.stem}-yolo-scan"
+            )
+            yolo_notice = None
+        if yolo_notice:
+            print(f"warning: {yolo_notice}", file=sys.stderr)
         subject_output_root = yolo_output_root
-        yolo_command = [
+        subject_command = [
             *prefix,
             "yolo-scan",
             subject_target,
@@ -12266,7 +12641,7 @@ def command_assist(args: argparse.Namespace) -> int:
             "--no-interactive",
         ]
     if args.max_samples is not None:
-        yolo_command.extend(["--max-samples", str(args.max_samples)])
+        subject_command.extend(["--max-samples", str(args.max_samples)])
 
     number_command = [
         *prefix,
@@ -12304,12 +12679,12 @@ def command_assist(args: argparse.Namespace) -> int:
     print("Identifier output:   " + str(number_output_root))
     print("Speech:              " + ("enabled" if args.speak else "disabled"))
     if args.dry_run:
-        print("Subjects:", shlex.join(yolo_command))
+        print("Subjects:", shlex.join(subject_command))
         print("Numbers:", shlex.join(number_command))
         return 0
 
-    print("Running subject assist:", shlex.join(yolo_command))
-    status = subprocess.call(yolo_command)
+    print("Running subject assist:", shlex.join(subject_command))
+    status = subprocess.call(subject_command)
     if status != 0:
         return status
     print("Reading identifiers:", shlex.join(number_command))
@@ -12339,7 +12714,8 @@ def command_ui(args: argparse.Namespace) -> int:
         ("record", "Start recording and launch DVR playback"),
         ("watch", "Open DVR playback for a recent session"),
         ("assist-live", "Follow a live session, read identifiers, and speak them"),
-        ("assist", "Run YOLO scan, then number scan, on a recent session"),
+        ("assist", "Run offline assist on a recent session"),
+        ("assist-setup", "Configure offline assist detector"),
         ("setup", "Open recording setup"),
     ]
     while True:
@@ -12356,6 +12732,16 @@ def command_ui(args: argparse.Namespace) -> int:
         prefix = field_replay_command_prefix(args)
         if action == "setup":
             return subprocess.call([*prefix, "setup"])
+        if action == "assist-setup":
+            command = build_ui_assist_setup_command(args, config)
+            if command is None:
+                continue
+            print("Running:", shlex.join(command))
+            status = subprocess.call(command)
+            config = load_config(config_path)
+            if status != 0:
+                return status
+            continue
         if action == "record":
             profile_name = choose_ui_profile(config, args.profile)
             if not profile_name:
@@ -12397,6 +12783,7 @@ def command_doctor(args: argparse.Namespace) -> int:
     for warning in auto_select_video_codec_mode(args):
         print(f"warning: {warning}", file=sys.stderr)
 
+    config = load_config(args.config_file.expanduser())
     ffmpeg_path, supported_encoders = detect_supported_encoders(args.ffmpeg_bin)
     has_nvenc = bool(
         ffmpeg_path
@@ -12415,6 +12802,8 @@ def command_doctor(args: argparse.Namespace) -> int:
     jetson_player = shutil.which("nvgstplayer-1.0") or shutil.which("nvgstplayer")
     deepstream_ok, deepstream_status = deepstream_available()
     nvdcf_ok, nvdcf_status = deepstream_tracker_available(DEFAULT_SUBJECT_TRACKER)
+    assist_detector_state, assist_detector_status = assist_subject_detector_status(config)
+    assist_detector_ok = assist_detector_state in {"ok", "off"}
     source_ok, source_status = source_readiness(args)
     if uses_alsa_audio_input(args):
         audio_recovered = recover_missing_audio_device(args.audio_device)
@@ -12443,6 +12832,8 @@ def command_doctor(args: argparse.Namespace) -> int:
     print(f"deepstream-status: {deepstream_status}")
     print(f"nvdcf:    {'yes' if nvdcf_ok else 'no'}")
     print(f"nvdcf-status: {nvdcf_status}")
+    print(f"assist-detector: {assist_detector_state}")
+    print(f"assist-detector-status: {assist_detector_status}")
     print(f"gst-player:{' '}{jetson_player or 'missing'}")
     print(f"video:    {args.video_codec_mode}")
     print(f"backend:  {capture_backend or 'missing'}")
@@ -12457,7 +12848,14 @@ def command_doctor(args: argparse.Namespace) -> int:
     print(f"audio:    {audio_status}")
     print(f"outputs:  {args.recordings_dir.expanduser()}")
 
-    if not ffmpeg_path or backend_error or not resolved_encoder or not source_ok or not audio_ok:
+    if (
+        not ffmpeg_path
+        or backend_error
+        or not resolved_encoder
+        or not source_ok
+        or not audio_ok
+        or not assist_detector_ok
+    ):
         return 1
     return 0
 
@@ -12941,6 +13339,37 @@ def build_parser() -> argparse.ArgumentParser:
         help="Prompt for dashboard actions after showing field readiness.",
     )
     ui.set_defaults(func=command_ui)
+
+    assist_setup = subparsers.add_parser(
+        "assist-setup",
+        help="Validate and remember the DeepStream subject detector pack for assist.",
+    )
+    assist_setup.add_argument(
+        "subject_model_dir",
+        nargs="?",
+        type=Path,
+        help=(
+            "DeepStream detector pack directory to use for assist. "
+            "Use --clear to return to the OpenCV YOLO fallback."
+        ),
+    )
+    assist_setup.add_argument(
+        "--clear",
+        action="store_true",
+        help="Forget the configured DeepStream pack and use the OpenCV YOLO fallback.",
+    )
+    assist_setup.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate or print the planned config change without saving it.",
+    )
+    assist_setup.add_argument(
+        "--interactive",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Prompt for a detector pack path when none is provided.",
+    )
+    assist_setup.set_defaults(func=command_assist_setup)
 
     assist = subparsers.add_parser(
         "assist",

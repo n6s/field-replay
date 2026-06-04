@@ -207,9 +207,20 @@ For event use, start with the operator dashboard:
 The dashboard shows saved recording profiles, video/audio readiness, recent
 sessions, and simple actions for starting capture, opening DVR playback, and
 running either the current YOLO-plus-number offline assist pass or the live
-assistant for an active DVR session. Lower-level commands remain available for
-setup and debugging, but field operation should center on one command and saved
-profiles rather than long argument lists.
+assistant for an active DVR session. It also shows whether offline assist is
+using a configured DeepStream/TensorRT subject pack or the OpenCV YOLO fallback.
+Recent session rows show an evidence count when promoted events already exist,
+including DeepStream `subject-scan` events.
+The dashboard also prints latest-session activity: whether the DVR file is
+still being updated, how many promoted events exist, the last promoted subject
+or identifier, and whether live assist debug logs are still fresh. During a
+quiet run this helps distinguish "nothing promoted yet" from "the detector is
+running but suppressing static or low-displacement tracks."
+The dashboard action menu can configure or clear that offline assist detector
+without remembering the full command.
+Lower-level commands remain available for setup and debugging, but field
+operation should center on one command and saved profiles rather than long
+argument lists.
 
 When the dashboard runs the assist pass, identifier candidates are spoken aloud
 with the local speech command when available, while also being written to the
@@ -221,19 +232,21 @@ For a one-shot assist pass without opening the dashboard:
 ./field-replay assist
 ```
 
-`assist` selects a recent session when needed, runs the current YOLO subject
-pass, feeds promoted crops into identifier reading, speaks candidate numbers,
-and writes the normal `yolo-scan/` and `number-scan/` event logs.
+`assist` selects a recent session when needed, runs the configured subject pass,
+feeds promoted crops into identifier reading, speaks candidate numbers, and
+writes the normal subject and number event logs. With a configured
+DeepStream/TensorRT pack, subject evidence lands under `subject-scan/`;
+otherwise it uses the OpenCV YOLO bridge and writes `yolo-scan/`.
 
 When a DeepStream/TensorRT detector pack has been configured, `assist` uses it
 as the subject detector automatically and falls back to the OpenCV YOLO bridge
-only when no usable pack is available. To stage that path during development,
-point `assist` at a pack once:
+only when no usable pack is available. Configure and validate the pack once
+during setup from the dashboard, or run the setup command directly:
 
 ```bash
-./field-replay assist /home/roger/recordings/NORC-NS-narrow.mp4 \
-  --subject-engine deepstream \
-  --subject-model-dir /home/roger/deepstream-models/triton-yolov3
+./field-replay ui
+./field-replay assist-setup
+./field-replay assist-setup /home/roger/deepstream-models/triton-yolov3
 ```
 
 Plain TensorRT/`nvinfer` packs must contain `config_infer_primary.txt` plus the
@@ -248,9 +261,15 @@ by that config. Triton/`nvinferserver` packs can instead include a
 }
 ```
 
-After a successful DeepStream assist run, the pack path is remembered in the
-normal operator config so later `./field-replay assist` runs can stay
-low-friction.
+`assist-setup` stores the pack path in the normal operator config so later
+`./field-replay assist` runs can stay low-friction. A successful DeepStream
+assist run with `--subject-model-dir` also remembers the pack. To preview or
+clear that setting:
+
+```bash
+./field-replay assist-setup /home/roger/deepstream-models/triton-yolov3 --dry-run
+./field-replay assist-setup --clear
+```
 
 For a running session, the live assistant follows the growing DVR tail:
 
@@ -264,7 +283,9 @@ tentative race identifiers from the promoted crops, prints them, speaks them
 when a local speech command is available, and appends evidence under
 `yolo-live/` and `number-live/`. The default operator path is still the
 dashboard; this command exists so a second terminal tab can be dedicated to the
-live assistant during field testing.
+live assistant during field testing. Reopen `./field-replay ui` in another
+terminal to see the latest promoted evidence count and live debug freshness
+without tailing log files manually.
 
 ### 1. Check the environment
 
@@ -621,7 +642,8 @@ available. That path decodes once through NVDEC, crops/scales to a small GRAY8
 motion plane, and only brings the tiny motion frame back to Python. If Jetson
 decode is unavailable, `auto` falls back to the slower FFmpeg sampler and prints
 the reason. Use `./field-replay doctor --no-audio` to check `gst-decode`,
-`gst-jetson`, and `deepstream` readiness before a field run.
+`gst-jetson`, `deepstream`, NvDCF, and the configured assist detector pack
+before a field run.
 
 The default goal is a single smart profile, not per-camera threshold tuning.
 `--motion-detect-mode smart` keeps a rolling baseline of normal scene motion and
@@ -677,6 +699,7 @@ In live comparison mode, it also accepts comparison responses like:
 - jump to first or last sightings in VLC when useful
 - print recent evidence lines
 - use `review all` to browse the whole promoted frame collection for a session
+- review promoted subject labels such as `subject-0001` from `subject-scan`
 - type another bib directly at the action prompt without restarting the command
 
 ### 7. Export a share-friendly copy
