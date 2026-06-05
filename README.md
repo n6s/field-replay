@@ -224,12 +224,23 @@ The dashboard is a ncurses control plane with an old-school pane layout:
 - speech output selection (`8`) and an audio test (`9`) for detection speech
 
 When `ui` starts interactively, it asks which recording profile the dashboard
-should use before the TUI opens. The startup picker reuses the normal
-saved-profile workflow: pick a profile, edit a saved profile, or run setup for a
-new one. If an existing capture is already running, the prompt also offers to
-attach to that capture or open the review dashboard without attaching. Recording
-still starts from the TUI with `1`, so there is a final status check before a
-camera begins writing.
+should use before the TUI opens, or which existing session it should operate on.
+If captures are already running, the startup picker lists the live sessions with
+their metadata-backed identity: session name, profile, source, state, and
+evidence count. Attaching is therefore session-first; the dashboard derives the
+camera/profile identity from `session.json` and then attaches to the matching
+process when one is still live. If no capture is running, the same startup flow
+can open a recent session for review or start the saved-profile workflow: pick a
+profile, edit a saved profile, or run setup for a new one.
+
+You can also open a known session directly:
+
+```bash
+./field-replay ui /path/to/session-dir
+```
+
+Recording still starts from the TUI with `1`, so there is a final status check
+before a camera begins writing.
 
 Mouse clicks on the bottom command cells and event rows are supported. If capture or
 detect is still running, `q` opens a quit confirmation with choices to stop the
@@ -247,11 +258,10 @@ surface is the default operator entry point.
 If the dashboard exits unexpectedly, or if you choose to leave subprocesses
 running from the quit confirmation, background recording or live assist
 processes are left alone. Reopen `./field-replay ui` with the same recordings
-root and it will reattach to matching running processes for recent sessions when
-it can identify them. Reattach is profile-aware and prefers the selected
-profile's recording root, so a second dashboard can choose a different saved
-camera profile and start a separate recording instead of attaching to the first
-camera.
+root and it will show matching running sessions first. Reattach uses the
+session directory and metadata as the operator-facing identity, so a second
+dashboard can attach to the correct camera session or start a separate
+recording instead of accidentally adopting the first camera it finds.
 
 When the dashboard runs the assist pass, identifier candidates are spoken aloud
 with the local speech command when available, while also being written to the

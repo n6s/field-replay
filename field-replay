@@ -3230,6 +3230,13 @@ def recent_sessions(args: argparse.Namespace, config: dict) -> list[Path]:
     return unique_sessions
 
 
+def same_path(left: Path, right: Path) -> bool:
+    try:
+        return left.resolve() == right.resolve()
+    except OSError:
+        return left == right
+
+
 def session_target_summary(session_dir: Path) -> str:
     timeshift = session_dir / DEFAULT_TIMESHIFT_NAME
     archive_mkv = session_dir / f"{DEFAULT_ARCHIVE_STEM}.mkv"
@@ -12462,6 +12469,31 @@ def choose_ui_session(args: argparse.Namespace, config: dict) -> Path | None:
     return Path(choice) if choice else None
 
 
+def ui_session_attach_label(
+    session_dir: Path,
+    process: _UiProcessHandle | None = None,
+) -> str:
+    metadata = load_session_metadata(session_dir)
+    details: list[str] = []
+    if process is not None:
+        details.append(f"live pid {process.pid}")
+    profile = metadata.get("profile")
+    if profile:
+        details.append(f"profile {profile}")
+    source_label = metadata.get("source_label") or metadata.get("source")
+    if source_label:
+        details.append(str(source_label))
+    state = metadata.get("state")
+    if state:
+        details.append(str(state))
+    details.append(session_target_summary(session_dir))
+    evidence_label = session_evidence_summary(session_dir)
+    if evidence_label:
+        details.append(evidence_label)
+    details.append(str(session_dir.parent))
+    return f"{session_dir.name} [{'; '.join(details)}]"
+
+
 def build_ui_assist_setup_command(
     args: argparse.Namespace, config: dict
 ) -> list[str] | None:
@@ -13109,6 +13141,47 @@ def _find_running_record_process(
     return None
 
 
+def _find_running_record_processes(
+    args: argparse.Namespace,
+    sessions: Sequence[Path],
+    *,
+    config: dict | None = None,
+) -> list[tuple[_UiProcessHandle, Path]]:
+    records: list[tuple[_UiProcessHandle, Path]] = []
+    seen: set[tuple[int, str]] = set()
+    profile_names = sorted((config or {}).get("profiles", {}))
+    for selected_profile in [*profile_names, None]:
+        running_record = _find_running_record_process(
+            args,
+            sessions,
+            selected_profile=selected_profile,
+            config=config,
+        )
+        if running_record is None:
+            continue
+        process, session_dir = running_record
+        try:
+            session_key = str(session_dir.resolve())
+        except OSError:
+            session_key = str(session_dir)
+        key = (process.pid, session_key)
+        if key in seen:
+            continue
+        seen.add(key)
+        records.append(running_record)
+    return records
+
+
+def _running_record_for_session(
+    running_records: Sequence[tuple[_UiProcessHandle, Path]],
+    session_dir: Path,
+) -> tuple[_UiProcessHandle, Path] | None:
+    for process, record_session in running_records:
+        if same_path(record_session, session_dir):
+            return process, record_session
+    return None
+
+
 def _find_running_assist_process(
     sessions: Sequence[Path],
 ) -> tuple[_UiProcessHandle, Path] | None:
@@ -13228,10 +13301,79 @@ def choose_ui_launch_intent(
     args: argparse.Namespace,
     config_path: Path,
     config: dict,
-) -> tuple[dict, str | None, bool, _UiProcessHandle | None, Path | None, str | None]:
+) -> tuple[dict, str | None, bool, _UiProcessHandle | None, Path | None, Path | None, str | None]:
     sessions = recent_sessions(args, config)
-    running_record = _find_running_record_process(args, sessions, config=config)
-    if not running_record:
+    explicit_session = getattr(args, "session_dir", None)
+    if explicit_session is not None:
+        selected_session = explicit_session.expanduser()
+        candidate_sessions = sessions
+        if selected_session.exists() and not any(same_path(selected_session, item) for item in candidate_sessions):
+            candidate_sessions = [selected_session, *candidate_sessions]
+        running_records = _find_running_record_processes(
+            args,
+            candidate_sessions,
+            config=config,
+        )
+        running_record = _running_record_for_session(running_records, selected_session)
+        if running_record is not None:
+            record_process, record_session = running_record
+            running_profile = _record_process_profile_name(record_process, record_session)
+            return (
+                config,
+                running_profile or _session_profile_name(selected_session) or args.profile,
+                True,
+                record_process,
+                record_session,
+                selected_session,
+                f"Attached to {selected_session.name}",
+            )
+        return (
+            config,
+            _session_profile_name(selected_session) or args.profile,
+            False,
+            None,
+            None,
+            selected_session,
+            f"Opened dashboard for {selected_session.name}",
+        )
+
+    running_records = _find_running_record_processes(args, sessions, config=config)
+    if not running_records:
+        if sessions:
+            options: list[tuple[str, str]] = [
+                (f"session:{index}", ui_session_attach_label(session))
+                for index, session in enumerate(sessions[:10])
+            ]
+            options.append(("__start__", "Start another capture"))
+            choice = prompt_menu(
+                "Choose dashboard session",
+                options,
+                default_value=options[0][0],
+                allow_cancel=True,
+                cancel_label="Open dashboard without attaching",
+            )
+            if choice and choice.startswith("session:"):
+                session = sessions[int(choice.split(":", 1)[1])]
+                return (
+                    config,
+                    _session_profile_name(session) or args.profile,
+                    False,
+                    None,
+                    None,
+                    session,
+                    f"Opened dashboard for {session.name}",
+                )
+            if choice is None:
+                return (
+                    config,
+                    args.profile,
+                    False,
+                    None,
+                    None,
+                    None,
+                    "Opened dashboard without attaching",
+                )
+
         config, profile_name = choose_ui_start_capture_profile(
             args,
             config_path,
@@ -13245,6 +13387,7 @@ def choose_ui_launch_intent(
                 False,
                 None,
                 None,
+                None,
                 f"Ready to start capture with profile {profile_name}",
             )
         return (
@@ -13253,31 +13396,41 @@ def choose_ui_launch_intent(
             False,
             None,
             None,
+            None,
             "Opened dashboard without capture profile",
         )
 
-    record_process, record_session = running_record
-    running_profile = _record_process_profile_name(record_process, record_session)
     print("Existing capture detected")
-    print(f"  {_running_record_summary(record_process, record_session)}")
+    for record_process, record_session in running_records:
+        print(f"  {ui_session_attach_label(record_session, record_process)}")
     print()
+    options = [
+        (f"attach:{index}", ui_session_attach_label(record_session, record_process))
+        for index, (record_process, record_session) in enumerate(running_records)
+    ]
+    options.extend(
+        [
+            ("start", "Start another capture"),
+            ("review", "Choose a recent session without attaching"),
+        ]
+    )
     choice = prompt_menu(
         "Dashboard startup",
-        (
-            ("attach", "Attach to existing capture"),
-            ("start", "Start another capture"),
-            ("review", "Review dashboard only"),
-        ),
-        default_value="attach",
+        options,
+        default_value=options[0][0],
     )
-    if choice == "attach":
+    if choice and choice.startswith("attach:"):
+        selected_index = int(choice.split(":", 1)[1])
+        record_process, record_session = running_records[selected_index]
+        running_profile = _record_process_profile_name(record_process, record_session)
         return (
             config,
             running_profile or args.profile,
             True,
             record_process,
             record_session,
-            "Attached to existing capture",
+            record_session,
+            f"Attached to {record_session.name}",
         )
     if choice == "start":
         config, profile_name = choose_ui_start_capture_profile(args, config_path, config)
@@ -13288,6 +13441,7 @@ def choose_ui_launch_intent(
                 False,
                 None,
                 None,
+                None,
                 f"Ready to start capture with profile {profile_name}",
             )
         return (
@@ -13296,12 +13450,26 @@ def choose_ui_launch_intent(
             False,
             None,
             None,
+            None,
             "Opened dashboard without attaching",
+        )
+    if choice == "review" and sessions:
+        session = choose_ui_session(args, config)
+        session_profile = _session_profile_name(session) if session else None
+        return (
+            config,
+            session_profile or args.profile,
+            False,
+            None,
+            None,
+            session,
+            f"Opened dashboard for {session.name}" if session else "Opened review dashboard without attaching",
         )
     return (
         config,
         args.profile,
         False,
+        None,
         None,
         None,
         "Opened review dashboard without attaching",
@@ -15025,10 +15193,7 @@ def command_ui_tui(args: argparse.Namespace) -> int:
         }
 
     def _same_session_path(left: Path, right: Path) -> bool:
-        try:
-            return left.resolve() == right.resolve()
-        except OSError:
-            return left == right
+        return same_path(left, right)
 
     def _select_session(session_dir: Path) -> bool:
         nonlocal selected_session_index
@@ -15042,12 +15207,14 @@ def command_ui_tui(args: argparse.Namespace) -> int:
         return any(_same_session_path(candidate, session_dir) for candidate in session_list)
 
     def _refresh_state() -> None:
-        nonlocal session_list, selected_session_index, user_selected_session
+        nonlocal session_list, selected_session_index, user_selected_session, selected_session_hint
         nonlocal record_process, record_session, record_launch_log, assist_process, messages
         nonlocal pending_open_frame
         session_list = recent_sessions(args, config)
         if record_session and not _session_in_list(record_session):
             session_list.insert(0, record_session)
+        if selected_session_hint and selected_session_hint.exists() and not _session_in_list(selected_session_hint):
+            session_list.insert(0, selected_session_hint)
         if not session_list:
             selected_session_index = 0
             return
@@ -15098,6 +15265,10 @@ def command_ui_tui(args: argparse.Namespace) -> int:
             selected_session_index = len(session_list) - 1
         if selected_session_index < 0:
             selected_session_index = 0
+        if selected_session_hint:
+            if _select_session(selected_session_hint):
+                user_selected_session = True
+            selected_session_hint = None
         if (
             record_session
             and _is_process_running(record_process)
@@ -16298,19 +16469,27 @@ def command_ui_tui(args: argparse.Namespace) -> int:
     config = load_config(config_path)
     initial_record_process: _UiProcessHandle | None = None
     initial_record_session: Path | None = None
+    initial_selected_session: Path | None = (
+        args.session_dir.expanduser()
+        if getattr(args, "session_dir", None) is not None
+        else None
+    )
     initial_message: str | None = None
     record_attach_enabled = True
-    if interactive_mode_enabled(args) and not args.profile:
+    if interactive_mode_enabled(args) and (not args.profile or initial_selected_session is not None):
         (
             config,
             preflight_profile,
             record_attach_enabled,
             initial_record_process,
             initial_record_session,
+            preflight_session,
             initial_message,
         ) = choose_ui_launch_intent(args, config_path, config)
         if preflight_profile:
             args.profile = preflight_profile
+        if preflight_session is not None:
+            initial_selected_session = preflight_session
     profiles = sorted(config.get("profiles", {}))
     profile_index = 0
     if args.profile and args.profile in profiles:
@@ -16332,7 +16511,8 @@ def command_ui_tui(args: argparse.Namespace) -> int:
 
     session_list: list[Path] = []
     selected_session_index = 0
-    user_selected_session = False
+    selected_session_hint: Path | None = initial_selected_session
+    user_selected_session = initial_selected_session is not None
     search_query = ""
     search_active = False
     record_process: subprocess.Popen[bytes] | _UiProcessHandle | None = initial_record_process
@@ -16903,6 +17083,12 @@ def build_parser() -> argparse.ArgumentParser:
     ui = subparsers.add_parser(
         "ui",
         help="Open the operator dashboard for recording, DVR playback, and assistive review.",
+    )
+    ui.add_argument(
+        "session_dir",
+        nargs="?",
+        type=Path,
+        help="Optional session directory to open or attach to.",
     )
     ui.add_argument(
         "--profile",
