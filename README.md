@@ -216,9 +216,11 @@ The dashboard is a ncurses control plane with an old-school pane layout:
 - a persistent evidence pane for latest detections plus selected-event details
 - a persistent `ffmpeg` log pane for capture warnings while recording
 - quick bib/label filtering (`/` or `_`, then type your query)
-- quick actions to open the latest saved evidence frame (`4`), queue the first
-  detected frame when no frame is available yet, open event video (`v`), or
-  launch review for the current query (`r`)
+- an always-visible evidence shortcut legend: up/down selects a detection,
+  `Enter` or mouse click opens its saved frames, `v` opens event video, `/`
+  filters detections, and `r` launches review for the current query
+- quick actions to open the latest saved evidence frame (`4`) or queue the
+  first detected frame when no frame is available yet
 - speech output selection (`8`) and an audio test (`9`) for detection speech
 
 When `ui` starts interactively, it asks which recording profile the dashboard

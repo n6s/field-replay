@@ -12608,7 +12608,7 @@ def _selected_event_detail_lines(event: dict | None) -> list[str]:
     crop = event.get("crop") or "-"
     lines.append(f"Frame:     {frame}")
     lines.append(f"Crop:      {crop}")
-    lines.append("Actions:   4 show frames  v open video  r review query")
+    lines.append("Actions:   Enter/click show frames  v video  r review query")
     return lines
 
 
@@ -13313,16 +13313,38 @@ def _launch_session_watch(prefix: list[str], session_dir: Path, player: str | No
     return _launch_background_command(command) is not None
 
 
-def _event_frame_path(session_dir: Path, event: dict | None) -> Path | None:
+def _event_image_references(event: dict | None) -> list[str]:
     if event is None:
-        return None
-    frame = event.get("f")
-    if not frame:
-        return None
-    frame_path = session_asset_path(session_dir, str(frame))
-    if not frame_path or not frame_path.exists():
-        return None
-    return frame_path
+        return []
+    references: list[str] = []
+    for key in ("crop", "f"):
+        value = event.get(key)
+        if value:
+            references.append(str(value))
+    crops = event.get("crops")
+    if isinstance(crops, list):
+        references.extend(str(item) for item in crops if item)
+    return list(dict.fromkeys(references))
+
+
+def _event_image_path(session_dir: Path, event: dict | None) -> Path | None:
+    for reference in _event_image_references(event):
+        image_path = session_asset_path(session_dir, reference)
+        if image_path and image_path.exists():
+            return image_path
+    return None
+
+
+def _event_image_paths_for_event(session_dir: Path, event: dict | None) -> list[Path]:
+    image_paths: list[Path] = []
+    seen_paths: set[Path] = set()
+    for reference in _event_image_references(event):
+        image_path = session_asset_path(session_dir, reference)
+        if image_path is None or not image_path.exists() or image_path in seen_paths:
+            continue
+        image_paths.append(image_path)
+        seen_paths.add(image_path)
+    return image_paths
 
 
 def _event_frame_paths(
@@ -13334,13 +13356,12 @@ def _event_frame_paths(
     image_paths: list[Path] = []
     seen_paths: set[Path] = set()
 
-    selected_path = _event_frame_path(session_dir, selected_event)
-    if selected_path is not None:
+    for selected_path in _event_image_paths_for_event(session_dir, selected_event):
         image_paths.append(selected_path)
         seen_paths.add(selected_path)
 
     for event in events:
-        frame_path = _event_frame_path(session_dir, event)
+        frame_path = _event_image_path(session_dir, event)
         if frame_path is None or frame_path in seen_paths:
             continue
         image_paths.append(frame_path)
@@ -13380,23 +13401,19 @@ def _open_selected_event_viewer(
         player = choose_player(None)
         if not player:
             return False
-        target = session_dir / DEFAULT_TIMESHIFT_NAME
-        if not target.exists():
-            target = session_dir / f"{DEFAULT_ARCHIVE_STEM}.mkv"
-        if not target.exists():
-            target = session_dir / f"{DEFAULT_ARCHIVE_STEM}.mp4"
-        if not target.exists():
+        target = _event_video_target_path(session_dir)
+        if target is None:
             return False
 
         command = build_player_command(
             player,
             target,
             300,
-            start_seconds=max(float(event.get("t") or 0.0) - 2.0, 0.0),
+            start_seconds=_event_video_start_seconds(event),
         )
         return _launch_background_command(command) is not None
 
-    frame_path = _event_frame_path(session_dir, event)
+    frame_path = _event_image_path(session_dir, event)
     if frame_path is None:
         return False
     viewer = choose_image_viewer(None)
@@ -13406,21 +13423,30 @@ def _open_selected_event_viewer(
     return _launch_background_command(command) is not None
 
 
+def _event_video_start_seconds(event: dict) -> float:
+    return max(float(event.get("t") or 0.0) - 2.0, 0.0)
+
+
+def _event_video_target_path(session_dir: Path) -> Path | None:
+    target = session_dir / DEFAULT_TIMESHIFT_NAME
+    if not target.exists():
+        target = session_dir / f"{DEFAULT_ARCHIVE_STEM}.mkv"
+    if not target.exists():
+        target = session_dir / f"{DEFAULT_ARCHIVE_STEM}.mp4"
+    if not target.exists():
+        return None
+    return target
+
+
 def _event_frame_reference(event: dict | None) -> str | None:
     if not event:
         return None
-    frame = event.get("f")
-    if not frame:
-        return None
-    return str(frame)
+    references = _event_image_references(event)
+    return references[0] if references else None
 
 
 def _event_has_existing_frame(session_dir: Path, event: dict | None) -> bool:
-    frame = _event_frame_reference(event)
-    if not frame:
-        return False
-    frame_path = session_asset_path(session_dir, frame)
-    return bool(frame_path and frame_path.exists())
+    return _event_image_path(session_dir, event) is not None
 
 
 def _event_frame_open_key(session_dir: Path, event: dict | None) -> str | None:
@@ -14833,8 +14859,8 @@ def command_ui_tui(args: argparse.Namespace) -> int:
     INFO_HEIGHT = 8
     SEARCH_HEIGHT = 3
     TUI_KEY_HINTS = (
-        "1 capture  2 watch  3 detect  4 frames  p profile  r review  "
-        "5 focus  6 rules  8 output  9 audio test  q quit"
+        "1 capture  2 watch  3 detect  4 frames  Enter/click selected  "
+        "v video  / search  q quit"
     )
 
     def _init_colors() -> None:
@@ -15385,9 +15411,17 @@ def command_ui_tui(args: argparse.Namespace) -> int:
             log_h = int(layout["log_h"])
 
         _draw_panel(stdscr, events_y, 0, events_h, events_w, "Evidence")
-        event_start_row = events_y + 1
+        event_start_row = events_y + 2
         detail_height = 5 if events_h >= 12 else 0
-        event_visible_height = max(0, events_h - 2 - detail_height)
+        event_visible_height = max(0, events_h - 3 - detail_height)
+        _safe_addstr(
+            stdscr,
+            events_y + 1,
+            2,
+            "Keys: Up/down select  Enter or click opens frames  v opens video  / filters  r reviews query",
+            events_w - 4,
+            curses.A_BOLD,
+        )
         if not event_rows:
             _safe_addstr(
                 stdscr,
@@ -15664,7 +15698,7 @@ def command_ui_tui(args: argparse.Namespace) -> int:
             events_y = pane_top
             events_h = int(layout["events_h"])
         detail_height = 5 if events_h >= 12 else 0
-        event_visible_height = max(0, events_h - 2 - detail_height)
+        event_visible_height = max(0, events_h - 3 - detail_height)
         buttons = _build_buttons(w, y=int(layout["command_y"]))
         session = _selected_session()
         for button in buttons:
@@ -15682,14 +15716,14 @@ def command_ui_tui(args: argparse.Namespace) -> int:
                 last_mouse_action_at = now
                 return _activate_action(button.button_id)
         if (
-            events_y + 1 <= my < events_y + 1 + event_visible_height
+            events_y + 2 <= my < events_y + 2 + event_visible_height
             and 0 <= mx < events_w - 1
             and event_rows
             and session is not None
         ):
             if not event_rows:
                 return True
-            index = my - events_y - 1
+            index = my - events_y - 2
             if 0 <= index < min(len(event_rows), event_visible_height):
                 selected_event_index = index
                 selected_event = event_rows[selected_event_index]
@@ -15699,7 +15733,7 @@ def command_ui_tui(args: argparse.Namespace) -> int:
                     if frame_key:
                         last_opened_frame_ref = frame_key
                 else:
-                    messages = _write_status_messages(messages, "Selected event has no frame")
+                    messages = _write_status_messages(messages, "Selected event has no saved image")
         return True
 
     def _save_ui_state() -> None:
@@ -15999,6 +16033,7 @@ def command_ui_tui(args: argparse.Namespace) -> int:
 
     def _curses_main(stdscr: "curses._CursesWindow") -> int:
         nonlocal messages, profile_index, record_process, assist_process, quit_confirm_active
+        nonlocal last_opened_frame_ref
         nonlocal search_active, search_query, selected_event_index, selected_session_index
         _init_colors()
         try:
@@ -16105,16 +16140,42 @@ def command_ui_tui(args: argparse.Namespace) -> int:
                 _activate_action("profile")
                 continue
 
+            if key in (curses.KEY_ENTER, 10, 13):
+                session = _selected_session()
+                if session is None:
+                    messages = _write_status_messages(messages, "No session selected")
+                elif not event_rows:
+                    messages = _write_status_messages(messages, "No evidence event selected")
+                elif event_rows and _show_frame_collection(
+                    session,
+                    event_rows[selected_event_index],
+                ):
+                    messages = _write_status_messages(messages, "Opened frame collection")
+                    frame_key = _event_frame_open_key(session, event_rows[selected_event_index])
+                    if frame_key:
+                        last_opened_frame_ref = frame_key
+                else:
+                    messages = _write_status_messages(messages, "Selected event has no saved image")
+                continue
+
             if key in (ord("v"), ord("V")):
                 session = _selected_session()
                 if session is None:
                     messages = _write_status_messages(messages, "No session selected")
-                elif event_rows and _open_selected_event_viewer(
-                    session,
-                    event_rows[selected_event_index],
-                    use_video=True,
-                ):
-                    messages = _write_status_messages(messages, "Opened event video")
+                elif not event_rows:
+                    messages = _write_status_messages(messages, "No evidence event selected")
+                elif _event_video_target_path(session) is None:
+                    messages = _write_status_messages(messages, "No playable session video found")
+                elif _open_selected_event_viewer(session, event_rows[selected_event_index], use_video=True):
+                    event = event_rows[selected_event_index]
+                    messages = _write_status_messages(
+                        messages,
+                        (
+                            "Opened event video at "
+                            f"{format_duration(_event_video_start_seconds(event))} "
+                            f"from {_event_video_target_path(session).name}"
+                        ),
+                    )
                 else:
                     messages = _write_status_messages(messages, "Could not open event video")
                 continue
