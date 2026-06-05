@@ -15216,7 +15216,7 @@ def command_ui_tui(args: argparse.Namespace) -> int:
         if selected_session_hint and selected_session_hint.exists() and not _session_in_list(selected_session_hint):
             session_list.insert(0, selected_session_hint)
         if not session_list:
-            selected_session_index = 0
+            selected_session_index = -1
             return
         if record_process is not None and not _is_process_running(record_process):
             if not isinstance(record_process, _UiProcessHandle):
@@ -15263,7 +15263,7 @@ def command_ui_tui(args: argparse.Namespace) -> int:
                 )
         if selected_session_index >= len(session_list):
             selected_session_index = len(session_list) - 1
-        if selected_session_index < 0:
+        if selected_session_index < 0 and not user_selected_session:
             selected_session_index = 0
         if selected_session_hint:
             if _select_session(selected_session_hint):
@@ -15314,7 +15314,7 @@ def command_ui_tui(args: argparse.Namespace) -> int:
             f"auto={'on' if auto_open_frames else 'off'} "
             f"pending={'yes' if pending_open_frame else 'no'}"
         )
-        if session_list:
+        if session_list and 0 <= selected_session_index < len(session_list):
             lines.append(
                 f"Selected session: {session_display_label(session_list[selected_session_index])}"
             )
@@ -15332,7 +15332,11 @@ def command_ui_tui(args: argparse.Namespace) -> int:
 
     def _refresh_events() -> None:
         nonlocal event_rows, selected_event_index
-        if not session_list or selected_session_index >= len(session_list):
+        if (
+            not session_list
+            or selected_session_index < 0
+            or selected_session_index >= len(session_list)
+        ):
             event_rows = []
             return
         session_dir = session_list[selected_session_index]
@@ -16447,14 +16451,22 @@ def command_ui_tui(args: argparse.Namespace) -> int:
 
             if key in (ord("a"), ord("A")):
                 if session_list:
-                    selected_session_index = (selected_session_index - 1) % len(session_list)
+                    selected_session_index = (
+                        0
+                        if selected_session_index < 0
+                        else (selected_session_index - 1) % len(session_list)
+                    )
                     user_selected_session = True
                     selected_event_index = 0
                     _refresh_events()
                 continue
             if key in (ord("d"), ord("D")):
                 if session_list:
-                    selected_session_index = (selected_session_index + 1) % len(session_list)
+                    selected_session_index = (
+                        0
+                        if selected_session_index < 0
+                        else (selected_session_index + 1) % len(session_list)
+                    )
                     user_selected_session = True
                     selected_event_index = 0
                     _refresh_events()
@@ -16474,6 +16486,9 @@ def command_ui_tui(args: argparse.Namespace) -> int:
         if getattr(args, "session_dir", None) is not None
         else None
     )
+    initial_no_session = (
+        initial_selected_session is None and getattr(args, "profile", None) is not None
+    )
     initial_message: str | None = None
     record_attach_enabled = True
     if interactive_mode_enabled(args) and (not args.profile or initial_selected_session is not None):
@@ -16490,6 +16505,9 @@ def command_ui_tui(args: argparse.Namespace) -> int:
             args.profile = preflight_profile
         if preflight_session is not None:
             initial_selected_session = preflight_session
+            initial_no_session = False
+        elif preflight_profile:
+            initial_no_session = True
     profiles = sorted(config.get("profiles", {}))
     profile_index = 0
     if args.profile and args.profile in profiles:
@@ -16510,9 +16528,9 @@ def command_ui_tui(args: argparse.Namespace) -> int:
     audio_sinks = available_speech_output_sinks()
 
     session_list: list[Path] = []
-    selected_session_index = 0
+    selected_session_index = -1 if initial_no_session else 0
     selected_session_hint: Path | None = initial_selected_session
-    user_selected_session = initial_selected_session is not None
+    user_selected_session = initial_selected_session is not None or initial_no_session
     search_query = ""
     search_active = False
     record_process: subprocess.Popen[bytes] | _UiProcessHandle | None = initial_record_process
