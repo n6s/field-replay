@@ -4480,10 +4480,15 @@ def choose_image_viewer(preferred: str | None) -> str | None:
     return shutil.which("eog")
 
 
-def build_image_viewer_command(viewer: str, image_paths: Sequence[Path]) -> list[str]:
+def build_image_viewer_command(
+    viewer: str,
+    image_paths: Sequence[Path],
+    *,
+    single_window: bool = True,
+) -> list[str]:
     viewer_name = Path(viewer).name
     command = [viewer]
-    if viewer_name == "eog":
+    if viewer_name == "eog" and single_window:
         command.append("--single-window")
     command.extend(str(path) for path in image_paths)
     return command
@@ -13012,7 +13017,14 @@ def _open_event_frame_collection(
     return _launch_background_command(command) is not None
 
 
-def _open_selected_event_viewer(session_dir: Path, event: dict, *, use_video: bool) -> bool:
+def _open_selected_event_viewer(
+    session_dir: Path,
+    event: dict,
+    *,
+    use_video: bool,
+    stable_preview: bool = True,
+    single_window: bool = True,
+) -> bool:
     if use_video:
         player = choose_player(None)
         if not player:
@@ -13041,14 +13053,14 @@ def _open_selected_event_viewer(session_dir: Path, event: dict, *, use_video: bo
         return False
     viewer_path = frame_path
     try:
-        if image_viewer_uses_stable_preview_path(viewer):
+        if stable_preview and image_viewer_uses_stable_preview_path(viewer):
             viewer_path = update_stable_preview_image(
                 frame_path,
                 session_dir / ".latest-evidence-preview.jpg",
             )
     except OSError:
         return False
-    command = build_image_viewer_command(viewer, [viewer_path])
+    command = build_image_viewer_command(viewer, [viewer_path], single_window=single_window)
     return _launch_background_command(command) is not None
 
 
@@ -14480,6 +14492,10 @@ def command_ui_tui(args: argparse.Namespace) -> int:
     COLOR_SELECTED = 5
     COLOR_DIM = 6
     COLOR_WARNING = 7
+    COMMAND_BAR_HEIGHT = 2
+    MESSAGE_HEIGHT = 4
+    INFO_HEIGHT = 8
+    SEARCH_HEIGHT = 3
     TUI_KEY_HINTS = (
         "1 capture  2 watch  3 detect  4 frames  r review  "
         "5 focus  6 rules  8 output  9 audio test  q quit"
@@ -14555,7 +14571,10 @@ def command_ui_tui(args: argparse.Namespace) -> int:
         if button.width <= 0:
             return
         label_lines = button.label.split("\n", 1)
-        first_line = f"[{button.hotkey}] {label_lines[0]}"
+        if button.width >= 10:
+            first_line = f"[{button.hotkey}] {label_lines[0]}"
+        else:
+            first_line = f"{button.hotkey}:{label_lines[0]}"
         second_line = label_lines[1] if len(label_lines) > 1 else ""
         _safe_addstr(
             window,
@@ -14574,33 +14593,58 @@ def command_ui_tui(args: argparse.Namespace) -> int:
             style,
         )
 
-    def _build_buttons(width: int, y: int = 4) -> list[_UiButton]:
-        operations = [
+    def _build_buttons(width: int, y: int) -> list[_UiButton]:
+        button_defs = [
             ("record", "Start\nCapture", "1"),
             ("watch", "Watch\nDVR", "2"),
             ("assist", "Start\nDetect", "3"),
             ("open", "Show\nFrames", "4"),
             ("review", "Review\nQuery", "r"),
-        ]
-        tuning = [
             ("subjects", "Detect\nFocus", "5"),
             ("speech_rules", "Report\nRules", "6"),
             ("audio", "Speech\nOutput", "8"),
             ("test_speaker", "Audio\nTest", "9"),
             ("quit", "Quit\nUI", "q"),
         ]
-        rows = [operations, tuning]
-        usable_width = max(20, width - 4)
         buttons: list[_UiButton] = []
-        for row_index, row in enumerate(rows):
-            cursor_x = 2
-            cursor_y = y + (row_index * 3)
-            gap_total = max(0, len(row) - 1) * 2
-            width_hint = max(11, min(18, (usable_width - gap_total) // len(row)))
-            for button_id, label, hotkey in row:
-                buttons.append(_UiButton(button_id, label, hotkey, cursor_y, cursor_x, width_hint))
-                cursor_x += width_hint + 2
+        cell_count = len(button_defs)
+        base_width = max(1, width // cell_count)
+        extra = max(0, width - (base_width * cell_count))
+        cursor_x = 0
+        for index, (button_id, label, hotkey) in enumerate(button_defs):
+            cell_width = base_width + (1 if index < extra else 0)
+            buttons.append(_UiButton(button_id, label, hotkey, y, cursor_x, cell_width))
+            cursor_x += cell_width
         return buttons
+
+    def _layout(h: int, w: int) -> dict[str, int | bool]:
+        top_y = 3
+        search_y = top_y + INFO_HEIGHT
+        pane_top = search_y + SEARCH_HEIGHT
+        command_y = h - COMMAND_BAR_HEIGHT
+        message_y = command_y - MESSAGE_HEIGHT
+        pane_height = max(0, message_y - pane_top)
+        side_by_side = w >= 112
+        if side_by_side:
+            events_h = log_h = pane_height
+        else:
+            if pane_height >= 10:
+                events_h = max(5, pane_height - 3)
+                log_h = pane_height - events_h
+            else:
+                events_h = pane_height
+                log_h = 0
+        return {
+            "top_y": top_y,
+            "search_y": search_y,
+            "pane_top": pane_top,
+            "pane_height": pane_height,
+            "message_y": message_y,
+            "command_y": command_y,
+            "events_h": events_h,
+            "log_h": log_h,
+            "side_by_side": side_by_side,
+        }
 
     def _refresh_state() -> None:
         nonlocal session_list, selected_session_index
@@ -14720,10 +14764,22 @@ def command_ui_tui(args: argparse.Namespace) -> int:
                 return event
         return None
 
-    def _open_frame_event(session_dir: Path, event: dict | None) -> bool:
+    def _open_frame_event(
+        session_dir: Path,
+        event: dict | None,
+        *,
+        stable_preview: bool = True,
+        single_window: bool = True,
+    ) -> bool:
         if event is None:
             return False
-        return _open_selected_event_viewer(session_dir, event, use_video=False)
+        return _open_selected_event_viewer(
+            session_dir,
+            event,
+            use_video=False,
+            stable_preview=stable_preview,
+            single_window=single_window,
+        )
 
     def _show_frame_collection(session_dir: Path, event: dict | None) -> bool:
         events = event_rows
@@ -14746,7 +14802,12 @@ def command_ui_tui(args: argparse.Namespace) -> int:
         frame_key = _event_frame_open_key(session, event)
         if not frame_key or frame_key == last_opened_frame_ref:
             return
-        if _open_frame_event(session, event):
+        if _open_frame_event(
+            session,
+            event,
+            stable_preview=not pending_open_frame,
+            single_window=not pending_open_frame,
+        ):
             last_opened_frame_ref = frame_key
             pending_open_frame = False
             messages = _write_status_messages(messages, "Opened latest detected frame")
@@ -14906,47 +14967,9 @@ def command_ui_tui(args: argparse.Namespace) -> int:
             header_attr,
         )
 
-        command_y = 3
-        command_height = 9
-        _draw_panel(stdscr, command_y - 1, 0, command_height, w, "Commands")
-        _safe_addstr(stdscr, command_y, 2, "Operations", max(0, w - 4), curses.A_BOLD)
-        _safe_addstr(stdscr, command_y + 3, 2, "Detection / Reporting", max(0, w - 4), curses.A_BOLD)
-        buttons = _build_buttons(w, y=command_y + 1)
-        for button in buttons:
-            if button.button_id == "record":
-                button.label = (
-                    "Stop\nCapture" if _is_process_running(record_process) else "Start\nCapture"
-                )
-            elif button.button_id == "assist":
-                button.label = (
-                    "Stop\nDetect" if _is_process_running(assist_process) else "Start\nDetect"
-                )
-            elif button.button_id == "subjects":
-                button.label = "Detect\nFocus"
-            elif button.button_id == "speech_rules":
-                button.label = "Report\nRules"
-            elif button.button_id == "audio":
-                button.label = "Speech\nOutput"
-            elif button.button_id == "test_speaker":
-                button.label = "Audio\nTest"
-            elif button.button_id == "quit":
-                button.label = "Quit\nUI"
-            if button.button_id == "open":
-                button.label = "Show\nWhen Seen" if pending_open_frame else "Show\nFrames"
-            if button.button_id == "review":
-                button.label = "Review\nQuery"
-            if button.button_id == "watch":
-                button.label = "Watch\nDVR"
-
-            _draw_button(
-                stdscr,
-                button,
-                selected=False,
-                enabled=button.button_id != "review" or bool(event_rows),
-            )
-
-        top_y = command_y + command_height
-        info_height = 8
+        layout = _layout(h, w)
+        top_y = int(layout["top_y"])
+        info_height = INFO_HEIGHT
         left_w = max(38, w // 2)
         right_w = w - left_w
         _draw_panel(stdscr, top_y, 0, info_height, left_w, "Status")
@@ -14982,8 +15005,8 @@ def command_ui_tui(args: argparse.Namespace) -> int:
         else:
             _safe_addstr(stdscr, top_y + 1, left_w + 2, "(none)", right_w - 4)
 
-        search_y = top_y + info_height
-        _draw_panel(stdscr, search_y, 0, 3, w, "Search")
+        search_y = int(layout["search_y"])
+        _draw_panel(stdscr, search_y, 0, SEARCH_HEIGHT, w, "Search")
         prompt = f"{search_query}{'_' if search_active else ''}"
         _safe_addstr(
             stdscr,
@@ -14993,23 +15016,23 @@ def command_ui_tui(args: argparse.Namespace) -> int:
             w - 4,
         )
 
-        message_height = 5
-        pane_top = search_y + 3
-        pane_height = h - pane_top - message_height
-        side_by_side = w >= 112
+        pane_top = int(layout["pane_top"])
+        pane_height = int(layout["pane_height"])
+        side_by_side = bool(layout["side_by_side"])
         if side_by_side:
             events_w = max(58, (w * 3) // 5)
             log_x = events_w
             log_w = w - events_w
-            events_h = log_h = pane_height
+            events_h = int(layout["events_h"])
+            log_h = int(layout["log_h"])
             events_y = log_y = pane_top
         else:
             events_w = log_w = w
             log_x = 0
             events_y = pane_top
-            events_h = max(7, (pane_height * 2) // 3)
+            events_h = int(layout["events_h"])
             log_y = events_y + events_h
-            log_h = max(3, pane_height - events_h)
+            log_h = int(layout["log_h"])
 
         _draw_panel(stdscr, events_y, 0, events_h, events_w, "Evidence")
         event_start_row = events_y + 1
@@ -15060,48 +15083,83 @@ def command_ui_tui(args: argparse.Namespace) -> int:
                     events_w - 4,
                 )
 
-        log_path = _selected_record_log_path()
-        log_title = "FFmpeg Log"
-        if log_path:
-            log_title += f" - {log_path.name}"
-        _draw_panel(stdscr, log_y, log_x, log_h, log_w, log_title)
-        log_start_row = log_y + 1
-        log_visible_height = max(0, log_h - 2)
-        if not log_path:
-            _safe_addstr(
-                stdscr,
-                log_start_row,
-                log_x + 2,
-                "No recorder log selected.",
-                log_w - 4,
-            )
-        else:
-            lines = tail_text_lines(log_path, limit=max(log_visible_height, 1))
-            important = (
-                "error",
-                "fail",
-                "buffer",
-                "overrun",
-                "drop",
-                "non-monotonous",
-                "input/output",
-                "no such device",
-            )
-            for index, line in enumerate(lines[:log_visible_height]):
-                attr = curses.A_BOLD if any(word in line.lower() for word in important) else 0
+        if log_h >= 3:
+            log_path = _selected_record_log_path()
+            log_title = "FFmpeg Log"
+            if log_path:
+                log_title += f" - {log_path.name}"
+            _draw_panel(stdscr, log_y, log_x, log_h, log_w, log_title)
+            log_start_row = log_y + 1
+            log_visible_height = max(0, log_h - 2)
+            if not log_path:
                 _safe_addstr(
                     stdscr,
-                    log_start_row + index,
+                    log_start_row,
                     log_x + 2,
-                    line,
+                    "No recorder log selected.",
                     log_w - 4,
-                    attr,
                 )
+            else:
+                lines = tail_text_lines(log_path, limit=max(log_visible_height, 1))
+                important = (
+                    "error",
+                    "fail",
+                    "buffer",
+                    "overrun",
+                    "drop",
+                    "non-monotonous",
+                    "input/output",
+                    "no such device",
+                )
+                for index, line in enumerate(lines[:log_visible_height]):
+                    attr = curses.A_BOLD if any(word in line.lower() for word in important) else 0
+                    _safe_addstr(
+                        stdscr,
+                        log_start_row + index,
+                        log_x + 2,
+                        line,
+                        log_w - 4,
+                        attr,
+                    )
 
-        log_top = h - message_height
-        _draw_panel(stdscr, log_top, 0, message_height, w, "Messages")
+        log_top = int(layout["message_y"])
+        _draw_panel(stdscr, log_top, 0, MESSAGE_HEIGHT, w, "Messages")
         for line_offset, line in enumerate(messages[-3:]):
             _safe_addstr(stdscr, log_top + 1 + line_offset, 2, line, w - 4)
+
+        buttons = _build_buttons(w, y=int(layout["command_y"]))
+        for button in buttons:
+            if button.button_id == "record":
+                button.label = (
+                    "Stop\nCapture" if _is_process_running(record_process) else "Start\nCapture"
+                )
+            elif button.button_id == "assist":
+                button.label = (
+                    "Stop\nDetect" if _is_process_running(assist_process) else "Start\nDetect"
+                )
+            elif button.button_id == "subjects":
+                button.label = "Detect\nFocus"
+            elif button.button_id == "speech_rules":
+                button.label = "Report\nRules"
+            elif button.button_id == "audio":
+                button.label = "Speech\nOutput"
+            elif button.button_id == "test_speaker":
+                button.label = "Audio\nTest"
+            elif button.button_id == "quit":
+                button.label = "Quit\nUI"
+            if button.button_id == "open":
+                button.label = "Show\nWhen Seen" if pending_open_frame else "Show\nFrames"
+            if button.button_id == "review":
+                button.label = "Review\nQuery"
+            if button.button_id == "watch":
+                button.label = "Watch\nDVR"
+
+            _draw_button(
+                stdscr,
+                button,
+                selected=False,
+                enabled=button.button_id != "review" or bool(event_rows),
+            )
 
         if quit_confirm_active:
             _draw_quit_confirmation(stdscr)
@@ -15228,25 +15286,20 @@ def command_ui_tui(args: argparse.Namespace) -> int:
         if click_state and not (bstate & click_state):
             return True
         h, w = stdscr.getmaxyx()
-        command_y = 3
-        command_height = 9
-        top_y = command_y + command_height
-        info_height = 8
-        search_y = top_y + info_height
-        pane_top = search_y + 3
-        pane_height = h - pane_top - 5
-        side_by_side = w >= 112
+        layout = _layout(h, w)
+        pane_top = int(layout["pane_top"])
+        side_by_side = bool(layout["side_by_side"])
         if side_by_side:
             events_w = max(58, (w * 3) // 5)
-            events_h = pane_height
+            events_h = int(layout["events_h"])
             events_y = pane_top
         else:
             events_w = w
             events_y = pane_top
-            events_h = max(7, (pane_height * 2) // 3)
+            events_h = int(layout["events_h"])
         detail_height = 5 if events_h >= 12 else 0
         event_visible_height = max(0, events_h - 2 - detail_height)
-        buttons = _build_buttons(w, y=command_y + 1)
+        buttons = _build_buttons(w, y=int(layout["command_y"]))
         session = _selected_session()
         for button in buttons:
             if (
@@ -15516,18 +15569,15 @@ def command_ui_tui(args: argparse.Namespace) -> int:
             if session is None:
                 messages = _write_status_messages(messages, "No session selected")
                 return True
-            selected_event = (
-                event_rows[selected_event_index]
-                if event_rows and selected_event_index < len(event_rows)
-                else None
-            )
-            frame_event = (
-                selected_event
-                if _event_has_existing_frame(session, selected_event)
-                else _latest_event_with_frame(session)
-            )
-            if _show_frame_collection(session, frame_event):
-                messages = _write_status_messages(messages, "Opened frame collection")
+            frame_event = _latest_event_with_frame(session)
+            if frame_event and _open_selected_event_viewer(
+                session,
+                frame_event,
+                use_video=False,
+                stable_preview=False,
+                single_window=False,
+            ):
+                messages = _write_status_messages(messages, "Opened latest detected frame")
                 frame_key = _event_frame_open_key(session, frame_event)
                 if frame_key:
                     last_opened_frame_ref = frame_key

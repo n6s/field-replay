@@ -209,18 +209,18 @@ The dashboard is a ncurses control plane with an old-school pane layout:
 - profile + recent session visibility
 - controls to start/stop recording, watch a session, and start/stop live
   detection (`assist-live`) for the selected session
-- two-line command buttons grouped into operations and detection/reporting
+- full-width bottom command cells for operations and detection/reporting actions
 - picker dialogs for detect focus, reporting rules, and speech output, with choices
   remembered in the normal config
 - a persistent evidence pane for latest detections plus selected-event details
 - a persistent `ffmpeg` log pane for capture warnings while recording
 - quick bib/label filtering (`/` or `_`, then type your query)
-- quick actions to show saved evidence frames (`4`), queue the first detected
-  frame when no frame is available yet, open event video (`v`), or
+- quick actions to open the latest saved evidence frame (`4`), queue the first
+  detected frame when no frame is available yet, open event video (`v`), or
   launch review for the current query (`r`)
 - speech output selection (`8`) and an audio test (`9`) for detection speech
 
-Mouse clicks on the top buttons and event rows are supported. If capture or
+Mouse clicks on the bottom command cells and event rows are supported. If capture or
 detect is still running, `q` opens a quit confirmation with choices to stop the
 running subprocesses, leave them running, or cancel and return to the dashboard.
 
