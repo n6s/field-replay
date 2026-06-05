@@ -1314,6 +1314,14 @@ def parse_hw_device(device_name: str) -> tuple[str, str] | None:
     return card_token, pcm_device
 
 
+def canonical_alsa_device_name(device_name: str) -> str:
+    parsed = parse_hw_device(device_name)
+    if not parsed:
+        return device_name
+    card_token, pcm_device = parsed
+    return f"hw:{card_token},{pcm_device}"
+
+
 def list_alsa_capture_devices() -> list[AudioDevice]:
     cards = {index: (card_id, desc) for index, card_id, desc in list_alsa_cards()}
     pcm_path = Path("/proc/asound/pcm")
@@ -3686,7 +3694,8 @@ def acquire_device_locks(recordings_dir: Path, args: argparse.Namespace, session
     primary_source = source_reference(args) or source_display_label(args)
     lock_specs = [(lock_name(args.source_type, primary_source), primary_source)]
     if uses_alsa_audio_input(args):
-        lock_specs.append((lock_name("audio", args.audio_device), args.audio_device))
+        audio_lock_device = canonical_alsa_device_name(args.audio_device)
+        lock_specs.append((lock_name("audio", audio_lock_device), args.audio_device))
 
     acquired: list[Path] = []
     try:
