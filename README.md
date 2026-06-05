@@ -210,13 +210,14 @@ The dashboard is a ncurses control plane with an old-school pane layout:
 - controls to start/stop recording, watch a session, and start/stop live
   detection (`assist-live`) for the selected session
 - two-line command buttons grouped into operations and detection/reporting
-- picker dialogs for detect focus, speech rules, and speech output, with choices
+- picker dialogs for detect focus, reporting rules, and speech output, with choices
   remembered in the normal config
 - a persistent evidence pane for latest detections plus selected-event details
 - a persistent `ffmpeg` log pane for capture warnings while recording
 - quick bib/label filtering (`/` or `_`, then type your query)
-- quick actions to open the selected evidence frame (`4`), open event video
-  (`v`), or launch review for the current query (`r`)
+- quick actions to open the selected evidence frame (`4`), queue the first
+  detected frame when no frame is available yet, open event video (`v`), or
+  launch review for the current query (`r`)
 - speech output selection (`8`) and an audio test (`9`) for detection speech
 
 Mouse clicks on the top buttons and event rows are supported. If capture or
@@ -310,8 +311,9 @@ Live speech can be narrowed without disabling all detection output:
 ```
 
 The dashboard exposes the same choices through dialogs: `5` opens detect focus
-checkboxes, `6` opens speech rule checkboxes, `8` opens a PulseAudio/PipeWire
-output picker when `pactl` is available, and `9` sends an audio test.
+checkboxes, `6` opens reporting rule checkboxes for speech and automatic latest
+frame preview, `8` opens a PulseAudio/PipeWire output picker when `pactl` is
+available, and `9` sends an audio test.
 
 To watch promoted detections as they arrive, add `--preview-detections`:
 
@@ -319,9 +321,10 @@ To watch promoted detections as they arrive, add `--preview-detections`:
 ./field-replay assist-live --preview-detections
 ```
 
-The preview opens each saved crop in the configured image viewer. It defaults to
-`eog`; with `eog`, field replay passes `--single-window` so a running viewer can
-reuse the same window instead of piling up separate crop windows. The dashboard
+The preview opens each promoted full frame in the configured image viewer, with
+the crop as a fallback when only a crop was saved. It defaults to `eog`; with
+`eog`, field replay refreshes a stable latest-preview image and passes
+`--single-window` so a running viewer can reuse the same window. The dashboard
 asks the same preview question when you choose the live assist action.
 
 ### 1. Check the environment
@@ -640,8 +643,8 @@ across the source-frame diagonal and at least `0.55` directionality. Promoted
 subject lines print immediately in the terminal and speak the subject label;
 identifier crops are queued asynchronously so detector sampling keeps moving,
 and identifier candidates are spoken later as `Possible <number>` when the
-reader finishes. Add `--preview-detections` to open each promoted crop as it is
-saved; `--preview-viewer` can select a different image viewer. Each live debug
+reader finishes. Add `--preview-detections` to open the latest promoted frame as
+it is saved; `--preview-viewer` can select a different image viewer. Each live debug
 sample includes a `timing` object with duration
 probe, frame extraction, YOLO, tracking, motion, analysis total, and media-lag
 measurements. Live assist refreshes the DVR duration with `ffprobe` every 5

@@ -110,6 +110,7 @@ DEFAULT_YOLO_LIVE_MOTION_FALLBACK_REPEAT_SUPPRESS_IOU = 0.5
 DEFAULT_YOLO_LIVE_PREVIEW_DETECTIONS = False
 DEFAULT_UI_SPEAK_IDENTIFIERS = True
 DEFAULT_UI_SPEAK_SUBJECTS = True
+DEFAULT_UI_AUTO_OPEN_FRAMES = False
 UI_SUBJECT_CLASS_OPTIONS = ("person", "bicycle", "car", "motorbike", "bus", "truck")
 MOTION_DETECT_MODES = ("smart", "fixed")
 MOTION_SCAN_ENGINES = ("auto", "gstreamer-jetson", "ffmpeg")
@@ -4488,6 +4489,20 @@ def build_image_viewer_command(viewer: str, image_paths: Sequence[Path]) -> list
     return command
 
 
+def image_viewer_uses_stable_preview_path(viewer: str) -> bool:
+    return Path(viewer).name == "eog"
+
+
+def update_stable_preview_image(source_path: Path, preview_path: Path) -> Path:
+    ensure_directory(preview_path.parent)
+    temporary_path = preview_path.with_name(
+        f".{preview_path.stem}-{os.getpid()}.tmp{preview_path.suffix}"
+    )
+    shutil.copy2(source_path, temporary_path)
+    os.replace(temporary_path, preview_path)
+    return preview_path
+
+
 def launch_background_viewer(command: Sequence[str]) -> subprocess.Popen[bytes]:
     return subprocess.Popen(
         list(command),
@@ -8430,6 +8445,10 @@ def configured_ui_speech(config: dict) -> tuple[bool, bool, str | None]:
     )
 
 
+def configured_ui_auto_open_frames(config: dict) -> bool:
+    return bool(config.get("ui_auto_open_frames", DEFAULT_UI_AUTO_OPEN_FRAMES))
+
+
 def save_ui_detection_config(
     config_path: Path,
     config: dict,
@@ -8438,10 +8457,12 @@ def save_ui_detection_config(
     speak_identifiers: bool,
     speak_subjects: bool,
     speech_output_sink: str | None,
+    auto_open_frames: bool,
 ) -> bool:
     config["ui_subject_classes"] = ",".join(subject_classes)
     config["ui_speak_identifiers"] = bool(speak_identifiers)
     config["ui_speak_subjects"] = bool(speak_subjects)
+    config["ui_auto_open_frames"] = bool(auto_open_frames)
     if speech_output_sink:
         config["ui_speech_output_sink"] = speech_output_sink
     else:
@@ -12965,8 +12986,41 @@ def _open_selected_event_viewer(session_dir: Path, event: dict, *, use_video: bo
     viewer = choose_image_viewer(None)
     if not viewer:
         return False
-    command = build_image_viewer_command(viewer, [frame_path])
+    viewer_path = frame_path
+    try:
+        if image_viewer_uses_stable_preview_path(viewer):
+            viewer_path = update_stable_preview_image(
+                frame_path,
+                session_dir / ".latest-evidence-preview.jpg",
+            )
+    except OSError:
+        return False
+    command = build_image_viewer_command(viewer, [viewer_path])
     return _launch_background_command(command) is not None
+
+
+def _event_frame_reference(event: dict | None) -> str | None:
+    if not event:
+        return None
+    frame = event.get("f")
+    if not frame:
+        return None
+    return str(frame)
+
+
+def _event_has_existing_frame(session_dir: Path, event: dict | None) -> bool:
+    frame = _event_frame_reference(event)
+    if not frame:
+        return False
+    frame_path = session_asset_path(session_dir, frame)
+    return bool(frame_path and frame_path.exists())
+
+
+def _event_frame_open_key(session_dir: Path, event: dict | None) -> str | None:
+    frame = _event_frame_reference(event)
+    if not frame:
+        return None
+    return f"{session_dir}:{frame}"
 
 
 def prepare_yolo_opencv_net(args: argparse.Namespace):
@@ -13364,15 +13418,28 @@ def command_assist_live(args: argparse.Namespace) -> int:
             print("warning: could not speak live subject events", file=sys.stderr)
             speech_warning_printed = True
 
-    def preview_subject_event(payload: dict, crop_reference: str | None) -> None:
+    def preview_subject_event(
+        payload: dict,
+        frame_reference: str | None,
+        crop_reference: str | None,
+    ) -> None:
         nonlocal preview_warning_printed
-        if not args.preview_detections or not preview_viewer or not crop_reference:
+        if not args.preview_detections or not preview_viewer:
             return
-        crop_path = session_asset_path(session_dir, crop_reference)
-        if crop_path is None or not crop_path.exists():
+        image_reference = frame_reference or crop_reference
+        if not image_reference:
             return
-        command = build_image_viewer_command(preview_viewer, [crop_path])
+        image_path = session_asset_path(session_dir, image_reference)
+        if image_path is None or not image_path.exists():
+            return
         try:
+            viewer_path = image_path
+            if image_viewer_uses_stable_preview_path(preview_viewer):
+                viewer_path = update_stable_preview_image(
+                    image_path,
+                    yolo_paths["root"] / "latest-detection-preview.jpg",
+                )
+            command = build_image_viewer_command(preview_viewer, [viewer_path])
             launch_background_viewer(command)
             append_jsonl(
                 yolo_paths["debug_log"],
@@ -13380,8 +13447,10 @@ def command_assist_live(args: argparse.Namespace) -> int:
                     "w": event_wall_time(datetime.now().astimezone()),
                     "kind": "preview",
                     "source_event": payload["l"],
+                    "image": image_reference,
                     "crop": crop_reference,
                     "viewer": preview_viewer,
+                    "viewer_image": relative_to_session(viewer_path, session_dir),
                     "ok": True,
                 },
             )
@@ -13392,6 +13461,7 @@ def command_assist_live(args: argparse.Namespace) -> int:
                     "w": event_wall_time(datetime.now().astimezone()),
                     "kind": "preview",
                     "source_event": payload["l"],
+                    "image": image_reference,
                     "crop": crop_reference,
                     "viewer": preview_viewer,
                     "ok": False,
@@ -13752,7 +13822,7 @@ def command_assist_live(args: argparse.Namespace) -> int:
                 )
                 promoted_count += 1
                 print(subject_event_log_line(payload), flush=True)
-                preview_subject_event(payload, crop_reference)
+                preview_subject_event(payload, frame_reference, crop_reference)
                 speak_subject_event(payload, payload.get("subject"))
 
                 submit_identifier_read(payload, crop_reference)
@@ -13937,7 +14007,7 @@ def command_assist_live(args: argparse.Namespace) -> int:
                     )
                     promoted_count += 1
                     print(subject_event_log_line(payload), flush=True)
-                    preview_subject_event(payload, crop_reference)
+                    preview_subject_event(payload, frame_reference, crop_reference)
                     speak_subject_event(payload, args.motion_fallback_label)
                     submit_identifier_read(payload, crop_reference)
 
@@ -14339,7 +14409,7 @@ def command_ui_legacy(args: argparse.Namespace) -> int:
                 print("No recent session found.", file=sys.stderr)
                 continue
             command = [*prefix, "assist-live", str(session), "--no-interactive"]
-            if prompt_yes_no("Open detection crop preview", default=False):
+            if prompt_yes_no("Open latest detection frame preview", default=False):
                 command.append("--preview-detections")
             print("Running:", shlex.join(command))
             return subprocess.call(command)
@@ -14359,7 +14429,7 @@ def command_ui_tui(args: argparse.Namespace) -> int:
     COLOR_WARNING = 7
     TUI_KEY_HINTS = (
         "1 capture  2 watch  3 detect  4 frame  r review  "
-        "5 focus  6 speech  8 output  9 audio test  q quit"
+        "5 focus  6 rules  8 output  9 audio test  q quit"
     )
 
     def _init_colors() -> None:
@@ -14461,7 +14531,7 @@ def command_ui_tui(args: argparse.Namespace) -> int:
         ]
         tuning = [
             ("subjects", "Detect\nFocus", "5"),
-            ("speech_rules", "Speech\nRules", "6"),
+            ("speech_rules", "Report\nRules", "6"),
             ("audio", "Speech\nOutput", "8"),
             ("test_speaker", "Audio\nTest", "9"),
             ("quit", "Quit\nUI", "q"),
@@ -14482,6 +14552,7 @@ def command_ui_tui(args: argparse.Namespace) -> int:
     def _refresh_state() -> None:
         nonlocal session_list, selected_session_index
         nonlocal record_process, record_session, record_launch_log, assist_process, messages
+        nonlocal pending_open_frame
         session_list = recent_sessions(args, config)
         if record_session and record_session not in session_list:
             session_list.insert(0, record_session)
@@ -14528,6 +14599,8 @@ def command_ui_tui(args: argparse.Namespace) -> int:
             selected_session_index = len(session_list) - 1
         if selected_session_index < 0:
             selected_session_index = 0
+        if not _selected_session():
+            pending_open_frame = False
 
     def _status_lines() -> list[str]:
         lines: list[str] = []
@@ -14552,6 +14625,11 @@ def command_ui_tui(args: argparse.Namespace) -> int:
             f"ids={'on' if speak_identifiers else 'off'} "
             f"subjects={'on' if speak_subjects else 'off'} "
             f"output={speech_output_label(speech_output_sink)}"
+        )
+        lines.append(
+            "Frames: "
+            f"auto={'on' if auto_open_frames else 'off'} "
+            f"pending={'yes' if pending_open_frame else 'no'}"
         )
         if session_list:
             lines.append(
@@ -14582,6 +14660,35 @@ def command_ui_tui(args: argparse.Namespace) -> int:
         event_rows.sort(key=lambda item: event_sort_key(item), reverse=True)
         if selected_event_index >= len(event_rows):
             selected_event_index = max(0, len(event_rows) - 1)
+
+    def _latest_event_with_frame(session_dir: Path) -> dict | None:
+        for event in event_rows:
+            if _event_has_existing_frame(session_dir, event):
+                return event
+        return None
+
+    def _open_frame_event(session_dir: Path, event: dict | None) -> bool:
+        if event is None:
+            return False
+        return _open_selected_event_viewer(session_dir, event, use_video=False)
+
+    def _maybe_open_latest_frame() -> None:
+        nonlocal pending_open_frame, last_opened_frame_ref, messages
+        if not (auto_open_frames or pending_open_frame):
+            return
+        session = _selected_session()
+        if session is None:
+            return
+        event = _latest_event_with_frame(session)
+        frame_key = _event_frame_open_key(session, event)
+        if not frame_key or frame_key == last_opened_frame_ref:
+            return
+        if _open_frame_event(session, event):
+            last_opened_frame_ref = frame_key
+            pending_open_frame = False
+            messages = _write_status_messages(messages, "Opened latest detected frame")
+        elif pending_open_frame:
+            messages = _write_status_messages(messages, "Waiting for a readable frame")
 
     def _selected_session() -> Path | None:
         if record_session and _is_process_running(record_process):
@@ -14754,7 +14861,7 @@ def command_ui_tui(args: argparse.Namespace) -> int:
             elif button.button_id == "subjects":
                 button.label = "Detect\nFocus"
             elif button.button_id == "speech_rules":
-                button.label = "Speech\nRules"
+                button.label = "Report\nRules"
             elif button.button_id == "audio":
                 button.label = "Speech\nOutput"
             elif button.button_id == "test_speaker":
@@ -14762,7 +14869,7 @@ def command_ui_tui(args: argparse.Namespace) -> int:
             elif button.button_id == "quit":
                 button.label = "Quit\nUI"
             if button.button_id == "open":
-                button.label = "Open\nFrame"
+                button.label = "Show\nWhen Seen" if pending_open_frame else "Open\nFrame"
             if button.button_id == "review":
                 button.label = "Review\nQuery"
             if button.button_id == "watch":
@@ -14772,7 +14879,7 @@ def command_ui_tui(args: argparse.Namespace) -> int:
                 stdscr,
                 button,
                 selected=False,
-                enabled=button.button_id not in {"open", "review"} or bool(event_rows),
+                enabled=button.button_id != "review" or bool(event_rows),
             )
 
         top_y = command_y + command_height
@@ -14983,6 +15090,7 @@ def command_ui_tui(args: argparse.Namespace) -> int:
             return [
                 ("identifiers", "Speak identifier reads", speak_identifiers),
                 ("subjects", "Speak subject detections", speak_subjects),
+                ("auto_frames", "Open latest detected frame", auto_open_frames),
             ]
         if active_dialog == "audio":
             audio_sinks[:] = available_speech_output_sinks()
@@ -14999,7 +15107,7 @@ def command_ui_tui(args: argparse.Namespace) -> int:
         if active_dialog == "focus":
             return "Detect Focus"
         if active_dialog == "speech":
-            return "Speech Rules"
+            return "Reporting Rules"
         if active_dialog == "audio":
             return "Speech Output"
         return ""
@@ -15050,6 +15158,7 @@ def command_ui_tui(args: argparse.Namespace) -> int:
         bstate: int,
     ) -> bool:
         nonlocal selected_event_index, messages, last_mouse_action_id, last_mouse_action_at
+        nonlocal last_opened_frame_ref
         click_state = 0
         for state_name in ("BUTTON1_CLICKED", "BUTTON1_PRESSED"):
             click_state |= getattr(curses, state_name, 0)
@@ -15101,12 +15210,12 @@ def command_ui_tui(args: argparse.Namespace) -> int:
             index = my - events_y - 1
             if 0 <= index < min(len(event_rows), event_visible_height):
                 selected_event_index = index
-                if _open_selected_event_viewer(
-                    session,
-                    event_rows[selected_event_index],
-                    use_video=False,
-                ):
+                selected_event = event_rows[selected_event_index]
+                if _open_frame_event(session, selected_event):
                     messages = _write_status_messages(messages, "Opened frame preview")
+                    frame_key = _event_frame_open_key(session, selected_event)
+                    if frame_key:
+                        last_opened_frame_ref = frame_key
                 else:
                     messages = _write_status_messages(messages, "Selected event has no frame")
         return True
@@ -15119,6 +15228,7 @@ def command_ui_tui(args: argparse.Namespace) -> int:
             speak_identifiers=speak_identifiers,
             speak_subjects=speak_subjects,
             speech_output_sink=speech_output_sink,
+            auto_open_frames=auto_open_frames,
         )
 
     def _open_dialog(kind: str) -> None:
@@ -15134,7 +15244,7 @@ def command_ui_tui(args: argparse.Namespace) -> int:
             messages = _write_status_messages(messages, message)
 
     def _toggle_dialog_row(row_key: str) -> None:
-        nonlocal speak_identifiers, speak_subjects
+        nonlocal speak_identifiers, speak_subjects, auto_open_frames
         if active_dialog == "focus":
             if row_key in subject_classes and len(subject_classes) > 1:
                 subject_classes.remove(row_key)
@@ -15147,6 +15257,8 @@ def command_ui_tui(args: argparse.Namespace) -> int:
                 speak_identifiers = not speak_identifiers
             elif row_key == "subjects":
                 speak_subjects = not speak_subjects
+            elif row_key == "auto_frames":
+                auto_open_frames = not auto_open_frames
             _save_ui_state()
 
     def _select_audio_row(row_key: str) -> None:
@@ -15265,6 +15377,7 @@ def command_ui_tui(args: argparse.Namespace) -> int:
 
     def _activate_action(action_id: str) -> bool:
         nonlocal messages, profile_index, selected_session_index, search_active, record_process, assist_process
+        nonlocal pending_open_frame, last_opened_frame_ref
         nonlocal speak_identifiers, speak_subjects
         if action_id == "record":
             if _is_process_running(record_process):
@@ -15336,17 +15449,32 @@ def command_ui_tui(args: argparse.Namespace) -> int:
             return True
 
         if action_id == "open":
-            if not event_rows:
-                messages = _write_status_messages(messages, "No event selected")
-                return True
             session = _selected_session()
             if session is None:
                 messages = _write_status_messages(messages, "No session selected")
                 return True
-            if _open_selected_event_viewer(session, event_rows[selected_event_index], use_video=False):
+            selected_event = (
+                event_rows[selected_event_index]
+                if event_rows and selected_event_index < len(event_rows)
+                else None
+            )
+            frame_event = (
+                selected_event
+                if _event_has_existing_frame(session, selected_event)
+                else _latest_event_with_frame(session)
+            )
+            if _open_frame_event(session, frame_event):
                 messages = _write_status_messages(messages, "Opened frame preview")
+                frame_key = _event_frame_open_key(session, frame_event)
+                if frame_key:
+                    last_opened_frame_ref = frame_key
+                pending_open_frame = False
             else:
-                messages = _write_status_messages(messages, "Selected event has no frame")
+                pending_open_frame = True
+                messages = _write_status_messages(
+                    messages,
+                    "Frame launch pending; will open first detected frame",
+                )
             return True
 
         if action_id == "review":
@@ -15379,6 +15507,7 @@ def command_ui_tui(args: argparse.Namespace) -> int:
                 last_state_update = now
             if now - last_event_update > 1.0:
                 _refresh_events()
+                _maybe_open_latest_frame()
                 last_event_update = now
 
             _draw(stdscr)
@@ -15547,6 +15676,7 @@ def command_ui_tui(args: argparse.Namespace) -> int:
     if not subject_classes:
         subject_classes = [UI_SUBJECT_CLASS_OPTIONS[0]]
     speak_identifiers, speak_subjects, speech_output_sink = configured_ui_speech(config)
+    auto_open_frames = configured_ui_auto_open_frames(config)
     audio_sinks = available_speech_output_sinks()
 
     session_list: list[Path] = []
@@ -15561,6 +15691,8 @@ def command_ui_tui(args: argparse.Namespace) -> int:
     last_mouse_action_at = 0.0
     event_rows: list[dict] = []
     selected_event_index = 0
+    pending_open_frame = False
+    last_opened_frame_ref: str | None = None
     messages: list[str] = ["UI ready"]
     quit_confirm_active = False
     active_dialog: str | None = None
@@ -16545,8 +16677,8 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=DEFAULT_YOLO_LIVE_PREVIEW_DETECTIONS,
         help=(
-            "Open each promoted live detection crop in an image viewer. "
-            "With eog this uses --single-window so the viewer can reuse an existing window."
+            "Open each promoted live detection frame in an image viewer. "
+            "With eog this refreshes a stable latest-preview image in a reused window."
         ),
     )
     assist_live.add_argument(
