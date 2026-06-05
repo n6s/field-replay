@@ -12549,7 +12549,7 @@ def _selected_event_detail_lines(event: dict | None) -> list[str]:
     crop = event.get("crop") or "-"
     lines.append(f"Frame:     {frame}")
     lines.append(f"Crop:      {crop}")
-    lines.append("Actions:   4 open frame  v open video  r review query")
+    lines.append("Actions:   4 show frames  v open video  r review query")
     return lines
 
 
@@ -12956,6 +12956,62 @@ def _launch_session_watch(prefix: list[str], session_dir: Path, player: str | No
     return _launch_background_command(command) is not None
 
 
+def _event_frame_path(session_dir: Path, event: dict | None) -> Path | None:
+    if event is None:
+        return None
+    frame = event.get("f")
+    if not frame:
+        return None
+    frame_path = session_asset_path(session_dir, str(frame))
+    if not frame_path or not frame_path.exists():
+        return None
+    return frame_path
+
+
+def _event_frame_paths(
+    session_dir: Path,
+    events: Sequence[dict],
+    *,
+    selected_event: dict | None = None,
+) -> list[Path]:
+    image_paths: list[Path] = []
+    seen_paths: set[Path] = set()
+
+    selected_path = _event_frame_path(session_dir, selected_event)
+    if selected_path is not None:
+        image_paths.append(selected_path)
+        seen_paths.add(selected_path)
+
+    for event in events:
+        frame_path = _event_frame_path(session_dir, event)
+        if frame_path is None or frame_path in seen_paths:
+            continue
+        image_paths.append(frame_path)
+        seen_paths.add(frame_path)
+
+    return image_paths
+
+
+def _open_event_frame_collection(
+    session_dir: Path,
+    events: Sequence[dict],
+    *,
+    selected_event: dict | None = None,
+) -> bool:
+    image_paths = _event_frame_paths(
+        session_dir,
+        events,
+        selected_event=selected_event,
+    )
+    if not image_paths:
+        return False
+    viewer = choose_image_viewer(None)
+    if not viewer:
+        return False
+    command = build_image_viewer_command(viewer, image_paths)
+    return _launch_background_command(command) is not None
+
+
 def _open_selected_event_viewer(session_dir: Path, event: dict, *, use_video: bool) -> bool:
     if use_video:
         player = choose_player(None)
@@ -12977,11 +13033,8 @@ def _open_selected_event_viewer(session_dir: Path, event: dict, *, use_video: bo
         )
         return _launch_background_command(command) is not None
 
-    frame = event.get("f")
-    if not frame:
-        return False
-    frame_path = session_asset_path(session_dir, str(frame))
-    if not frame_path or not frame_path.exists():
+    frame_path = _event_frame_path(session_dir, event)
+    if frame_path is None:
         return False
     viewer = choose_image_viewer(None)
     if not viewer:
@@ -14428,7 +14481,7 @@ def command_ui_tui(args: argparse.Namespace) -> int:
     COLOR_DIM = 6
     COLOR_WARNING = 7
     TUI_KEY_HINTS = (
-        "1 capture  2 watch  3 detect  4 frame  r review  "
+        "1 capture  2 watch  3 detect  4 frames  r review  "
         "5 focus  6 rules  8 output  9 audio test  q quit"
     )
 
@@ -14526,7 +14579,7 @@ def command_ui_tui(args: argparse.Namespace) -> int:
             ("record", "Start\nCapture", "1"),
             ("watch", "Watch\nDVR", "2"),
             ("assist", "Start\nDetect", "3"),
-            ("open", "Open\nFrame", "4"),
+            ("open", "Show\nFrames", "4"),
             ("review", "Review\nQuery", "r"),
         ]
         tuning = [
@@ -14671,6 +14724,16 @@ def command_ui_tui(args: argparse.Namespace) -> int:
         if event is None:
             return False
         return _open_selected_event_viewer(session_dir, event, use_video=False)
+
+    def _show_frame_collection(session_dir: Path, event: dict | None) -> bool:
+        events = event_rows
+        if event is not None and event not in events:
+            events = [event, *event_rows]
+        return _open_event_frame_collection(
+            session_dir,
+            events,
+            selected_event=event,
+        )
 
     def _maybe_open_latest_frame() -> None:
         nonlocal pending_open_frame, last_opened_frame_ref, messages
@@ -14869,7 +14932,7 @@ def command_ui_tui(args: argparse.Namespace) -> int:
             elif button.button_id == "quit":
                 button.label = "Quit\nUI"
             if button.button_id == "open":
-                button.label = "Show\nWhen Seen" if pending_open_frame else "Open\nFrame"
+                button.label = "Show\nWhen Seen" if pending_open_frame else "Show\nFrames"
             if button.button_id == "review":
                 button.label = "Review\nQuery"
             if button.button_id == "watch":
@@ -15211,8 +15274,8 @@ def command_ui_tui(args: argparse.Namespace) -> int:
             if 0 <= index < min(len(event_rows), event_visible_height):
                 selected_event_index = index
                 selected_event = event_rows[selected_event_index]
-                if _open_frame_event(session, selected_event):
-                    messages = _write_status_messages(messages, "Opened frame preview")
+                if _show_frame_collection(session, selected_event):
+                    messages = _write_status_messages(messages, "Opened frame collection")
                     frame_key = _event_frame_open_key(session, selected_event)
                     if frame_key:
                         last_opened_frame_ref = frame_key
@@ -15463,8 +15526,8 @@ def command_ui_tui(args: argparse.Namespace) -> int:
                 if _event_has_existing_frame(session, selected_event)
                 else _latest_event_with_frame(session)
             )
-            if _open_frame_event(session, frame_event):
-                messages = _write_status_messages(messages, "Opened frame preview")
+            if _show_frame_collection(session, frame_event):
+                messages = _write_status_messages(messages, "Opened frame collection")
                 frame_key = _event_frame_open_key(session, frame_event)
                 if frame_key:
                     last_opened_frame_ref = frame_key
