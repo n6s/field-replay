@@ -15043,7 +15043,7 @@ def command_ui_tui(args: argparse.Namespace) -> int:
     INFO_HEIGHT = 8
     SEARCH_HEIGHT = 3
     TUI_KEY_HINTS = (
-        "1 capture  2 watch  3 detect  4 frames  Enter/click selected  "
+        "1 capture  2 detect  3 frames  4 watch  Enter/click selected  "
         "v video  / search  q quit"
     )
 
@@ -15142,9 +15142,9 @@ def command_ui_tui(args: argparse.Namespace) -> int:
     def _build_buttons(width: int, y: int) -> list[_UiButton]:
         button_defs = [
             ("record", "Start\nCapture", "1"),
-            ("watch", "Watch\nDVR", "2"),
-            ("assist", "Start\nDetect", "3"),
-            ("open", "Show\nFrames", "4"),
+            ("assist", "Start\nDetect", "2"),
+            ("open", "Show\nFrames", "3"),
+            ("watch", "Watch\nDVR", "4"),
             ("review", "Review\nQuery", "r"),
             ("subjects", "Detect\nFocus", "5"),
             ("speech_rules", "Report\nRules", "6"),
@@ -16342,9 +16342,9 @@ def command_ui_tui(args: argparse.Namespace) -> int:
             ):
                 mapping = {
                     49: "record",
-                    50: "watch",
-                    51: "assist",
-                    52: "open",
+                    50: "assist",
+                    51: "open",
+                    52: "watch",
                     53: "subjects",
                     54: "speech_rules",
                     56: "audio",

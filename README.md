@@ -219,7 +219,7 @@ The dashboard is a ncurses control plane with an old-school pane layout:
 - an always-visible evidence shortcut legend: up/down selects a detection,
   `Enter` or mouse click opens its saved frames, `v` opens event video, `/`
   filters detections, and `r` launches review for the current query
-- quick actions to open the latest saved evidence frame (`4`) or queue the
+- quick actions to open the latest saved evidence frame (`3`) or queue the
   first detected frame when no frame is available yet
 - speech output selection (`8`) and an audio test (`9`) for detection speech
 
