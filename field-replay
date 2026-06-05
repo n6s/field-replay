@@ -12498,6 +12498,47 @@ def _wait_for_pid_exit(pid: int, timeout_seconds: float) -> bool:
     return not _pid_is_running(pid)
 
 
+def _process_group_id(pid: int) -> int | None:
+    try:
+        return os.getpgid(pid)
+    except OSError:
+        return None
+
+
+def _process_group_has_running_members(pgid: int | None) -> bool:
+    if pgid is None:
+        return False
+    current_pid = os.getpid()
+    proc_root = Path("/proc")
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError:
+        return False
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == current_pid or not _pid_is_running(pid):
+            continue
+        try:
+            if os.getpgid(pid) == pgid:
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _wait_for_process_group_exit(pgid: int | None, timeout_seconds: float) -> bool:
+    if pgid is None:
+        return True
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        if not _process_group_has_running_members(pgid):
+            return True
+        time.sleep(0.1)
+    return not _process_group_has_running_members(pgid)
+
+
 def _signal_process_group(pid: int, sig: int) -> None:
     try:
         os.killpg(os.getpgid(pid), sig)
@@ -12508,13 +12549,14 @@ def _signal_process_group(pid: int, sig: int) -> None:
 def _stop_process(
     process: subprocess.Popen[bytes] | _UiProcessHandle | None,
     tag: str,
-) -> subprocess.Popen[bytes] | _UiProcessHandle | None:
+) -> bool:
     if process is None or not _is_process_running(process):
-        return None
+        return True
 
     pid = _process_pid(process)
     if pid is None:
-        return None
+        return True
+    pgid = _process_group_id(pid)
 
     try:
         if isinstance(process, _UiProcessHandle):
@@ -12522,19 +12564,28 @@ def _stop_process(
         else:
             _signal_process_group(pid, signal.SIGINT)
     except ProcessLookupError:
-        return None
+        return True
     except OSError:
-        return None
+        return False
 
     if isinstance(process, _UiProcessHandle):
-        if _wait_for_pid_exit(pid, 1.5):
-            return None
+        if _wait_for_pid_exit(pid, 1.5) and _wait_for_process_group_exit(pgid, 0.5):
+            return True
+        if pgid is not None and pgid != os.getpgrp():
+            try:
+                os.killpg(pgid, signal.SIGINT)
+            except OSError:
+                pass
+            if _wait_for_process_group_exit(pgid, 2.0):
+                return True
         try:
-            os.kill(pid, signal.SIGTERM)
+            if pgid is not None and pgid != os.getpgrp():
+                os.killpg(pgid, signal.SIGTERM)
+            else:
+                os.kill(pid, signal.SIGTERM)
         except OSError:
             pass
-        _wait_for_pid_exit(pid, 1.0)
-        return None
+        return _wait_for_pid_exit(pid, 1.0) and _wait_for_process_group_exit(pgid, 1.0)
 
     try:
         process.wait(timeout=1.5)
@@ -12547,7 +12598,7 @@ def _stop_process(
             process.wait(timeout=1.0)
         except (subprocess.TimeoutExpired, OSError):
             pass
-    return None
+    return process.poll() is not None and _wait_for_process_group_exit(pgid, 0.5)
 
 
 def _read_proc_cmdline(pid: int) -> list[str]:
