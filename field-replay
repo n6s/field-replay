@@ -3706,6 +3706,8 @@ def acquire_device_locks(recordings_dir: Path, args: argparse.Namespace, session
                 handle.write(f"pid={os.getpid()}\n")
                 handle.write(f"session={session_name}\n")
                 handle.write(f"device={device_name}\n")
+                if getattr(args, "profile", None):
+                    handle.write(f"profile={args.profile}\n")
             acquired.append(lock_path)
     except FileExistsError:
         release_device_locks(acquired)
@@ -3791,6 +3793,7 @@ def write_metadata(
 ) -> None:
     payload = {
         "state": state,
+        "profile": getattr(args, "profile", None),
         "created_at": datetime.now().astimezone().isoformat(),
         "session_dir": str(paths.session_dir),
         "archive_path": str(paths.archive_path),
@@ -10534,6 +10537,7 @@ def run_record_command(args: argparse.Namespace, *, launch_player: bool = False)
         if selected_profile_name and selected_profile_name != "__manual__":
             selected_profile = profiles[selected_profile_name]
             apply_profile(args, selected_profile)
+            args.profile = selected_profile_name
             config["last_profile"] = selected_profile_name
             for line in profile_summary_lines(selected_profile_name, selected_profile):
                 print(line)
@@ -12894,26 +12898,59 @@ def _session_by_name(session_list: Sequence[Path]) -> dict[str, Path]:
     return {session.name: session for session in session_list}
 
 
+def _session_profile_name(session_dir: Path) -> str | None:
+    metadata = load_session_metadata(session_dir)
+    profile = metadata.get("profile")
+    return str(profile) if profile else None
+
+
+def _record_profile_matches(
+    *,
+    selected_profile: str | None,
+    lock_values: dict[str, str] | None = None,
+    command: Sequence[str] | None = None,
+    session_dir: Path | None = None,
+) -> bool:
+    if not selected_profile:
+        return True
+    profile = None
+    if lock_values:
+        profile = lock_values.get("profile")
+    if not profile and command:
+        profile = _command_value_after(command, "--profile")
+    if not profile and session_dir is not None:
+        profile = _session_profile_name(session_dir)
+    return profile == selected_profile
+
+
 def _find_running_record_process(
     args: argparse.Namespace,
     sessions: Sequence[Path],
+    *,
+    selected_profile: str | None = None,
 ) -> tuple[_UiProcessHandle, Path] | None:
     by_name = _session_by_name(sessions)
-    try:
-        recordings_root = args.recordings_dir.expanduser().resolve()
-    except OSError:
-        recordings_root = args.recordings_dir.expanduser()
+    recording_roots = {args.recordings_dir.expanduser()}
+    recording_roots.update(session.parent for session in sessions)
+    resolved_recording_roots: list[Path] = []
+    for root in recording_roots:
+        try:
+            resolved_recording_roots.append(root.resolve())
+        except OSError:
+            resolved_recording_roots.append(root)
     by_resolved: dict[str, Path] = {}
     for session in sessions:
         try:
             by_resolved[str(session.resolve())] = session
         except OSError:
             by_resolved[str(session)] = session
-    lock_dir = args.recordings_dir.expanduser() / ".locks"
-    try:
-        lock_paths = list(lock_dir.glob("*.lock"))
-    except OSError:
-        lock_paths = []
+    lock_paths: list[Path] = []
+    for root in recording_roots:
+        lock_dir = root / ".locks"
+        try:
+            lock_paths.extend(lock_dir.glob("*.lock"))
+        except OSError:
+            continue
 
     for lock_path in lock_paths:
         values = _parse_lock_file(lock_path)
@@ -12924,11 +12961,19 @@ def _find_running_record_process(
         pid = int(pid_text)
         if not _pid_is_running(pid):
             continue
-        session_dir = by_name.get(session_name) or args.recordings_dir.expanduser() / session_name
+        session_dir = by_name.get(session_name) or lock_path.parent.parent / session_name
         if not session_dir.exists():
             continue
+        command = _read_proc_cmdline(pid)
+        if not _record_profile_matches(
+            selected_profile=selected_profile,
+            lock_values=values,
+            command=command,
+            session_dir=session_dir,
+        ):
+            continue
         return (
-            _UiProcessHandle(pid=pid, command=_read_proc_cmdline(pid), label="record"),
+            _UiProcessHandle(pid=pid, command=command, label="record"),
             session_dir,
         )
 
@@ -12942,6 +12987,12 @@ def _find_running_record_process(
             continue
         session_dir = by_name.get(session_name) or args.recordings_dir.expanduser() / session_name
         if session_dir.exists():
+            if not _record_profile_matches(
+                selected_profile=selected_profile,
+                command=command,
+                session_dir=session_dir,
+            ):
+                continue
             return (_UiProcessHandle(pid=pid, command=command, label="record"), session_dir)
 
     capture_bins = {"ffmpeg", "gst-launch-1.0", "gst-launch"}
@@ -12956,17 +13007,29 @@ def _find_running_record_process(
         cwd = _read_proc_cwd(pid)
         if cwd is None:
             continue
-        try:
-            cwd.relative_to(recordings_root)
-        except ValueError:
-            continue
         session_dir = by_resolved.get(str(cwd))
         if session_dir is None:
+            under_known_root = False
+            for root in resolved_recording_roots:
+                try:
+                    cwd.relative_to(root)
+                    under_known_root = True
+                    break
+                except ValueError:
+                    continue
+            if not under_known_root:
+                continue
             candidate = cwd / "session.json"
             timeshift = cwd / DEFAULT_TIMESHIFT_NAME
             if candidate.exists() or timeshift.exists():
                 session_dir = cwd
         if session_dir is not None:
+            if not _record_profile_matches(
+                selected_profile=selected_profile,
+                command=command,
+                session_dir=session_dir,
+            ):
+                continue
             return (_UiProcessHandle(pid=pid, command=command, label="record-backend"), session_dir)
     return None
 
@@ -14533,7 +14596,7 @@ def command_ui_tui(args: argparse.Namespace) -> int:
     INFO_HEIGHT = 8
     SEARCH_HEIGHT = 3
     TUI_KEY_HINTS = (
-        "1 capture  2 watch  3 detect  4 frames  r review  "
+        "1 capture  2 watch  3 detect  4 frames  p profile  r review  "
         "5 focus  6 rules  8 output  9 audio test  q quit"
     )
 
@@ -14708,7 +14771,12 @@ def command_ui_tui(args: argparse.Namespace) -> int:
                     )
             record_process = None
         if record_process is None:
-            adopted_record = _find_running_record_process(args, session_list)
+            selected_profile = profiles[profile_index] if profiles else None
+            adopted_record = _find_running_record_process(
+                args,
+                session_list,
+                selected_profile=selected_profile,
+            )
             if adopted_record:
                 record_process, record_session = adopted_record
                 if record_session not in session_list:
@@ -15015,12 +15083,15 @@ def command_ui_tui(args: argparse.Namespace) -> int:
         for index, line in enumerate(status[: max(0, info_height - 3)]):
             _safe_addstr(stdscr, top_y + 1 + index, 2, line, left_w - 4)
 
-        profile_text = ", ".join(profiles) if profiles else "(none)"
+        profile_text = ", ".join(
+            f"[{name}]" if index == profile_index else name
+            for index, name in enumerate(profiles)
+        ) if profiles else "(none)"
         _safe_addstr(
             stdscr,
             top_y + info_height - 2,
             2,
-            f"Profiles: {profile_text}",
+            f"Profiles: {profile_text}   p choose",
             left_w - 4,
             curses.A_BOLD,
         )
@@ -15258,6 +15329,18 @@ def command_ui_tui(args: argparse.Namespace) -> int:
                     for sink, label in audio_sinks
                 ],
             ]
+        if active_dialog == "profile":
+            return [
+                (
+                    name,
+                    profile_menu_label(
+                        name,
+                        config.get("profiles", {}).get(name, {}),
+                    ),
+                    index == profile_index,
+                )
+                for index, name in enumerate(profiles)
+            ]
         return []
 
     def _dialog_title() -> str:
@@ -15267,6 +15350,8 @@ def command_ui_tui(args: argparse.Namespace) -> int:
             return "Reporting Rules"
         if active_dialog == "audio":
             return "Speech Output"
+        if active_dialog == "profile":
+            return "Recording Profile"
         return ""
 
     def _dialog_hint() -> str:
@@ -15274,6 +15359,8 @@ def command_ui_tui(args: argparse.Namespace) -> int:
             return "Up/down move  Space/Enter toggle  d done  Esc cancel"
         if active_dialog == "audio":
             return "Up/down move  Enter select output  Esc cancel"
+        if active_dialog == "profile":
+            return "Up/down move  Enter select profile  Esc cancel"
         return ""
 
     def _draw_dialog(stdscr: "curses._CursesWindow") -> None:
@@ -15419,6 +15506,28 @@ def command_ui_tui(args: argparse.Namespace) -> int:
         _save_ui_state()
         _close_dialog(f"Speech output {speech_output_label(speech_output_sink)}")
 
+    def _select_profile_row(row_key: str) -> None:
+        if row_key not in profiles:
+            return
+        _switch_profile(row_key)
+        _close_dialog(f"Recording profile {row_key}")
+
+    def _switch_profile(row_key: str) -> bool:
+        nonlocal profile_index, record_process, record_session, record_launch_log
+        if row_key not in profiles:
+            return False
+        old_profile = profiles[profile_index] if profiles else None
+        if old_profile == row_key:
+            return True
+        profile_index = profiles.index(row_key)
+        record_process = None
+        record_session = None
+        record_launch_log = None
+        config["last_profile"] = row_key
+        save_config(config_path, config)
+        _refresh_state()
+        return True
+
     def _handle_dialog_key(key: int) -> bool:
         nonlocal dialog_index
         rows = _dialog_rows()
@@ -15441,6 +15550,8 @@ def command_ui_tui(args: argparse.Namespace) -> int:
                 row_key = rows[dialog_index][0]
                 if active_dialog == "audio":
                     _select_audio_row(row_key)
+                elif active_dialog == "profile":
+                    _select_profile_row(row_key)
                 else:
                     _toggle_dialog_row(row_key)
             return True
@@ -15451,6 +15562,8 @@ def command_ui_tui(args: argparse.Namespace) -> int:
             row_key = rows[dialog_index][0]
             if active_dialog == "audio":
                 _select_audio_row(row_key)
+            elif active_dialog == "profile":
+                _select_profile_row(row_key)
             else:
                 _toggle_dialog_row(row_key)
             return True
@@ -15596,6 +15709,13 @@ def command_ui_tui(args: argparse.Namespace) -> int:
             _open_dialog("audio")
             return True
 
+        if action_id == "profile":
+            if profiles:
+                _open_dialog("profile")
+            else:
+                messages = _write_status_messages(messages, "No saved profiles")
+            return True
+
         if action_id == "test_speaker":
             _test_speaker()
             return True
@@ -15739,6 +15859,10 @@ def command_ui_tui(args: argparse.Namespace) -> int:
                 _launch_review(search_query)
                 continue
 
+            if key in (ord("p"), ord("P")):
+                _activate_action("profile")
+                continue
+
             if key in (ord("v"), ord("V")):
                 session = _selected_session()
                 if session is None:
@@ -15774,11 +15898,19 @@ def command_ui_tui(args: argparse.Namespace) -> int:
 
             if key in (ord("["), ord("{") ):
                 if profiles:
-                    profile_index = (profile_index - 1) % len(profiles)
+                    _switch_profile(profiles[(profile_index - 1) % len(profiles)])
+                    messages = _write_status_messages(
+                        messages,
+                        f"Recording profile {profiles[profile_index]}",
+                    )
                 continue
             if key in (ord("]"), ord("}")):
                 if profiles:
-                    profile_index = (profile_index + 1) % len(profiles)
+                    _switch_profile(profiles[(profile_index + 1) % len(profiles)])
+                    messages = _write_status_messages(
+                        messages,
+                        f"Recording profile {profiles[profile_index]}",
+                    )
                 continue
 
             if key in (ord("_"), ord("/") ):

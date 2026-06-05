@@ -207,6 +207,7 @@ For event use, start with the operator control plane:
 The dashboard is a ncurses control plane with an old-school pane layout:
 
 - profile + recent session visibility
+- recording profile selection from the dashboard (`p`, or `[` / `]` to cycle)
 - controls to start/stop recording, watch a session, and start/stop live
   detection (`assist-live`) for the selected session
 - full-width bottom command cells for operations and detection/reporting actions
@@ -237,7 +238,9 @@ If the dashboard exits unexpectedly, or if you choose to leave subprocesses
 running from the quit confirmation, background recording or live assist
 processes are left alone. Reopen `./field-replay ui` with the same recordings
 root and it will reattach to matching running processes for recent sessions when
-it can identify them.
+it can identify them. Reattach is profile-aware for new captures, so a second
+dashboard can choose a different saved camera profile and start a separate
+recording instead of attaching to the first camera.
 
 When the dashboard runs the assist pass, identifier candidates are spoken aloud
 with the local speech command when available, while also being written to the
