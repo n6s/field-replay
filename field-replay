@@ -15024,12 +15024,29 @@ def command_ui_tui(args: argparse.Namespace) -> int:
             "side_by_side": side_by_side,
         }
 
+    def _same_session_path(left: Path, right: Path) -> bool:
+        try:
+            return left.resolve() == right.resolve()
+        except OSError:
+            return left == right
+
+    def _select_session(session_dir: Path) -> bool:
+        nonlocal selected_session_index
+        for index, candidate in enumerate(session_list):
+            if _same_session_path(candidate, session_dir):
+                selected_session_index = index
+                return True
+        return False
+
+    def _session_in_list(session_dir: Path) -> bool:
+        return any(_same_session_path(candidate, session_dir) for candidate in session_list)
+
     def _refresh_state() -> None:
-        nonlocal session_list, selected_session_index
+        nonlocal session_list, selected_session_index, user_selected_session
         nonlocal record_process, record_session, record_launch_log, assist_process, messages
         nonlocal pending_open_frame
         session_list = recent_sessions(args, config)
-        if record_session and record_session not in session_list:
+        if record_session and not _session_in_list(record_session):
             session_list.insert(0, record_session)
         if not session_list:
             selected_session_index = 0
@@ -15059,8 +15076,9 @@ def command_ui_tui(args: argparse.Namespace) -> int:
             )
             if adopted_record:
                 record_process, record_session = adopted_record
-                if record_session not in session_list:
+                if not _session_in_list(record_session):
                     session_list.insert(0, record_session)
+                user_selected_session = False
                 messages = _write_status_messages(
                     messages,
                     f"Reattached recording pid {_process_pid(record_process)}",
@@ -15070,7 +15088,7 @@ def command_ui_tui(args: argparse.Namespace) -> int:
             adopted_assist = _find_running_assist_process(session_list)
             if adopted_assist:
                 assist_process, assist_session = adopted_assist
-                if assist_session not in session_list:
+                if not _session_in_list(assist_session):
                     session_list.insert(0, assist_session)
                 messages = _write_status_messages(
                     messages,
@@ -15080,6 +15098,12 @@ def command_ui_tui(args: argparse.Namespace) -> int:
             selected_session_index = len(session_list) - 1
         if selected_session_index < 0:
             selected_session_index = 0
+        if (
+            record_session
+            and _is_process_running(record_process)
+            and not user_selected_session
+        ):
+            _select_session(record_session)
         if not _selected_session():
             pending_open_frame = False
 
@@ -15203,10 +15227,6 @@ def command_ui_tui(args: argparse.Namespace) -> int:
             messages = _write_status_messages(messages, "Waiting for a readable frame")
 
     def _selected_session() -> Path | None:
-        if record_session and _is_process_running(record_process):
-            return record_session
-        if record_session and record_session in session_list:
-            return record_session
         if not session_list:
             return None
         if selected_session_index < 0 or selected_session_index >= len(session_list):
@@ -15229,6 +15249,7 @@ def command_ui_tui(args: argparse.Namespace) -> int:
 
     def _launch_record() -> bool:
         nonlocal record_process, record_session, record_launch_log, record_attach_enabled
+        nonlocal user_selected_session
         if not profiles:
             return False
         profile_name = profiles[profile_index]
@@ -15261,6 +15282,7 @@ def command_ui_tui(args: argparse.Namespace) -> int:
             return False
         record_process = proc
         record_attach_enabled = True
+        user_selected_session = False
         return True
 
     def _launch_assist_live() -> bool:
@@ -15807,6 +15829,7 @@ def command_ui_tui(args: argparse.Namespace) -> int:
 
     def _switch_profile(row_key: str) -> bool:
         nonlocal profile_index, record_process, record_session, record_launch_log
+        nonlocal user_selected_session
         if row_key not in profiles:
             return False
         old_profile = profiles[profile_index] if profiles else None
@@ -15816,6 +15839,7 @@ def command_ui_tui(args: argparse.Namespace) -> int:
         record_process = None
         record_session = None
         record_launch_log = None
+        user_selected_session = False
         config["last_profile"] = row_key
         save_config(config_path, config)
         _refresh_state()
@@ -16060,6 +16084,7 @@ def command_ui_tui(args: argparse.Namespace) -> int:
         nonlocal messages, profile_index, record_process, assist_process, quit_confirm_active
         nonlocal last_opened_frame_ref
         nonlocal search_active, search_query, selected_event_index, selected_session_index
+        nonlocal user_selected_session
         _init_colors()
         try:
             curses.curs_set(0)
@@ -16252,12 +16277,14 @@ def command_ui_tui(args: argparse.Namespace) -> int:
             if key in (ord("a"), ord("A")):
                 if session_list:
                     selected_session_index = (selected_session_index - 1) % len(session_list)
+                    user_selected_session = True
                     selected_event_index = 0
                     _refresh_events()
                 continue
             if key in (ord("d"), ord("D")):
                 if session_list:
                     selected_session_index = (selected_session_index + 1) % len(session_list)
+                    user_selected_session = True
                     selected_event_index = 0
                     _refresh_events()
                 continue
@@ -16305,6 +16332,7 @@ def command_ui_tui(args: argparse.Namespace) -> int:
 
     session_list: list[Path] = []
     selected_session_index = 0
+    user_selected_session = False
     search_query = ""
     search_active = False
     record_process: subprocess.Popen[bytes] | _UiProcessHandle | None = initial_record_process
