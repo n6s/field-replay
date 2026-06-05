@@ -15122,8 +15122,8 @@ def command_ui_tui(args: argparse.Namespace) -> int:
         if _open_frame_event(
             session,
             event,
-            stable_preview=not pending_open_frame,
-            single_window=not pending_open_frame,
+            stable_preview=False,
+            single_window=True,
         ):
             last_opened_frame_ref = frame_key
             pending_open_frame = False
@@ -15945,7 +15945,7 @@ def command_ui_tui(args: argparse.Namespace) -> int:
                 frame_event,
                 use_video=False,
                 stable_preview=False,
-                single_window=False,
+                single_window=True,
             ):
                 messages = _write_status_messages(messages, "Opened latest detected frame")
                 frame_key = _event_frame_open_key(session, frame_event)

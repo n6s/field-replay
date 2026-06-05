@@ -334,8 +334,8 @@ To watch promoted detections as they arrive, add `--preview-detections`:
 
 The preview opens each promoted full frame in the configured image viewer, with
 the crop as a fallback when only a crop was saved. It defaults to `eog`; with
-`eog`, field replay refreshes a stable latest-preview image and passes
-`--single-window` so a running viewer can reuse the same window. The dashboard
+`eog`, field replay passes the latest saved evidence frame path with
+`--single-window` so a running viewer can switch to the new image. The dashboard
 asks the same preview question when you choose the live assist action.
 
 ### 1. Check the environment
