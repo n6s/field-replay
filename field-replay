@@ -12439,6 +12439,25 @@ def choose_ui_profile(config: dict, preferred_profile: str | None = None) -> str
     return prompt_menu("Choose recording profile", options, default_value=default_value)
 
 
+def choose_ui_profile_with_details(
+    config: dict,
+    preferred_profile: str | None = None,
+    *,
+    title: str = "Choose recording profile",
+) -> str | None:
+    profiles = config.get("profiles", {})
+    if not profiles:
+        return None
+    default_value = preferred_profile or config.get("last_profile")
+    if default_value not in profiles:
+        default_value = sorted(profiles)[0]
+    options = [
+        (name, profile_menu_label(name, profile))
+        for name, profile in sorted(profiles.items())
+    ]
+    return prompt_menu(title, options, default_value=default_value)
+
+
 def choose_ui_session(args: argparse.Namespace, config: dict) -> Path | None:
     sessions = recent_sessions(args, config)
     if not sessions:
@@ -13053,6 +13072,184 @@ def _find_running_assist_process(
             if resolved in command_text or raw in command_text or name in command_text:
                 return (_UiProcessHandle(pid=pid, command=command, label="assist-live"), session)
     return None
+
+
+def _record_process_profile_name(
+    process: _UiProcessHandle | None,
+    session_dir: Path | None,
+) -> str | None:
+    if process is not None:
+        profile = _command_value_after(process.command, "--profile")
+        if profile:
+            return profile
+    if session_dir is not None:
+        return _session_profile_name(session_dir)
+    return None
+
+
+def _running_record_summary(
+    process: _UiProcessHandle,
+    session_dir: Path,
+) -> str:
+    details = [f"pid {process.pid}", session_dir.name]
+    profile = _record_process_profile_name(process, session_dir)
+    if profile:
+        details.append(f"profile {profile}")
+    return "; ".join(details)
+
+
+def run_ui_setup_profile_command(
+    args: argparse.Namespace,
+    config_path: Path,
+    *,
+    profile_name: str | None = None,
+) -> tuple[int, dict]:
+    command = [*field_replay_command_prefix(args), "setup"]
+    if profile_name:
+        command.extend(["--profile", profile_name])
+    print("Running:", shlex.join(command))
+    status = subprocess.call(command)
+    return status, load_config(config_path)
+
+
+def choose_ui_start_capture_profile(
+    args: argparse.Namespace,
+    config_path: Path,
+    config: dict,
+    *,
+    title: str = "Choose profile for new capture",
+) -> tuple[dict, str | None]:
+    while True:
+        profiles = config.get("profiles", {})
+        options: list[tuple[str, str]] = [
+            (name, profile_menu_label(name, profile))
+            for name, profile in sorted(profiles.items())
+        ]
+        if profiles:
+            options.append(("__edit__", "Edit a saved profile first"))
+        options.append(("__setup__", "Set up a new recording profile"))
+        choice = prompt_menu(
+            title,
+            options,
+            default_value=(
+                config.get("last_profile")
+                if config.get("last_profile") in profiles
+                else (options[0][0] if options else "__setup__")
+            ),
+            allow_cancel=True,
+            cancel_label="Open dashboard without capture",
+        )
+        if choice is None:
+            return config, None
+        if choice == "__edit__":
+            profile_name = choose_ui_profile_with_details(
+                config,
+                title="Choose profile to edit",
+            )
+            if not profile_name:
+                continue
+            status, config = run_ui_setup_profile_command(
+                args,
+                config_path,
+                profile_name=profile_name,
+            )
+            if status == 0 and profile_name in config.get("profiles", {}):
+                return config, profile_name
+            continue
+        if choice == "__setup__":
+            status, config = run_ui_setup_profile_command(args, config_path)
+            last_profile = config.get("last_profile")
+            if status == 0 and last_profile in config.get("profiles", {}):
+                return config, last_profile
+            continue
+        if choice in profiles:
+            config["last_profile"] = choice
+            save_config(config_path, config)
+            return config, choice
+
+
+def choose_ui_launch_intent(
+    args: argparse.Namespace,
+    config_path: Path,
+    config: dict,
+) -> tuple[dict, str | None, bool, _UiProcessHandle | None, Path | None, str | None]:
+    sessions = recent_sessions(args, config)
+    running_record = _find_running_record_process(args, sessions)
+    if not running_record:
+        config, profile_name = choose_ui_start_capture_profile(
+            args,
+            config_path,
+            config,
+            title="Choose dashboard recording profile",
+        )
+        if profile_name:
+            return (
+                config,
+                profile_name,
+                False,
+                None,
+                None,
+                f"Ready to start capture with profile {profile_name}",
+            )
+        return (
+            config,
+            args.profile,
+            False,
+            None,
+            None,
+            "Opened dashboard without capture profile",
+        )
+
+    record_process, record_session = running_record
+    running_profile = _record_process_profile_name(record_process, record_session)
+    print("Existing capture detected")
+    print(f"  {_running_record_summary(record_process, record_session)}")
+    print()
+    choice = prompt_menu(
+        "Dashboard startup",
+        (
+            ("attach", "Attach to existing capture"),
+            ("start", "Start another capture"),
+            ("review", "Review dashboard only"),
+        ),
+        default_value="attach",
+    )
+    if choice == "attach":
+        return (
+            config,
+            running_profile or args.profile,
+            True,
+            record_process,
+            record_session,
+            "Attached to existing capture",
+        )
+    if choice == "start":
+        config, profile_name = choose_ui_start_capture_profile(args, config_path, config)
+        if profile_name:
+            return (
+                config,
+                profile_name,
+                False,
+                None,
+                None,
+                f"Ready to start capture with profile {profile_name}",
+            )
+        return (
+            config,
+            args.profile,
+            False,
+            None,
+            None,
+            "Opened dashboard without attaching",
+        )
+    return (
+        config,
+        args.profile,
+        False,
+        None,
+        None,
+        "Opened review dashboard without attaching",
+    )
 
 
 def _launch_session_watch(prefix: list[str], session_dir: Path, player: str | None) -> bool:
@@ -14770,7 +14967,7 @@ def command_ui_tui(args: argparse.Namespace) -> int:
                         f"Recording exited {exit_code}",
                     )
             record_process = None
-        if record_process is None:
+        if record_process is None and record_attach_enabled:
             selected_profile = profiles[profile_index] if profiles else None
             adopted_record = _find_running_record_process(
                 args,
@@ -14813,10 +15010,17 @@ def command_ui_tui(args: argparse.Namespace) -> int:
         lines.append(f"Active profile: {profile}")
         record_pid = _process_pid(record_process) if _is_process_running(record_process) else None
         assist_pid = _process_pid(assist_process) if _is_process_running(assist_process) else None
+        if _is_process_running(record_process):
+            capture_mode = "attached"
+        elif record_attach_enabled:
+            capture_mode = "auto-attach"
+        else:
+            capture_mode = "new/review"
         lines.append(
             "Processes: "
             f"record={'running pid ' + str(record_pid) if record_pid else 'stopped'} "
-            f"detect={'running pid ' + str(assist_pid) if assist_pid else 'stopped'}"
+            f"detect={'running pid ' + str(assist_pid) if assist_pid else 'stopped'} "
+            f"mode={capture_mode}"
         )
         lines.append(
             f"Detect classes: {','.join(subject_classes)}"
@@ -14944,7 +15148,7 @@ def command_ui_tui(args: argparse.Namespace) -> int:
         return None
 
     def _launch_record() -> bool:
-        nonlocal record_process, record_session, record_launch_log
+        nonlocal record_process, record_session, record_launch_log, record_attach_enabled
         if not profiles:
             return False
         profile_name = profiles[profile_index]
@@ -14976,6 +15180,7 @@ def command_ui_tui(args: argparse.Namespace) -> int:
         if proc.poll() is not None:
             return False
         record_process = proc
+        record_attach_enabled = True
         return True
 
     def _launch_assist_live() -> bool:
@@ -15941,6 +16146,21 @@ def command_ui_tui(args: argparse.Namespace) -> int:
 
     config_path = args.config_file.expanduser()
     config = load_config(config_path)
+    initial_record_process: _UiProcessHandle | None = None
+    initial_record_session: Path | None = None
+    initial_message: str | None = None
+    record_attach_enabled = True
+    if interactive_mode_enabled(args) and not args.profile:
+        (
+            config,
+            preflight_profile,
+            record_attach_enabled,
+            initial_record_process,
+            initial_record_session,
+            initial_message,
+        ) = choose_ui_launch_intent(args, config_path, config)
+        if preflight_profile:
+            args.profile = preflight_profile
     profiles = sorted(config.get("profiles", {}))
     profile_index = 0
     if args.profile and args.profile in profiles:
@@ -15964,9 +16184,9 @@ def command_ui_tui(args: argparse.Namespace) -> int:
     selected_session_index = 0
     search_query = ""
     search_active = False
-    record_process: subprocess.Popen[bytes] | _UiProcessHandle | None = None
+    record_process: subprocess.Popen[bytes] | _UiProcessHandle | None = initial_record_process
     assist_process: subprocess.Popen[bytes] | _UiProcessHandle | None = None
-    record_session: Path | None = None
+    record_session: Path | None = initial_record_session
     record_launch_log: Path | None = None
     last_mouse_action_id: str | None = None
     last_mouse_action_at = 0.0
@@ -15974,7 +16194,7 @@ def command_ui_tui(args: argparse.Namespace) -> int:
     selected_event_index = 0
     pending_open_frame = False
     last_opened_frame_ref: str | None = None
-    messages: list[str] = ["UI ready"]
+    messages: list[str] = [initial_message or "UI ready"]
     quit_confirm_active = False
     active_dialog: str | None = None
     dialog_index = 0
@@ -16545,7 +16765,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--interactive",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Prompt for dashboard actions after showing field readiness.",
+        help="Prompt for dashboard startup profile and attach choices.",
     )
     ui.add_argument(
         "--legacy",

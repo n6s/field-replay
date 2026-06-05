@@ -221,6 +221,14 @@ The dashboard is a ncurses control plane with an old-school pane layout:
   launch review for the current query (`r`)
 - speech output selection (`8`) and an audio test (`9`) for detection speech
 
+When `ui` starts interactively, it asks which recording profile the dashboard
+should use before the TUI opens. The startup picker reuses the normal
+saved-profile workflow: pick a profile, edit a saved profile, or run setup for a
+new one. If an existing capture is already running, the prompt also offers to
+attach to that capture or open the review dashboard without attaching. Recording
+still starts from the TUI with `1`, so there is a final status check before a
+camera begins writing.
+
 Mouse clicks on the bottom command cells and event rows are supported. If capture or
 detect is still running, `q` opens a quit confirmation with choices to stop the
 running subprocesses, leave them running, or cancel and return to the dashboard.
