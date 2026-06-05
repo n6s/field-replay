@@ -12320,6 +12320,439 @@ def build_ui_assist_setup_command(
     return [*field_replay_command_prefix(args), "assist-setup", raw_path]
 
 
+@dataclass
+class _UiButton:
+    button_id: str
+    label: str
+    hotkey: str
+    y: int
+    x: int
+    width: int
+
+
+@dataclass
+class _UiProcessHandle:
+    pid: int
+    command: list[str]
+    label: str
+
+
+def _load_recent_evidence_events(
+    session_dir: Path,
+    *,
+    limit_per_source: int = 200,
+) -> list[dict]:
+    events: list[dict] = []
+    for source_label, source_path in evidence_event_sources_for_session(session_dir):
+        for record in tail_jsonl_records(source_path, limit=limit_per_source):
+            item = dict(record)
+            item["_source"] = source_label
+            item["_path"] = source_path
+            events.append(item)
+    events.sort(key=event_sort_key)
+    return events
+
+
+def _event_matches_query(event: dict, query: str) -> bool:
+    if not query:
+        return True
+    if is_all_review_selector(query):
+        return True
+
+    normalized = normalize_detection_text(query)
+    raw_query = query.strip().lower()
+    label = event_detection_label(event)
+    if normalized and label and normalized == label:
+        return True
+
+    subject = event.get("subject")
+    source = str(event.get("_source") or "")
+    frame = str(event.get("f") or "")
+    fields = [
+        str(label or ""),
+        str(subject or ""),
+        source,
+        frame,
+        str(event.get("w") or ""),
+    ]
+    combined = " ".join(field.lower() for field in fields if field)
+    if raw_query in combined:
+        return True
+
+    if normalized:
+        return any(
+            isinstance(value, str)
+            and normalized in (normalize_detection_text(value) or "")
+            for value in (event.get("label"), event.get("l"), event.get("detection"))
+            if value
+        )
+
+    return False
+
+
+def _event_label_for_row(event: dict) -> str:
+    label = event_detection_label(event)
+    if label:
+        return label
+    subject = event.get("subject")
+    if subject:
+        return str(subject)
+    kind = event.get("k")
+    if kind:
+        return str(kind)
+    return "event"
+
+
+def _event_row_text(event: dict) -> str:
+    wall_label = event.get("w")
+    if isinstance(wall_label, str) and wall_label.strip():
+        wall_label = wall_label.strip()
+    else:
+        wall_label = ""
+    return (
+        f"t={format_duration(event.get('t'))} "
+        f"src={event.get('_source', '?'):<10} "
+        f"{_event_label_for_row(event)} "
+        f"conf={event_confidence_label(event):>5} "
+        f"frame={event.get('f', '-') or '-'} "
+        f"{wall_label}"
+    )
+
+
+def _truncate_for_width(value: str, width: int) -> str:
+    if width <= 0:
+        return ""
+    if len(value) <= width:
+        return value.ljust(width)
+    if width <= 3:
+        return value[:width]
+    return value[: width - 3] + "..."
+
+
+def _write_status_messages(lines: list[str], message: str, max_messages: int = 6) -> list[str]:
+    if not message:
+        return lines
+    lines = list(lines)
+    lines.append(f"{time.strftime('%H:%M:%S')} {message}")
+    if len(lines) > max_messages:
+        lines = lines[-max_messages:]
+    return lines
+
+
+def _proc_state(pid: int) -> str | None:
+    try:
+        stat_text = (Path("/proc") / str(pid) / "stat").read_text()
+    except OSError:
+        return None
+    parts = stat_text.split()
+    return parts[2] if len(parts) >= 3 else None
+
+
+def _pid_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if _proc_state(pid) == "Z":
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def _process_pid(process: subprocess.Popen[bytes] | _UiProcessHandle | None) -> int | None:
+    if process is None:
+        return None
+    return int(process.pid)
+
+
+def _is_process_running(process: subprocess.Popen[bytes] | _UiProcessHandle | None) -> bool:
+    if process is None:
+        return False
+    if isinstance(process, _UiProcessHandle):
+        return _pid_is_running(process.pid)
+    return process.poll() is None
+
+
+def _launch_background_command(command: Sequence[str]) -> subprocess.Popen[bytes] | None:
+    try:
+        return subprocess.Popen(
+            list(command),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError as exc:
+        return None
+
+
+def _wait_for_pid_exit(pid: int, timeout_seconds: float) -> bool:
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        if not _pid_is_running(pid):
+            return True
+        time.sleep(0.1)
+    return not _pid_is_running(pid)
+
+
+def _signal_process_group(pid: int, sig: int) -> None:
+    try:
+        os.killpg(os.getpgid(pid), sig)
+    except OSError:
+        os.kill(pid, sig)
+
+
+def _stop_process(
+    process: subprocess.Popen[bytes] | _UiProcessHandle | None,
+    tag: str,
+) -> subprocess.Popen[bytes] | _UiProcessHandle | None:
+    if process is None or not _is_process_running(process):
+        return None
+
+    pid = _process_pid(process)
+    if pid is None:
+        return None
+
+    try:
+        if isinstance(process, _UiProcessHandle):
+            os.kill(pid, signal.SIGINT)
+        else:
+            _signal_process_group(pid, signal.SIGINT)
+    except ProcessLookupError:
+        return None
+    except OSError:
+        return None
+
+    if isinstance(process, _UiProcessHandle):
+        if _wait_for_pid_exit(pid, 1.5):
+            return None
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+        _wait_for_pid_exit(pid, 1.0)
+        return None
+
+    try:
+        process.wait(timeout=1.5)
+    except (subprocess.TimeoutExpired, ProcessLookupError):
+        try:
+            _signal_process_group(pid, signal.SIGTERM)
+        except OSError:
+            pass
+        try:
+            process.wait(timeout=1.0)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+    return None
+
+
+def _read_proc_cmdline(pid: int) -> list[str]:
+    try:
+        raw = (Path("/proc") / str(pid) / "cmdline").read_bytes()
+    except OSError:
+        return []
+    return [part.decode("utf-8", errors="replace") for part in raw.split(b"\0") if part]
+
+
+def _read_proc_cwd(pid: int) -> Path | None:
+    try:
+        return (Path("/proc") / str(pid) / "cwd").resolve()
+    except OSError:
+        return None
+
+
+def _iter_process_cmdlines() -> list[tuple[int, list[str]]]:
+    proc_root = Path("/proc")
+    rows: list[tuple[int, list[str]]] = []
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError:
+        return rows
+    current_pid = os.getpid()
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == current_pid or not _pid_is_running(pid):
+            continue
+        command = _read_proc_cmdline(pid)
+        if command:
+            rows.append((pid, command))
+    return rows
+
+
+def _command_contains_field_replay(command: Sequence[str]) -> bool:
+    return any(Path(part).name == "field-replay" for part in command)
+
+
+def _command_has_token(command: Sequence[str], token: str) -> bool:
+    return any(part == token for part in command)
+
+
+def _command_value_after(command: Sequence[str], option: str) -> str | None:
+    for index, part in enumerate(command[:-1]):
+        if part == option:
+            return command[index + 1]
+    return None
+
+
+def _parse_lock_file(lock_path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    try:
+        text = lock_path.read_text()
+    except OSError:
+        return values
+    for line in text.splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip()
+    return values
+
+
+def _session_by_name(session_list: Sequence[Path]) -> dict[str, Path]:
+    return {session.name: session for session in session_list}
+
+
+def _find_running_record_process(
+    args: argparse.Namespace,
+    sessions: Sequence[Path],
+) -> tuple[_UiProcessHandle, Path] | None:
+    by_name = _session_by_name(sessions)
+    try:
+        recordings_root = args.recordings_dir.expanduser().resolve()
+    except OSError:
+        recordings_root = args.recordings_dir.expanduser()
+    by_resolved: dict[str, Path] = {}
+    for session in sessions:
+        try:
+            by_resolved[str(session.resolve())] = session
+        except OSError:
+            by_resolved[str(session)] = session
+    lock_dir = args.recordings_dir.expanduser() / ".locks"
+    try:
+        lock_paths = list(lock_dir.glob("*.lock"))
+    except OSError:
+        lock_paths = []
+
+    for lock_path in lock_paths:
+        values = _parse_lock_file(lock_path)
+        pid_text = values.get("pid", "")
+        session_name = values.get("session", "")
+        if not pid_text.isdigit() or not session_name:
+            continue
+        pid = int(pid_text)
+        if not _pid_is_running(pid):
+            continue
+        session_dir = by_name.get(session_name) or args.recordings_dir.expanduser() / session_name
+        if not session_dir.exists():
+            continue
+        return (
+            _UiProcessHandle(pid=pid, command=_read_proc_cmdline(pid), label="record"),
+            session_dir,
+        )
+
+    for pid, command in _iter_process_cmdlines():
+        if not _command_contains_field_replay(command) or not _command_has_token(command, "go"):
+            continue
+        session_name = _command_value_after(command, "--session-name")
+        if not session_name:
+            continue
+        session_dir = by_name.get(session_name) or args.recordings_dir.expanduser() / session_name
+        if session_dir.exists():
+            return (_UiProcessHandle(pid=pid, command=command, label="record"), session_dir)
+
+    capture_bins = {"ffmpeg", "gst-launch-1.0", "gst-launch"}
+    for pid, command in _iter_process_cmdlines():
+        if not command:
+            continue
+        executable_name = Path(command[0]).name
+        if executable_name not in capture_bins:
+            continue
+        if DEFAULT_TIMESHIFT_NAME not in "\0".join(command):
+            continue
+        cwd = _read_proc_cwd(pid)
+        if cwd is None:
+            continue
+        try:
+            cwd.relative_to(recordings_root)
+        except ValueError:
+            continue
+        session_dir = by_resolved.get(str(cwd))
+        if session_dir is None:
+            candidate = cwd / "session.json"
+            timeshift = cwd / DEFAULT_TIMESHIFT_NAME
+            if candidate.exists() or timeshift.exists():
+                session_dir = cwd
+        if session_dir is not None:
+            return (_UiProcessHandle(pid=pid, command=command, label="record-backend"), session_dir)
+    return None
+
+
+def _find_running_assist_process(
+    sessions: Sequence[Path],
+) -> tuple[_UiProcessHandle, Path] | None:
+    session_paths = []
+    for session in sessions:
+        try:
+            resolved = str(session.resolve())
+        except OSError:
+            resolved = str(session)
+        session_paths.append((session, resolved, str(session), session.name))
+
+    for pid, command in _iter_process_cmdlines():
+        if not _command_contains_field_replay(command) or not _command_has_token(command, "assist-live"):
+            continue
+        command_text = "\0".join(command)
+        for session, resolved, raw, name in session_paths:
+            if resolved in command_text or raw in command_text or name in command_text:
+                return (_UiProcessHandle(pid=pid, command=command, label="assist-live"), session)
+    return None
+
+
+def _launch_session_watch(prefix: list[str], session_dir: Path, player: str | None) -> bool:
+    command = [*prefix, "watch", str(session_dir), "--no-interactive", "--player", player or "mpv"]
+    return _launch_background_command(command) is not None
+
+
+def _open_selected_event_viewer(session_dir: Path, event: dict, *, use_video: bool) -> bool:
+    if use_video:
+        player = choose_player(None)
+        if not player:
+            return False
+        target = session_dir / DEFAULT_TIMESHIFT_NAME
+        if not target.exists():
+            target = session_dir / f"{DEFAULT_ARCHIVE_STEM}.mkv"
+        if not target.exists():
+            target = session_dir / f"{DEFAULT_ARCHIVE_STEM}.mp4"
+        if not target.exists():
+            return False
+
+        command = build_player_command(
+            player,
+            target,
+            300,
+            start_seconds=max(float(event.get("t") or 0.0) - 2.0, 0.0),
+        )
+        return _launch_background_command(command) is not None
+
+    frame = event.get("f")
+    if not frame:
+        return False
+    frame_path = session_asset_path(session_dir, str(frame))
+    if not frame_path or not frame_path.exists():
+        return False
+    viewer = choose_image_viewer(None)
+    if not viewer:
+        return False
+    command = build_image_viewer_command(viewer, [frame_path])
+    return _launch_background_command(command) is not None
+
+
 def prepare_yolo_opencv_net(args: argparse.Namespace):
     model_path = args.yolo_model.expanduser()
     labels_path = args.yolo_labels.expanduser()
@@ -13588,7 +14021,10 @@ def command_assist(args: argparse.Namespace) -> int:
     return status
 
 
-def command_ui(args: argparse.Namespace) -> int:
+def command_ui_legacy(args: argparse.Namespace) -> int:
+    if not interactive_mode_enabled(args):
+        return 0
+
     config_path = args.config_file.expanduser()
     config = load_config(config_path)
     print("Field Replay Dashboard")
@@ -13597,9 +14033,6 @@ def command_ui(args: argparse.Namespace) -> int:
     print_ui_recent_sessions(args, config)
     print()
     print("Field target: DVR first. Detection and number reads are assistive evidence.")
-
-    if not interactive_mode_enabled(args):
-        return 0
 
     actions = [
         ("record", "Start recording and launch DVR playback"),
@@ -13670,6 +14103,701 @@ def command_ui(args: argparse.Namespace) -> int:
                 command.append("--preview-detections")
             print("Running:", shlex.join(command))
             return subprocess.call(command)
+
+
+def command_ui_tui(args: argparse.Namespace) -> int:
+    import curses
+
+    TUI_MIN_WIDTH = 80
+    TUI_MIN_HEIGHT = 18
+    COLOR_HEADER = 1
+    COLOR_PANEL = 2
+    COLOR_BUTTON = 3
+    COLOR_BUTTON_DISABLED = 4
+    COLOR_SELECTED = 5
+    COLOR_DIM = 6
+    TUI_KEY_HINTS = (
+        "1 start/stop capture  2 watch  3 start/stop assist-live  4 open frame  "
+        "a/d session  j/k events  / search  r review  v video  q quit"
+    )
+
+    def _init_colors() -> None:
+        if not curses.has_colors():
+            return
+        curses.start_color()
+        curses.use_default_colors()
+        curses.init_pair(COLOR_HEADER, curses.COLOR_WHITE, curses.COLOR_BLUE)
+        curses.init_pair(COLOR_PANEL, curses.COLOR_CYAN, -1)
+        curses.init_pair(COLOR_BUTTON, curses.COLOR_BLACK, curses.COLOR_CYAN)
+        curses.init_pair(COLOR_BUTTON_DISABLED, curses.COLOR_WHITE, curses.COLOR_BLACK)
+        curses.init_pair(COLOR_SELECTED, curses.COLOR_BLACK, curses.COLOR_YELLOW)
+        curses.init_pair(COLOR_DIM, curses.COLOR_WHITE, -1)
+
+    def _color(pair: int, fallback: int = 0) -> int:
+        if curses.has_colors():
+            return curses.color_pair(pair)
+        return fallback
+
+    def _safe_addstr(
+        window: "curses._CursesWindow",
+        y: int,
+        x: int,
+        text: str,
+        width: int,
+        attr: int = 0,
+    ) -> None:
+        if width <= 0:
+            return
+        try:
+            window.addstr(y, x, _truncate_for_width(text, width), attr)
+        except curses.error:
+            return
+
+    def _draw_panel(
+        window: "curses._CursesWindow",
+        y: int,
+        x: int,
+        height: int,
+        width: int,
+        title: str,
+    ) -> None:
+        if height < 3 or width < 4:
+            return
+        attr = _color(COLOR_PANEL, curses.A_BOLD)
+        try:
+            window.attron(attr)
+            window.addstr(y, x, "+" + "-" * (width - 2) + "+")
+            for row in range(y + 1, y + height - 1):
+                window.addstr(row, x, "|")
+                window.addstr(row, x + width - 1, "|")
+            window.addstr(y + height - 1, x, "+" + "-" * (width - 2) + "+")
+            if title:
+                label = f" {title} "
+                window.addstr(y, x + 2, label[: max(0, width - 4)])
+            window.attroff(attr)
+        except curses.error:
+            return
+
+    def _draw_button(
+        window: "curses._CursesWindow",
+        button: _UiButton,
+        selected: bool = False,
+        enabled: bool = True,
+    ) -> None:
+        style = _color(COLOR_SELECTED if selected else COLOR_BUTTON, curses.A_REVERSE)
+        if not enabled:
+            style = _color(COLOR_BUTTON_DISABLED, curses.A_DIM)
+        text = f"[{button.hotkey}] {button.label}"
+        if button.width <= 0:
+            return
+        content = f" {text} "
+        _safe_addstr(window, button.y, button.x, content.center(button.width), button.width, style)
+
+    def _build_buttons(width: int, y: int = 4) -> list[_UiButton]:
+        labels = [
+            ("record", "Capture", "1"),
+            ("watch", "Watch", "2"),
+            ("assist", "Assist", "3"),
+            ("open", "Open", "4"),
+            ("quit", "Quit", "q"),
+        ]
+        target_width = max(12, (width - (len(labels) + 1) * 3) // len(labels))
+        buttons: list[_UiButton] = []
+        cursor_x = 2
+        for button_id, label, hotkey in labels:
+            width_hint = max(10, min(24, target_width))
+            buttons.append(_UiButton(button_id, label, hotkey, y, cursor_x, width_hint))
+            cursor_x += width_hint + 3
+        return buttons
+
+    def _refresh_state() -> None:
+        nonlocal session_list, selected_session_index
+        nonlocal record_process, record_session, assist_process, messages
+        session_list = recent_sessions(args, config)
+        if record_session and record_session not in session_list:
+            session_list.insert(0, record_session)
+        if not session_list:
+            selected_session_index = 0
+            return
+        if not _is_process_running(record_process):
+            record_process = None
+            adopted_record = _find_running_record_process(args, session_list)
+            if adopted_record:
+                record_process, record_session = adopted_record
+                if record_session not in session_list:
+                    session_list.insert(0, record_session)
+                messages = _write_status_messages(
+                    messages,
+                    f"Reattached recording pid {_process_pid(record_process)}",
+                )
+        if not _is_process_running(assist_process):
+            assist_process = None
+            adopted_assist = _find_running_assist_process(session_list)
+            if adopted_assist:
+                assist_process, assist_session = adopted_assist
+                if assist_session not in session_list:
+                    session_list.insert(0, assist_session)
+                messages = _write_status_messages(
+                    messages,
+                    f"Reattached assist-live pid {_process_pid(assist_process)}",
+                )
+        if selected_session_index >= len(session_list):
+            selected_session_index = len(session_list) - 1
+        if selected_session_index < 0:
+            selected_session_index = 0
+
+    def _status_lines() -> list[str]:
+        lines: list[str] = []
+        profile = profiles[profile_index] if profiles else "(none)"
+        if record_session:
+            lines.append(f"Recording session: {record_session.name}")
+        else:
+            lines.append("Recording session: (none)")
+        lines.append(f"Active profile: {profile}")
+        record_pid = _process_pid(record_process) if _is_process_running(record_process) else None
+        assist_pid = _process_pid(assist_process) if _is_process_running(assist_process) else None
+        lines.append(
+            "Processes: "
+            f"record={'running pid ' + str(record_pid) if record_pid else 'stopped'} "
+            f"assist-live={'running pid ' + str(assist_pid) if assist_pid else 'stopped'}"
+        )
+        if session_list:
+            lines.append(
+                f"Selected session: {session_display_label(session_list[selected_session_index])}"
+            )
+        else:
+            lines.append("Selected session: (none)")
+        return lines
+
+    def _refresh_events() -> None:
+        nonlocal event_rows, selected_event_index
+        if not session_list or selected_session_index >= len(session_list):
+            event_rows = []
+            return
+        session_dir = session_list[selected_session_index]
+        raw_events = _load_recent_evidence_events(session_dir)
+        event_rows = [
+            event for event in raw_events if _event_matches_query(event, search_query)
+        ]
+        event_rows.sort(key=lambda item: event_sort_key(item), reverse=True)
+        if selected_event_index >= len(event_rows):
+            selected_event_index = max(0, len(event_rows) - 1)
+
+    def _selected_session() -> Path | None:
+        if record_session and _is_process_running(record_process):
+            return record_session
+        if record_session and record_session in session_list:
+            return record_session
+        if not session_list:
+            return None
+        if selected_session_index < 0 or selected_session_index >= len(session_list):
+            return None
+        return session_list[selected_session_index]
+
+    def _launch_record() -> bool:
+        nonlocal record_process, record_session
+        if not profiles:
+            return False
+        profile_name = profiles[profile_index]
+        profile = config.get("profiles", {}).get(profile_name, {}) if config else {}
+        session_prefix = str(profile.get("session_prefix") or DEFAULT_SESSION_PREFIX)
+        session_name = default_session_name(session_prefix)
+        record_session = args.recordings_dir / session_name
+        if record_session.exists():
+            session_name = (
+                f"{session_prefix}-{int(time.time())}"
+            )
+            record_session = args.recordings_dir / session_name
+
+        command = [
+            *field_replay_command_prefix(args),
+            "go",
+            "--profile",
+            profile_name,
+            "--session-name",
+            session_name,
+            "--player",
+            args.player or "mpv",
+            "--no-interactive",
+        ]
+        proc = _launch_background_command(command)
+        if proc is None:
+            return False
+        time.sleep(0.1)
+        if proc.poll() is not None:
+            return False
+        record_process = proc
+        return True
+
+    def _launch_assist_live() -> bool:
+        nonlocal assist_process
+        session_dir = _selected_session()
+        if session_dir is None:
+            return False
+        command = [
+            *field_replay_command_prefix(args),
+            "assist-live",
+            str(session_dir),
+            "--no-interactive",
+        ]
+        proc = _launch_background_command(command)
+        if proc is None:
+            return False
+        time.sleep(0.1)
+        if proc.poll() is not None:
+            return False
+        assist_process = proc
+        return True
+
+    def _launch_review(query: str) -> None:
+        nonlocal messages
+        session = _selected_session()
+        if session is None:
+            messages = _write_status_messages(messages, "No session selected")
+            return
+        if not evidence_event_sources_for_session(session):
+            messages = _write_status_messages(messages, "No evidence for selected session")
+            return
+
+        effective_query = query if query else "all"
+        mode = "frames" if effective_query.lower() in {"all", "frames"} else "summary"
+        command = [
+            *field_replay_command_prefix(args),
+            "review",
+            effective_query,
+            str(session),
+            "--mode",
+            mode,
+            "--no-interactive",
+        ]
+        if _launch_background_command(command):
+            messages = _write_status_messages(
+                messages,
+                f"Review started for {effective_query!r}",
+            )
+        else:
+            messages = _write_status_messages(messages, "Could not start review")
+
+    def _draw(stdscr: "curses._CursesWindow") -> None:
+        nonlocal selected_event_index
+        h, w = stdscr.getmaxyx()
+        if h < TUI_MIN_HEIGHT or w < TUI_MIN_WIDTH:
+            stdscr.erase()
+            _safe_addstr(
+                stdscr,
+                0,
+                0,
+                f"Window too small. Resize terminal to at least {TUI_MIN_WIDTH}x{TUI_MIN_HEIGHT}.",
+                max(w - 1, 0),
+            )
+            return
+        stdscr.erase()
+
+        header_attr = _color(COLOR_HEADER, curses.A_REVERSE | curses.A_BOLD)
+        stdscr.bkgd(" ", _color(COLOR_DIM))
+        _safe_addstr(
+            stdscr,
+            0,
+            0,
+            " FIELD REPLAY CONTROL PLANE ".ljust(w),
+            w,
+            header_attr,
+        )
+        _safe_addstr(
+            stdscr,
+            1,
+            0,
+            f" {TUI_KEY_HINTS}".ljust(w),
+            w,
+            header_attr,
+        )
+
+        command_y = 3
+        _draw_panel(stdscr, command_y - 1, 0, 4, w, "Commands")
+        buttons = _build_buttons(w, y=command_y + 1)
+        for button in buttons:
+            if button.button_id == "record":
+                button.label = (
+                    "Stop capture" if _is_process_running(record_process) else "Start capture"
+                )
+                button.width = max(button.width, 16)
+            elif button.button_id == "assist":
+                button.label = (
+                    "Stop assist-live" if _is_process_running(assist_process) else "Start assist-live"
+                )
+                button.width = max(button.width, 16)
+            elif button.button_id == "quit":
+                button.label = "Quit"
+            if button.button_id == "open":
+                button.label = "Open frame"
+            if button.button_id == "watch":
+                button.label = "Watch"
+
+            _draw_button(
+                stdscr,
+                button,
+                selected=False,
+                enabled=button.button_id != "open" or bool(event_rows),
+            )
+
+        top_y = command_y + 4
+        info_height = 7
+        left_w = max(38, w // 2)
+        right_w = w - left_w
+        _draw_panel(stdscr, top_y, 0, info_height, left_w, "Status")
+        _draw_panel(stdscr, top_y, left_w, info_height, right_w, "Sessions")
+
+        status = _status_lines()
+        for index, line in enumerate(status[: info_height - 2]):
+            _safe_addstr(stdscr, top_y + 1 + index, 2, line, left_w - 4)
+
+        profile_text = ", ".join(profiles) if profiles else "(none)"
+        _safe_addstr(
+            stdscr,
+            top_y + info_height - 2,
+            2,
+            f"Profiles: {profile_text}",
+            left_w - 4,
+            curses.A_BOLD,
+        )
+
+        if session_list:
+            visible_sessions = session_list[: info_height - 2]
+            for index, session in enumerate(visible_sessions):
+                marker = ">" if index == selected_session_index else " "
+                attr = _color(COLOR_SELECTED, curses.A_REVERSE) if index == selected_session_index else 0
+                _safe_addstr(
+                    stdscr,
+                    top_y + 1 + index,
+                    left_w + 2,
+                    f"{marker} {session_display_label(session)}",
+                    right_w - 4,
+                    attr,
+                )
+        else:
+            _safe_addstr(stdscr, top_y + 1, left_w + 2, "(none)", right_w - 4)
+
+        search_y = top_y + info_height
+        _draw_panel(stdscr, search_y, 0, 3, w, "Search")
+        prompt = f"{search_query}{'_' if search_active else ''}"
+        _safe_addstr(
+            stdscr,
+            search_y + 1,
+            2,
+            f"Query: {prompt or '(all)'}    Matches: {len(event_rows)}",
+            w - 4,
+        )
+
+        message_height = 5
+        pane_top = search_y + 3
+        pane_height = h - pane_top - message_height
+        _draw_panel(stdscr, pane_top, 0, pane_height, w, "Detections")
+
+        start_row = pane_top + 1
+        visible_height = max(0, pane_height - 2)
+        if not event_rows:
+            _safe_addstr(stdscr, start_row, 2, "No matching detections yet.", w - 4)
+        else:
+            selected_event_index = min(selected_event_index, len(event_rows) - 1)
+            visible_rows = event_rows[:visible_height]
+            for index, event in enumerate(visible_rows):
+                style = _color(COLOR_SELECTED, curses.A_REVERSE) if index == selected_event_index else 0
+                _safe_addstr(
+                    stdscr,
+                    start_row + index,
+                    2,
+                    _event_row_text(event),
+                    w - 4,
+                    style,
+                )
+
+        log_top = h - message_height
+        _draw_panel(stdscr, log_top, 0, message_height, w, "Messages")
+        for line_offset, line in enumerate(messages[-3:]):
+            _safe_addstr(stdscr, log_top + 1 + line_offset, 2, line, w - 4)
+
+    def _handle_click(stdscr: "curses._CursesWindow", my: int, mx: int) -> bool:
+        nonlocal selected_event_index, messages
+        h, w = stdscr.getmaxyx()
+        command_y = 3
+        top_y = command_y + 4
+        info_height = 7
+        search_y = top_y + info_height
+        pane_top = search_y + 3
+        pane_height = h - pane_top - 5
+        buttons = _build_buttons(w, y=command_y + 1)
+        session = _selected_session()
+        for button in buttons:
+            if (
+                button.y == my
+                and button.x <= mx < button.x + button.width
+            ):
+                return _activate_action(button.button_id)
+        if (
+            pane_top + 1 <= my < pane_top + pane_height - 1
+            and 0 <= mx < w - 1
+            and event_rows
+            and session is not None
+        ):
+            if not event_rows:
+                return True
+            index = my - pane_top - 1
+            if 0 <= index < min(len(event_rows), max(0, pane_height - 2)):
+                selected_event_index = index
+                if _open_selected_event_viewer(
+                    session,
+                    event_rows[selected_event_index],
+                    use_video=False,
+                ):
+                    messages = _write_status_messages(messages, "Opened frame preview")
+                else:
+                    messages = _write_status_messages(messages, "Selected event has no frame")
+        return True
+
+    def _activate_action(action_id: str) -> bool:
+        nonlocal messages, profile_index, selected_session_index, search_active, record_process, assist_process
+        if action_id == "record":
+            if _is_process_running(record_process):
+                if _stop_process(record_process, "record"):
+                    messages = _write_status_messages(messages, "Stopped recording")
+                else:
+                    messages = _write_status_messages(
+                        messages,
+                        "Could not stop recording",
+                    )
+                record_process = None
+                return True
+            if _launch_record():
+                messages = _write_status_messages(messages, "Started recording")
+                _refresh_state()
+            else:
+                messages = _write_status_messages(
+                    messages,
+                    "Failed to launch capture command",
+                )
+            return True
+
+        if action_id == "watch":
+            session = _selected_session()
+            if session is None:
+                messages = _write_status_messages(messages, "No session selected")
+                return True
+            if _launch_session_watch(field_replay_command_prefix(args), session, args.player):
+                messages = _write_status_messages(messages, f"Watching {session.name}")
+            else:
+                messages = _write_status_messages(messages, "Failed to launch player")
+            return True
+
+        if action_id == "assist":
+            if _is_process_running(assist_process):
+                if _stop_process(assist_process, "assist"):
+                    messages = _write_status_messages(messages, "Stopped assist-live")
+                else:
+                    messages = _write_status_messages(messages, "Could not stop assist-live")
+                assist_process = None
+                return True
+            if _launch_assist_live():
+                messages = _write_status_messages(messages, "Started assist-live")
+            else:
+                messages = _write_status_messages(messages, "Failed to start assist-live")
+            return True
+
+        if action_id == "open":
+            if not event_rows:
+                messages = _write_status_messages(messages, "No event selected")
+                return True
+            session = _selected_session()
+            if session is None:
+                messages = _write_status_messages(messages, "No session selected")
+                return True
+            if _open_selected_event_viewer(session, event_rows[selected_event_index], use_video=False):
+                messages = _write_status_messages(messages, "Opened frame preview")
+            else:
+                messages = _write_status_messages(messages, "Selected event has no frame")
+            return True
+
+        if action_id == "review":
+            _launch_review(search_query)
+            return True
+
+        if action_id == "quit":
+            return False
+
+        return True
+
+    def _curses_main(stdscr: "curses._CursesWindow") -> int:
+        nonlocal messages, profile_index, record_process, assist_process
+        nonlocal search_active, search_query, selected_event_index, selected_session_index
+        _init_colors()
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        stdscr.nodelay(True)
+        stdscr.keypad(True)
+        curses.mousemask(curses.ALL_MOUSE_EVENTS)
+
+        last_event_update = 0.0
+        last_state_update = 0.0
+        while True:
+            now = time.time()
+            if now - last_state_update > 1.0:
+                _refresh_state()
+                last_state_update = now
+            if now - last_event_update > 1.0:
+                _refresh_events()
+                last_event_update = now
+
+            _draw(stdscr)
+            stdscr.refresh()
+
+            key = stdscr.getch()
+            if key == curses.ERR:
+                time.sleep(0.05)
+                if not _is_process_running(record_process):
+                    record_process = None
+                if not _is_process_running(assist_process):
+                    assist_process = None
+                continue
+
+            if search_active:
+                if key in (curses.KEY_ENTER, 10, 13):
+                    search_active = False
+                    try:
+                        curses.curs_set(0)
+                    except curses.error:
+                        pass
+                    _refresh_events()
+                    continue
+                if key in (27,):
+                    search_active = False
+                    try:
+                        curses.curs_set(0)
+                    except curses.error:
+                        pass
+                    continue
+                if key in (curses.KEY_BACKSPACE, 127, 8):
+                    search_query = search_query[:-1]
+                    _refresh_events()
+                    continue
+                if 32 <= key <= 126:
+                    if len(search_query) < 64:
+                        search_query += chr(key)
+                        _refresh_events()
+                    continue
+                continue
+
+            if key == ord("q") or key == ord("Q"):
+                return 0
+            if key in (ord("1"), ord("2"), ord("3"), ord("4"), ord("Q")):
+                mapping = {49: "record", 50: "watch", 51: "assist", 52: "open", 81: "quit"}
+                next_action = mapping.get(key)
+                if next_action:
+                    if not _activate_action(next_action):
+                        return 0
+                continue
+
+            if key in (ord("r"), ord("R")):
+                _launch_review(search_query)
+                continue
+
+            if key in (ord("v"), ord("V")):
+                session = _selected_session()
+                if session is None:
+                    messages = _write_status_messages(messages, "No session selected")
+                elif event_rows and _open_selected_event_viewer(
+                    session,
+                    event_rows[selected_event_index],
+                    use_video=True,
+                ):
+                    messages = _write_status_messages(messages, "Opened event video")
+                else:
+                    messages = _write_status_messages(messages, "Could not open event video")
+                continue
+
+            if key in (curses.KEY_MOUSE,):
+                try:
+                    _, mx, my, _, _ = curses.getmouse()
+                except curses.error:
+                    continue
+                if not _handle_click(stdscr, my, mx):
+                    return 0
+                continue
+
+            if key in (curses.KEY_UP, ord("k")) and event_rows:
+                selected_event_index = max(0, selected_event_index - 1)
+                continue
+            if key in (curses.KEY_DOWN, ord("j")) and event_rows:
+                selected_event_index = min(
+                    len(event_rows) - 1,
+                    selected_event_index + 1,
+                )
+                continue
+
+            if key in (ord("["), ord("{") ):
+                if profiles:
+                    profile_index = (profile_index - 1) % len(profiles)
+                continue
+            if key in (ord("]"), ord("}")):
+                if profiles:
+                    profile_index = (profile_index + 1) % len(profiles)
+                continue
+
+            if key in (ord("_"), ord("/") ):
+                search_active = True
+                try:
+                    curses.curs_set(1)
+                except curses.error:
+                    pass
+                continue
+
+            if key in (ord("a"), ord("A")):
+                if session_list:
+                    selected_session_index = (selected_session_index - 1) % len(session_list)
+                    selected_event_index = 0
+                    _refresh_events()
+                continue
+            if key in (ord("d"), ord("D")):
+                if session_list:
+                    selected_session_index = (selected_session_index + 1) % len(session_list)
+                    selected_event_index = 0
+                    _refresh_events()
+                continue
+
+        return 0
+
+    if not interactive_mode_enabled(args):
+        return command_ui_legacy(args)
+
+    config_path = args.config_file.expanduser()
+    config = load_config(config_path)
+    profiles = sorted(config.get("profiles", {}))
+    profile_index = 0
+    if args.profile and args.profile in profiles:
+        profile_index = profiles.index(args.profile)
+    elif config.get("last_profile") in profiles:
+        profile_index = profiles.index(config.get("last_profile"))
+    if not profiles:
+        profile_index = 0
+
+    session_list: list[Path] = []
+    selected_session_index = 0
+    search_query = ""
+    search_active = False
+    record_process: subprocess.Popen[bytes] | _UiProcessHandle | None = None
+    assist_process: subprocess.Popen[bytes] | _UiProcessHandle | None = None
+    record_session: Path | None = None
+    event_rows: list[dict] = []
+    selected_event_index = 0
+    messages: list[str] = ["UI ready"]
+
+    return curses.wrapper(_curses_main)
+
+
+def command_ui(args: argparse.Namespace) -> int:
+    if getattr(args, "legacy", False):
+        return command_ui_legacy(args)
+    return command_ui_tui(args)
 
 
 def command_doctor(args: argparse.Namespace) -> int:
@@ -14230,6 +15358,11 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Prompt for dashboard actions after showing field readiness.",
+    )
+    ui.add_argument(
+        "--legacy",
+        action="store_true",
+        help="Run the legacy menu dashboard instead of the curses control plane.",
     )
     ui.set_defaults(func=command_ui)
 

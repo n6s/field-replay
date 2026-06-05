@@ -198,29 +198,35 @@ If you want live vision features, also install and run Ollama separately.
 
 ### Field dashboard
 
-For event use, start with the operator dashboard:
+For event use, start with the operator control plane:
 
 ```bash
 ./field-replay ui
 ```
 
-The dashboard shows saved recording profiles, video/audio readiness, recent
-sessions, and simple actions for starting capture, opening DVR playback, and
-running either the current YOLO-plus-number offline assist pass or the live
-assistant for an active DVR session. It also shows whether offline assist is
-using a configured DeepStream/TensorRT subject pack or the OpenCV YOLO fallback.
-Recent session rows show an evidence count when promoted events already exist,
-including DeepStream `subject-scan` events.
-The dashboard also prints latest-session activity: whether the DVR file is
-still being updated, how many promoted events exist, the last promoted subject
-or identifier, and whether live assist debug logs are still fresh. During a
-quiet run this helps distinguish "nothing promoted yet" from "the detector is
-running but suppressing static or low-displacement tracks."
-The dashboard action menu can configure or clear that offline assist detector
-without remembering the full command.
-Lower-level commands remain available for setup and debugging, but field
-operation should center on one command and saved profiles rather than long
-argument lists.
+The dashboard is a ncurses control plane with an old-school pane layout:
+
+- profile + recent session visibility
+- controls to start/stop recording (with player launch), watch a session, and
+  start/stop live assist (`assist-live`) for the selected session
+- a bottom pane showing the latest detection events
+- quick bib/label filtering (`/` or `_`, then type your query)
+- quick actions to open the selected evidence frame (`4`) or launch review (`r`)
+
+Mouse clicks on the top buttons and event rows are supported.
+
+Legacy mode is still available if you want the previous text menu flow:
+
+```bash
+./field-replay ui --legacy
+```
+
+Lower-level commands remain available for setup and debugging, but this control
+surface is the default operator entry point.
+
+If the dashboard exits unexpectedly, background recording or live assist
+processes are left alone. Reopen `./field-replay ui` and it will reattach to
+matching running processes for recent sessions when it can identify them.
 
 When the dashboard runs the assist pass, identifier candidates are spoken aloud
 with the local speech command when available, while also being written to the
