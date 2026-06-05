@@ -287,6 +287,17 @@ live assistant during field testing. Reopen `./field-replay ui` in another
 terminal to see the latest promoted evidence count and live debug freshness
 without tailing log files manually.
 
+To watch promoted detections as they arrive, add `--preview-detections`:
+
+```bash
+./field-replay assist-live --preview-detections
+```
+
+The preview opens each saved crop in the configured image viewer. It defaults to
+`eog`; with `eog`, field replay passes `--single-window` so a running viewer can
+reuse the same window instead of piling up separate crop windows. The dashboard
+asks the same preview question when you choose the live assist action.
+
 ### 1. Check the environment
 
 ```bash
@@ -601,9 +612,37 @@ detection work bounded with an 8-second rolling track window and uses more
 sensitive live transit defaults than offline scans: at least `1%` net movement
 across the source-frame diagonal and at least `0.55` directionality. Promoted
 subject lines print immediately in the terminal and speak the subject label;
-identifier candidates are spoken as `Possible <number>`. It is still a bridge:
-the desired production path is a persistent Jetson DeepStream/TensorRT detector
-and tracker feeding the same promoted subject and identifier event logs.
+identifier crops are queued asynchronously so detector sampling keeps moving,
+and identifier candidates are spoken later as `Possible <number>` when the
+reader finishes. Add `--preview-detections` to open each promoted crop as it is
+saved; `--preview-viewer` can select a different image viewer. Each live debug
+sample includes a `timing` object with duration
+probe, frame extraction, YOLO, tracking, motion, analysis total, and media-lag
+measurements. Live assist refreshes the DVR duration with `ffprobe` every 5
+seconds and estimates growth between refreshes to avoid spending hundreds of
+milliseconds probing on every sample. Live assist continues `subject-live-####`
+event numbering when restarted against an existing session instead of reusing
+old labels. Overlapping YOLO subject repeats are suppressed for 30 seconds, and
+related labels near the same frame region are grouped so one rider or vehicle is
+less likely to be announced as separate `subject`, `person`, `bicycle`, or
+`motorbike` events. Spoken subject alerts also have a 10-second per-label
+cooldown, so a burst of several detected people still logs each promoted subject
+without saying `person detected` for every one. If YOLO promotes nothing but
+full-frame motion analysis finds a coherent, entity-sized moving component, live
+assist logs a `motion-live-fallback` subject, saves a crop of that moving area, speaks
+`moving subject detected`, and queues that crop through identifier reading.
+Small edge shimmer, flags, and other tiny motion still land in the debug log,
+but are not promoted. When YOLO saw nothing in the same frame, the fallback
+requires a larger motion component before speaking, which helps avoid announcing
+the disappearance/reflection side of the same pass. Motion fallback also checks
+the recent YOLO/fallback subject memory before announcing, so a generic moving
+subject crop should not immediately duplicate a nearby vehicle or rider crop.
+Same-region fallback repeats without a raw YOLO detection are also suppressed for
+30 seconds. Identifier
+reading accepts short race numbers and longer service vehicle unit numbers when
+they are clearly printed on the moving subject. It is still a bridge: the
+desired production path is a persistent Jetson DeepStream/TensorRT detector and
+tracker feeding the same promoted subject and identifier event logs.
 
 For Jetson detector experiments, `subject-scan` currently runs the local
 DeepStream TrafficCamNet detector as a temporary scaffold, passes its objects
