@@ -859,7 +859,7 @@ A profile currently remembers:
 - video device
 - video codec mode
 - video input format
-- audio enabled or disabled
+- audio capture, enabled by default for normal recordings
 - audio device
 - probed audio input rate and channel count
 - probed video size and framerate
@@ -888,7 +888,7 @@ Useful current defaults:
 - preset: `fast`
 - archive format after stop: `mkv`
 
-If `h264_nvenc` is unavailable, the tool falls back to another available encoder such as `libx264`. On Jetson systems, `auto` can use the GStreamer `nvv4l2h264enc` backend for V4L2 video-only recordings, preserving the wall-clock overlay while moving the final H.264 encode onto Jetson hardware:
+If `h264_nvenc` is unavailable, the tool falls back to another available encoder such as `libx264`. On Jetson systems, `auto` can use the GStreamer `nvv4l2h264enc` backend for normal V4L2 recordings, preserving the wall-clock overlay while moving the final H.264 encode onto Jetson hardware:
 
 ```bash
 ./field-replay doctor --no-audio
@@ -896,6 +896,8 @@ If `h264_nvenc` is unavailable, the tool falls back to another available encoder
 ```
 
 Use `--capture-backend gstreamer-jetson` to require that path, or `--capture-backend ffmpeg` to force the older FFmpeg path. The Jetson backend currently supports V4L2 capture with optional ALSA audio; RTSP and direct timelapse recordings use FFmpeg.
+
+Normal `record` and `go` sessions capture audio by default, including when an older saved normal profile had audio disabled. Use `--no-audio` for a deliberately silent normal recording. Direct `--timelapse` recording is always video-only.
 
 If `doctor --no-audio` reports that `/dev/v4l2-nvenc` is missing, the Jetson multimedia encoder device is not exposed to the current system session. Fix the Jetson driver/runtime install or device access first; the GStreamer plugin can be installed while the actual encoder device is still unavailable.
 
@@ -961,7 +963,7 @@ A few common variations:
 
 `export` can create either a normal-speed share copy or a timelapse. In interactive mode it asks for the export type, then offers common timelapse speeds and playback frame rates before showing the final `ffmpeg` command.
 
-`record` and `go` can also write a timelapse directly to the normal growing `timeshift.ts` DVR file with `--timelapse`. By default, this captures one frame every 10 seconds and encodes playback at 20 fps, so the resulting DVR stream is 200x real time while still preserving the wall-clock overlay on each retained frame. Direct timelapse recording is video-only and uses encode mode because frame sampling, timestamp rebuilds, and overlays cannot work with passthrough copy mode.
+`record` and `go` can also write a timelapse directly to the normal growing `timeshift.ts` DVR file with `--timelapse`. By default, this captures one frame every 10 seconds and encodes playback at 20 fps, so the resulting DVR stream is 200x real time while still preserving the wall-clock overlay on each retained frame. Direct timelapse recording is video-only, uses FFmpeg, and uses encode mode because frame sampling, timestamp rebuilds, and overlays cannot work with passthrough copy mode.
 
 Interactive `setup` asks whether the saved recording setup should be a timelapse, then asks for the frame interval and playback FPS when timelapse mode is enabled.
 

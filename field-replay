@@ -46,6 +46,7 @@ COMMON_FRAME_RATES = (30, 25, 15, 10, 5)
 COMMON_VIDEO_INPUT_FORMATS = ("auto", "h264", "mjpeg", "yuyv422", "uyvy422", "nv12")
 COMMON_AUDIO_INPUTS = ((48000, 2), (48000, 1), (44100, 2), (44100, 1), (32000, 1))
 DEFAULT_VIDEO_TIMESTAMP_ENABLED = True
+DEFAULT_RECORD_AUDIO_ENABLED = True
 DEFAULT_VISION_MODEL = "gemma4:e2b"
 DEFAULT_VISION_SAMPLE_INTERVAL = 10.0
 DEFAULT_VISION_TAIL_OFFSET = 4.0
@@ -278,10 +279,11 @@ def source_display_label(args: argparse.Namespace | dict) -> str:
 
 
 def uses_alsa_audio_input(args: argparse.Namespace | dict) -> bool:
-    if isinstance(args, dict):
-        audio_enabled = bool(args.get("audio", True))
-    else:
-        audio_enabled = bool(getattr(args, "audio", True))
+    if is_record_timelapse(args):
+        return False
+    audio_enabled = profile_record_audio_enabled(args) if isinstance(args, dict) else record_audio_setting(args)
+    if audio_enabled is None:
+        audio_enabled = DEFAULT_RECORD_AUDIO_ENABLED
     return audio_enabled and not is_rtsp_source(args)
 
 
@@ -297,6 +299,27 @@ def is_record_timelapse(args: argparse.Namespace | dict) -> bool:
     if isinstance(args, dict):
         return bool(args.get("record_timelapse", False))
     return bool(getattr(args, "record_timelapse", False))
+
+
+def record_audio_setting(args: argparse.Namespace | dict) -> bool | None:
+    if isinstance(args, dict):
+        value = args.get("audio", DEFAULT_RECORD_AUDIO_ENABLED)
+    else:
+        value = getattr(args, "audio", DEFAULT_RECORD_AUDIO_ENABLED)
+    return None if value is None else bool(value)
+
+
+def profile_record_audio_enabled(profile: dict) -> bool:
+    return False if is_record_timelapse(profile) else DEFAULT_RECORD_AUDIO_ENABLED
+
+
+def resolve_record_audio_defaults(args: argparse.Namespace) -> None:
+    if getattr(args, "record_timelapse", None) is None:
+        args.record_timelapse = False
+    if is_record_timelapse(args):
+        return
+    if getattr(args, "audio", None) is None:
+        args.audio = DEFAULT_RECORD_AUDIO_ENABLED
 
 
 def record_timelapse_speed(args: argparse.Namespace | dict) -> float:
@@ -1530,14 +1553,22 @@ def normalize_video_settings(
 def normalize_record_timelapse_settings(args: argparse.Namespace) -> list[str]:
     warnings: list[str] = []
     if not is_record_timelapse(args):
+        resolve_record_audio_defaults(args)
         return warnings
-    if args.audio:
+    if record_audio_setting(args):
         args.audio = False
         warnings.append("direct timelapse recording is video-only; disabling audio")
+    else:
+        args.audio = False
     if args.video_codec_mode == "copy":
         args.video_codec_mode = "encode"
         warnings.append(
             "direct timelapse recording must filter/re-time frames; switching video codec mode to encode"
+        )
+    if getattr(args, "capture_backend", DEFAULT_CAPTURE_BACKEND) == "gstreamer-jetson":
+        args.capture_backend = "ffmpeg"
+        warnings.append(
+            "gstreamer-jetson capture does not support direct timelapse; switching capture backend to ffmpeg"
         )
     return warnings
 
@@ -2719,7 +2750,7 @@ def profile_summary_lines(profile_name: str, profile: dict) -> list[str]:
     audio_label = (
         profile.get("audio_device", "disabled")
         if uses_alsa_audio_input(profile)
-        else ("embedded stream audio" if profile.get("audio", True) else "disabled")
+        else ("embedded stream audio" if profile_record_audio_enabled(profile) else "disabled")
     )
     mode_label = (
         f"{profile.get('video_size', 'source native')} @ {profile.get('framerate', '?')} fps"
@@ -2787,7 +2818,9 @@ def apply_profile(args: argparse.Namespace, profile: dict) -> None:
     args.video_input_format = profile.get(
         "video_input_format", args.video_input_format
     )
-    args.audio = profile.get("audio", args.audio)
+    profile_timelapse = is_record_timelapse(profile)
+    if getattr(args, "audio", None) is None:
+        args.audio = False if profile_timelapse else DEFAULT_RECORD_AUDIO_ENABLED
     args.audio_device = profile.get("audio_device", args.audio_device)
     args.audio_input_rate = profile.get("audio_input_rate", args.audio_input_rate)
     args.audio_input_channels = profile.get(
@@ -2800,7 +2833,8 @@ def apply_profile(args: argparse.Namespace, profile: dict) -> None:
     args.framerate = profile.get("framerate", args.framerate)
     args.video_size = profile.get("video_size", args.video_size)
     if hasattr(args, "record_timelapse"):
-        args.record_timelapse = profile.get("record_timelapse", args.record_timelapse)
+        if getattr(args, "record_timelapse", None) is None:
+            args.record_timelapse = profile.get("record_timelapse", args.record_timelapse)
     if hasattr(args, "timelapse_interval"):
         args.timelapse_interval = profile.get(
             "timelapse_interval", args.timelapse_interval
@@ -2977,6 +3011,7 @@ def command_setup(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
+    resolve_record_audio_defaults(args)
 
     if interactive_mode_enabled(args):
         print()
@@ -10480,7 +10515,7 @@ def run_record_command(args: argparse.Namespace, *, launch_player: bool = False)
     config_path = args.config_file.expanduser()
     config = load_config(config_path)
     profiles = config.get("profiles", {})
-    if not args.profile:
+    if not args.profile and not interactive_mode_enabled(args):
         last_profile = config.get("last_profile")
         if last_profile in profiles:
             args.profile = last_profile
@@ -10505,6 +10540,7 @@ def run_record_command(args: argparse.Namespace, *, launch_player: bool = False)
             print()
             save_config(config_path, config)
         else:
+            resolve_record_audio_defaults(args)
             configure_record_interactively(args, config)
             print()
             if not prompt_yes_no("Start recording now?", default=True):
@@ -12319,7 +12355,7 @@ def profile_source_readiness(profile: dict) -> tuple[str, str]:
 
 
 def profile_audio_readiness(profile: dict) -> tuple[str, str]:
-    if not profile.get("audio", True):
+    if is_record_timelapse(profile):
         return "off", "disabled"
     if is_rtsp_source(profile):
         return "ok", "embedded stream audio"
@@ -15976,7 +16012,7 @@ def add_record_arguments(
     parser.add_argument(
         "--audio",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=None,
         help="Capture audio from the selected source.",
     )
     parser.add_argument(
@@ -16062,7 +16098,7 @@ def add_record_arguments(
         "--timelapse",
         dest="record_timelapse",
         action="store_true",
-        default=False,
+        default=None,
         help=(
             "Record direct-to-DVR timelapse video instead of normal-speed video. "
             "Defaults to one frame every 10 seconds at 20 fps playback."
@@ -16215,7 +16251,7 @@ def build_parser() -> argparse.ArgumentParser:
     setup.add_argument(
         "--audio",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=None,
         help="Include audio in the saved setup.",
     )
     setup.add_argument(
@@ -16268,7 +16304,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--timelapse",
         dest="record_timelapse",
         action="store_true",
-        default=False,
+        default=None,
         help=(
             "Save this recording profile as direct-to-DVR timelapse. "
             "Defaults to one frame every 10 seconds at 20 fps playback."
