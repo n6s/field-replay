@@ -12908,8 +12908,43 @@ def _parse_lock_file(lock_path: Path) -> dict[str, str]:
     return values
 
 
-def _session_by_name(session_list: Sequence[Path]) -> dict[str, Path]:
-    return {session.name: session for session in session_list}
+def _sessions_by_name(session_list: Sequence[Path]) -> dict[str, list[Path]]:
+    sessions_by_name: dict[str, list[Path]] = {}
+    for session in session_list:
+        sessions_by_name.setdefault(session.name, []).append(session)
+    return sessions_by_name
+
+
+def _session_from_name(
+    session_name: str,
+    *,
+    preferred_roots: Sequence[Path] = (),
+    sessions_by_name: dict[str, list[Path]],
+) -> Path | None:
+    for root in preferred_roots:
+        candidate = root.expanduser() / session_name
+        if candidate.exists():
+            return candidate
+
+    candidates = sessions_by_name.get(session_name, [])
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
+
+
+def _profile_recordings_root(
+    config: dict | None,
+    profile_name: str | None,
+) -> Path | None:
+    if not config or not profile_name:
+        return None
+    profile = config.get("profiles", {}).get(profile_name)
+    if not isinstance(profile, dict):
+        return None
+    recordings_dir = profile.get("recordings_dir")
+    if not recordings_dir:
+        return None
+    return Path(recordings_dir).expanduser()
 
 
 def _session_profile_name(session_dir: Path) -> str | None:
@@ -12942,10 +12977,14 @@ def _find_running_record_process(
     sessions: Sequence[Path],
     *,
     selected_profile: str | None = None,
+    config: dict | None = None,
 ) -> tuple[_UiProcessHandle, Path] | None:
-    by_name = _session_by_name(sessions)
+    sessions_by_name = _sessions_by_name(sessions)
     recording_roots = {args.recordings_dir.expanduser()}
     recording_roots.update(session.parent for session in sessions)
+    selected_profile_root = _profile_recordings_root(config, selected_profile)
+    if selected_profile_root is not None:
+        recording_roots.add(selected_profile_root)
     resolved_recording_roots: list[Path] = []
     for root in recording_roots:
         try:
@@ -12975,7 +13014,14 @@ def _find_running_record_process(
         pid = int(pid_text)
         if not _pid_is_running(pid):
             continue
-        session_dir = by_name.get(session_name) or lock_path.parent.parent / session_name
+        lock_root = lock_path.parent.parent
+        session_dir = _session_from_name(
+            session_name,
+            preferred_roots=(lock_root,),
+            sessions_by_name=sessions_by_name,
+        )
+        if session_dir is None:
+            session_dir = lock_root / session_name
         if not session_dir.exists():
             continue
         command = _read_proc_cmdline(pid)
@@ -12999,7 +13045,22 @@ def _find_running_record_process(
         session_name = _command_value_after(command, "--session-name")
         if not session_name:
             continue
-        session_dir = by_name.get(session_name) or args.recordings_dir.expanduser() / session_name
+        command_profile = _command_value_after(command, "--profile")
+        command_recordings_dir = _command_value_after(command, "--recordings-dir")
+        preferred_roots: list[Path] = []
+        if command_recordings_dir:
+            preferred_roots.append(Path(command_recordings_dir).expanduser())
+        profile_root = _profile_recordings_root(config, command_profile or selected_profile)
+        if profile_root is not None:
+            preferred_roots.append(profile_root)
+        preferred_roots.append(args.recordings_dir.expanduser())
+        session_dir = _session_from_name(
+            session_name,
+            preferred_roots=preferred_roots,
+            sessions_by_name=sessions_by_name,
+        )
+        if session_dir is None:
+            session_dir = args.recordings_dir.expanduser() / session_name
         if session_dir.exists():
             if not _record_profile_matches(
                 selected_profile=selected_profile,
@@ -13169,7 +13230,7 @@ def choose_ui_launch_intent(
     config: dict,
 ) -> tuple[dict, str | None, bool, _UiProcessHandle | None, Path | None, str | None]:
     sessions = recent_sessions(args, config)
-    running_record = _find_running_record_process(args, sessions)
+    running_record = _find_running_record_process(args, sessions, config=config)
     if not running_record:
         config, profile_name = choose_ui_start_capture_profile(
             args,
@@ -14952,6 +15013,7 @@ def command_ui_tui(args: argparse.Namespace) -> int:
                 args,
                 session_list,
                 selected_profile=selected_profile,
+                config=config,
             )
             if adopted_record:
                 record_process, record_session = adopted_record
@@ -16730,7 +16792,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ui.add_argument(
         "--profile",
-        help="Preferred recording profile when starting capture from the dashboard.",
+        help="Preferred recording profile when attaching to or starting capture from the dashboard.",
     )
     ui.add_argument(
         "--player",
