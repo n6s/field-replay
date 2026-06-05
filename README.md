@@ -332,10 +332,10 @@ To watch promoted detections as they arrive, add `--preview-detections`:
 ./field-replay assist-live --preview-detections
 ```
 
-The preview opens each promoted full frame in the configured image viewer, with
-the crop as a fallback when only a crop was saved. It defaults to `eog`; with
-`eog`, field replay passes the latest saved evidence frame path with
-`--single-window` so a running viewer can switch to the new image. The dashboard
+The preview opens each promoted full frame in the configured image viewer. It
+defaults to `eog`; with `eog`, field replay passes the latest saved full-frame
+path with `--single-window` so a running viewer can switch to the new image
+while still letting you browse prior frames in the same folder. The dashboard
 asks the same preview question when you choose the live assist action.
 
 ### 1. Check the environment
@@ -654,8 +654,8 @@ across the source-frame diagonal and at least `0.55` directionality. Promoted
 subject lines print immediately in the terminal and speak the subject label;
 identifier crops are queued asynchronously so detector sampling keeps moving,
 and identifier candidates are spoken later as `Possible <number>` when the
-reader finishes. Add `--preview-detections` to open the latest promoted frame as
-it is saved; `--preview-viewer` can select a different image viewer. Each live debug
+reader finishes. Add `--preview-detections` to open the latest promoted full
+frame as it is saved; `--preview-viewer` can select a different image viewer. Each live debug
 sample includes a `timing` object with duration
 probe, frame extraction, YOLO, tracking, motion, analysis total, and media-lag
 measurements. Live assist refreshes the DVR duration with `ffprobe` every 5

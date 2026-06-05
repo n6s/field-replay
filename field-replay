@@ -4541,20 +4541,6 @@ def build_image_viewer_command(
     return command
 
 
-def image_viewer_uses_stable_preview_path(viewer: str) -> bool:
-    return Path(viewer).name == "eog"
-
-
-def update_stable_preview_image(source_path: Path, preview_path: Path) -> Path:
-    ensure_directory(preview_path.parent)
-    temporary_path = preview_path.with_name(
-        f".{preview_path.stem}-{os.getpid()}.tmp{preview_path.suffix}"
-    )
-    shutil.copy2(source_path, temporary_path)
-    os.replace(temporary_path, preview_path)
-    return preview_path
-
-
 def launch_background_viewer(command: Sequence[str]) -> subprocess.Popen[bytes]:
     return subprocess.Popen(
         list(command),
@@ -13327,7 +13313,6 @@ def _open_selected_event_viewer(
     event: dict,
     *,
     use_video: bool,
-    stable_preview: bool = True,
     single_window: bool = True,
 ) -> bool:
     if use_video:
@@ -13356,16 +13341,7 @@ def _open_selected_event_viewer(
     viewer = choose_image_viewer(None)
     if not viewer:
         return False
-    viewer_path = frame_path
-    try:
-        if stable_preview and image_viewer_uses_stable_preview_path(viewer):
-            viewer_path = update_stable_preview_image(
-                frame_path,
-                session_dir / ".latest-evidence-preview.jpg",
-            )
-    except OSError:
-        return False
-    command = build_image_viewer_command(viewer, [viewer_path], single_window=single_window)
+    command = build_image_viewer_command(viewer, [frame_path], single_window=single_window)
     return _launch_background_command(command) is not None
 
 
@@ -13796,20 +13772,14 @@ def command_assist_live(args: argparse.Namespace) -> int:
         nonlocal preview_warning_printed
         if not args.preview_detections or not preview_viewer:
             return
-        image_reference = frame_reference or crop_reference
+        image_reference = frame_reference
         if not image_reference:
             return
         image_path = session_asset_path(session_dir, image_reference)
         if image_path is None or not image_path.exists():
             return
         try:
-            viewer_path = image_path
-            if image_viewer_uses_stable_preview_path(preview_viewer):
-                viewer_path = update_stable_preview_image(
-                    image_path,
-                    yolo_paths["root"] / "latest-detection-preview.jpg",
-                )
-            command = build_image_viewer_command(preview_viewer, [viewer_path])
+            command = build_image_viewer_command(preview_viewer, [image_path])
             launch_background_viewer(command)
             append_jsonl(
                 yolo_paths["debug_log"],
@@ -13820,7 +13790,7 @@ def command_assist_live(args: argparse.Namespace) -> int:
                     "image": image_reference,
                     "crop": crop_reference,
                     "viewer": preview_viewer,
-                    "viewer_image": relative_to_session(viewer_path, session_dir),
+                    "viewer_image": relative_to_session(image_path, session_dir),
                     "ok": True,
                 },
             )
@@ -15085,7 +15055,6 @@ def command_ui_tui(args: argparse.Namespace) -> int:
         session_dir: Path,
         event: dict | None,
         *,
-        stable_preview: bool = True,
         single_window: bool = True,
     ) -> bool:
         if event is None:
@@ -15094,7 +15063,6 @@ def command_ui_tui(args: argparse.Namespace) -> int:
             session_dir,
             event,
             use_video=False,
-            stable_preview=stable_preview,
             single_window=single_window,
         )
 
@@ -15122,7 +15090,6 @@ def command_ui_tui(args: argparse.Namespace) -> int:
         if _open_frame_event(
             session,
             event,
-            stable_preview=False,
             single_window=True,
         ):
             last_opened_frame_ref = frame_key
@@ -15944,7 +15911,6 @@ def command_ui_tui(args: argparse.Namespace) -> int:
                 session,
                 frame_event,
                 use_video=False,
-                stable_preview=False,
                 single_window=True,
             ):
                 messages = _write_status_messages(messages, "Opened latest detected frame")
@@ -17187,8 +17153,8 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=DEFAULT_YOLO_LIVE_PREVIEW_DETECTIONS,
         help=(
-            "Open each promoted live detection frame in an image viewer. "
-            "With eog this refreshes a stable latest-preview image in a reused window."
+            "Open each promoted live detection full frame in an image viewer. "
+            "With eog this refreshes the window with the latest saved frame path."
         ),
     )
     assist_live.add_argument(
