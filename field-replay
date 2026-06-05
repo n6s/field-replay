@@ -108,6 +108,9 @@ DEFAULT_YOLO_LIVE_MOTION_FALLBACK_MAX_COMPONENT_ASPECT = 10.0
 DEFAULT_YOLO_LIVE_MOTION_FALLBACK_REPEAT_SUPPRESS_SECONDS = 30.0
 DEFAULT_YOLO_LIVE_MOTION_FALLBACK_REPEAT_SUPPRESS_IOU = 0.5
 DEFAULT_YOLO_LIVE_PREVIEW_DETECTIONS = False
+DEFAULT_UI_SPEAK_IDENTIFIERS = True
+DEFAULT_UI_SPEAK_SUBJECTS = True
+UI_SUBJECT_CLASS_OPTIONS = ("person", "bicycle", "car", "motorbike", "bus", "truck")
 MOTION_DETECT_MODES = ("smart", "fixed")
 MOTION_SCAN_ENGINES = ("auto", "gstreamer-jetson", "ffmpeg")
 DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
@@ -8333,7 +8336,12 @@ def choose_speech_command(preferred: str | None) -> list[str] | None:
     return [resolved, *parts[1:]]
 
 
-def speak_text(text: str, speech_command: Sequence[str] | None) -> bool:
+def speak_text(
+    text: str,
+    speech_command: Sequence[str] | None,
+    *,
+    speech_output_sink: str | None = None,
+) -> bool:
     if not speech_command:
         return False
     try:
@@ -8343,14 +8351,24 @@ def speak_text(text: str, speech_command: Sequence[str] | None) -> bool:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
+            env=speech_process_env(speech_output_sink),
         )
     except OSError:
         return False
     return True
 
 
-def speak_identifier(number: str, speech_command: Sequence[str] | None) -> bool:
-    return speak_text(f"Possible {number}", speech_command)
+def speak_identifier(
+    number: str,
+    speech_command: Sequence[str] | None,
+    *,
+    speech_output_sink: str | None = None,
+) -> bool:
+    return speak_text(
+        f"Possible {number}",
+        speech_command,
+        speech_output_sink=speech_output_sink,
+    )
 
 
 def subject_speech_text(subject: str | None) -> str:
@@ -8358,6 +8376,81 @@ def subject_speech_text(subject: str | None) -> str:
     if not label or label == "subject":
         return "moving subject detected"
     return f"{label} detected"
+
+
+def speech_process_env(speech_output_sink: str | None) -> dict[str, str] | None:
+    sink = (speech_output_sink or "").strip()
+    if not sink:
+        return None
+    env = os.environ.copy()
+    env["PULSE_SINK"] = sink
+    return env
+
+
+def available_speech_output_sinks() -> list[tuple[str, str]]:
+    pactl = shutil.which("pactl")
+    if not pactl:
+        return []
+    try:
+        result = subprocess.run(
+            [pactl, "list", "short", "sinks"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except OSError:
+        return []
+    sinks: list[tuple[str, str]] = []
+    for line in result.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        name = parts[1].strip()
+        if name:
+            sinks.append((name, name))
+    return sinks
+
+
+def configured_ui_subject_classes(config: dict) -> list[str]:
+    raw = config.get("ui_subject_classes", DEFAULT_YOLO_CLASSES)
+    if isinstance(raw, list):
+        values = [str(item).strip().lower() for item in raw]
+    else:
+        values = [item.strip().lower() for item in str(raw).split(",")]
+    selected = [item for item in values if item]
+    return selected or [item.strip() for item in DEFAULT_YOLO_CLASSES.split(",") if item.strip()]
+
+
+def configured_ui_speech(config: dict) -> tuple[bool, bool, str | None]:
+    return (
+        bool(config.get("ui_speak_identifiers", DEFAULT_UI_SPEAK_IDENTIFIERS)),
+        bool(config.get("ui_speak_subjects", DEFAULT_UI_SPEAK_SUBJECTS)),
+        str(config.get("ui_speech_output_sink") or "").strip() or None,
+    )
+
+
+def save_ui_detection_config(
+    config_path: Path,
+    config: dict,
+    *,
+    subject_classes: Sequence[str],
+    speak_identifiers: bool,
+    speak_subjects: bool,
+    speech_output_sink: str | None,
+) -> bool:
+    config["ui_subject_classes"] = ",".join(subject_classes)
+    config["ui_speak_identifiers"] = bool(speak_identifiers)
+    config["ui_speak_subjects"] = bool(speak_subjects)
+    if speech_output_sink:
+        config["ui_speech_output_sink"] = speech_output_sink
+    else:
+        config.pop("ui_speech_output_sink", None)
+    return save_config(config_path, config)
+
+
+def speech_output_label(speech_output_sink: str | None) -> str:
+    return speech_output_sink or "default"
 
 
 def subject_scan_output_paths(output_root: Path) -> dict[str, Path]:
@@ -12402,7 +12495,6 @@ def _event_label_for_row(event: dict) -> str:
         return str(kind)
     return "event"
 
-
 def _event_row_text(event: dict) -> str:
     wall_label = event.get("w")
     if isinstance(wall_label, str) and wall_label.strip():
@@ -12417,6 +12509,27 @@ def _event_row_text(event: dict) -> str:
         f"frame={event.get('f', '-') or '-'} "
         f"{wall_label}"
     )
+
+
+def _selected_event_detail_lines(event: dict | None) -> list[str]:
+    if event is None:
+        return ["Selection: none"]
+    label = _event_label_for_row(event)
+    lines = [
+        (
+            f"Selection: {label}  src={event.get('_source', '?')}  "
+            f"t={format_duration(event.get('t'))}  conf={event_confidence_label(event)}"
+        )
+    ]
+    subject = event.get("subject")
+    if subject:
+        lines.append(f"Subject:   {subject}")
+    frame = event.get("f") or "-"
+    crop = event.get("crop") or "-"
+    lines.append(f"Frame:     {frame}")
+    lines.append(f"Crop:      {crop}")
+    lines.append("Actions:   4 open frame  v open video  r review query")
+    return lines
 
 
 def _truncate_for_width(value: str, width: int) -> str:
@@ -12758,7 +12871,9 @@ def _find_running_record_process(
         )
 
     for pid, command in _iter_process_cmdlines():
-        if not _command_contains_field_replay(command) or not _command_has_token(command, "go"):
+        if not _command_contains_field_replay(command) or not (
+            _command_has_token(command, "go") or _command_has_token(command, "record")
+        ):
             continue
         session_name = _command_value_after(command, "--session-name")
         if not session_name:
@@ -13025,9 +13140,15 @@ def command_assist_live(args: argparse.Namespace) -> int:
         * (max(args.min_area_pct, 0.0) / 100.0)
     )
     prompt = args.prompt or default_number_scan_prompt()
-    speech_command = choose_speech_command(args.speech_command) if args.speak else None
+    speak_identifiers = bool(args.speak and args.speak_identifiers)
+    speak_subjects = bool(args.speak and args.speak_subjects)
+    speech_command = (
+        choose_speech_command(args.speech_command)
+        if (speak_identifiers or speak_subjects)
+        else None
+    )
     speech_warning_printed = False
-    if args.speak and not speech_command:
+    if (speak_identifiers or speak_subjects) and not speech_command:
         print(
             f"warning: speech command not found: {args.speech_command}",
             file=sys.stderr,
@@ -13079,7 +13200,14 @@ def command_assist_live(args: argparse.Namespace) -> int:
             else "disabled"
         )
     )
-    print("Speech:              " + ("enabled" if args.speak else "disabled"))
+    speech_modes = []
+    if speak_identifiers:
+        speech_modes.append("identifiers")
+    if speak_subjects:
+        speech_modes.append("subjects")
+    print("Speech:              " + (",".join(speech_modes) if speech_modes else "disabled"))
+    if args.speech_output_sink:
+        print(f"Speech output:       {args.speech_output_sink}")
     print(
         "Detection preview:   "
         + (
@@ -13179,8 +13307,12 @@ def command_assist_live(args: argparse.Namespace) -> int:
                     flush=True,
                 )
                 if (
-                    args.speak
-                    and not speak_identifier(number, speech_command)
+                    speak_identifiers
+                    and not speak_identifier(
+                        number,
+                        speech_command,
+                        speech_output_sink=args.speech_output_sink,
+                    )
                     and not speech_warning_printed
                 ):
                     print("warning: could not speak identifier events", file=sys.stderr)
@@ -13189,7 +13321,7 @@ def command_assist_live(args: argparse.Namespace) -> int:
 
     def speak_subject_event(payload: dict, label: str | None) -> None:
         nonlocal speech_warning_printed
-        if not args.speak or not label:
+        if not speak_subjects or not label:
             return
         speech_label = str(label)
         event_t = float(payload.get("t") or 0.0)
@@ -13211,7 +13343,11 @@ def command_assist_live(args: argparse.Namespace) -> int:
             )
             return
         speech_text = subject_speech_text(speech_label)
-        speech_ok = speak_text(speech_text, speech_command)
+        speech_ok = speak_text(
+            speech_text,
+            speech_command,
+            speech_output_sink=args.speech_output_sink,
+        )
         append_jsonl(
             yolo_paths["debug_log"],
             {
@@ -13836,6 +13972,9 @@ def command_assist_live(args: argparse.Namespace) -> int:
                 DEFAULT_YOLO_LIVE_SUBJECT_REPEAT_SUPPRESS_CENTER_PCT
             ),
             "subject_speech_cooldown": args.subject_speech_cooldown,
+            "speak_identifiers": speak_identifiers,
+            "speak_subjects": speak_subjects,
+            "speech_output_sink": args.speech_output_sink,
             "yolo_input_size": args.yolo_input_size,
             "min_movement_pct": args.min_movement_pct,
             "min_directionality": args.min_directionality,
@@ -14210,16 +14349,17 @@ def command_ui_tui(args: argparse.Namespace) -> int:
     import curses
 
     TUI_MIN_WIDTH = 80
-    TUI_MIN_HEIGHT = 18
+    TUI_MIN_HEIGHT = 26
     COLOR_HEADER = 1
     COLOR_PANEL = 2
     COLOR_BUTTON = 3
     COLOR_BUTTON_DISABLED = 4
     COLOR_SELECTED = 5
     COLOR_DIM = 6
+    COLOR_WARNING = 7
     TUI_KEY_HINTS = (
-        "1 start/stop capture  2 watch  3 start/stop assist-live  4 open frame  "
-        "a/d session  j/k events  / search  r review  v video  q quit"
+        "1 capture  2 watch  3 detect  4 frame  r review  "
+        "5 focus  6 speech  8 output  9 audio test  q quit"
     )
 
     def _init_colors() -> None:
@@ -14233,6 +14373,7 @@ def command_ui_tui(args: argparse.Namespace) -> int:
         curses.init_pair(COLOR_BUTTON_DISABLED, curses.COLOR_WHITE, curses.COLOR_BLACK)
         curses.init_pair(COLOR_SELECTED, curses.COLOR_BLACK, curses.COLOR_YELLOW)
         curses.init_pair(COLOR_DIM, curses.COLOR_WHITE, -1)
+        curses.init_pair(COLOR_WARNING, curses.COLOR_BLACK, curses.COLOR_YELLOW)
 
     def _color(pair: int, fallback: int = 0) -> int:
         if curses.has_colors():
@@ -14288,27 +14429,54 @@ def command_ui_tui(args: argparse.Namespace) -> int:
         style = _color(COLOR_SELECTED if selected else COLOR_BUTTON, curses.A_REVERSE)
         if not enabled:
             style = _color(COLOR_BUTTON_DISABLED, curses.A_DIM)
-        text = f"[{button.hotkey}] {button.label}"
         if button.width <= 0:
             return
-        content = f" {text} "
-        _safe_addstr(window, button.y, button.x, content.center(button.width), button.width, style)
+        label_lines = button.label.split("\n", 1)
+        first_line = f"[{button.hotkey}] {label_lines[0]}"
+        second_line = label_lines[1] if len(label_lines) > 1 else ""
+        _safe_addstr(
+            window,
+            button.y,
+            button.x,
+            f" {first_line} ".center(button.width),
+            button.width,
+            style,
+        )
+        _safe_addstr(
+            window,
+            button.y + 1,
+            button.x,
+            f" {second_line} ".center(button.width),
+            button.width,
+            style,
+        )
 
     def _build_buttons(width: int, y: int = 4) -> list[_UiButton]:
-        labels = [
-            ("record", "Capture", "1"),
-            ("watch", "Watch", "2"),
-            ("assist", "Assist", "3"),
-            ("open", "Open", "4"),
-            ("quit", "Quit", "q"),
+        operations = [
+            ("record", "Start\nCapture", "1"),
+            ("watch", "Watch\nDVR", "2"),
+            ("assist", "Start\nDetect", "3"),
+            ("open", "Open\nFrame", "4"),
+            ("review", "Review\nQuery", "r"),
         ]
-        target_width = max(12, (width - (len(labels) + 1) * 3) // len(labels))
+        tuning = [
+            ("subjects", "Detect\nFocus", "5"),
+            ("speech_rules", "Speech\nRules", "6"),
+            ("audio", "Speech\nOutput", "8"),
+            ("test_speaker", "Audio\nTest", "9"),
+            ("quit", "Quit\nUI", "q"),
+        ]
+        rows = [operations, tuning]
+        usable_width = max(20, width - 4)
         buttons: list[_UiButton] = []
-        cursor_x = 2
-        for button_id, label, hotkey in labels:
-            width_hint = max(10, min(24, target_width))
-            buttons.append(_UiButton(button_id, label, hotkey, y, cursor_x, width_hint))
-            cursor_x += width_hint + 3
+        for row_index, row in enumerate(rows):
+            cursor_x = 2
+            cursor_y = y + (row_index * 3)
+            gap_total = max(0, len(row) - 1) * 2
+            width_hint = max(11, min(18, (usable_width - gap_total) // len(row)))
+            for button_id, label, hotkey in row:
+                buttons.append(_UiButton(button_id, label, hotkey, cursor_y, cursor_x, width_hint))
+                cursor_x += width_hint + 2
         return buttons
 
     def _refresh_state() -> None:
@@ -14374,7 +14542,16 @@ def command_ui_tui(args: argparse.Namespace) -> int:
         lines.append(
             "Processes: "
             f"record={'running pid ' + str(record_pid) if record_pid else 'stopped'} "
-            f"assist-live={'running pid ' + str(assist_pid) if assist_pid else 'stopped'}"
+            f"detect={'running pid ' + str(assist_pid) if assist_pid else 'stopped'}"
+        )
+        lines.append(
+            f"Detect classes: {','.join(subject_classes)}"
+        )
+        lines.append(
+            "Speech: "
+            f"ids={'on' if speak_identifiers else 'off'} "
+            f"subjects={'on' if speak_subjects else 'off'} "
+            f"output={speech_output_label(speech_output_sink)}"
         )
         if session_list:
             lines.append(
@@ -14383,6 +14560,14 @@ def command_ui_tui(args: argparse.Namespace) -> int:
         else:
             lines.append("Selected session: (none)")
         return lines
+
+    def _running_ui_process_labels() -> list[str]:
+        labels: list[str] = []
+        if _is_process_running(record_process):
+            labels.append("capture")
+        if _is_process_running(assist_process):
+            labels.append("detect")
+        return labels
 
     def _refresh_events() -> None:
         nonlocal event_rows, selected_event_index
@@ -14409,6 +14594,20 @@ def command_ui_tui(args: argparse.Namespace) -> int:
             return None
         return session_list[selected_session_index]
 
+    def _selected_record_log_path() -> Path | None:
+        if record_session:
+            ffmpeg_log = record_session / "ffmpeg.log"
+            if ffmpeg_log.exists():
+                return ffmpeg_log
+        if record_launch_log and record_launch_log.exists():
+            return record_launch_log
+        session = _selected_session()
+        if session is not None:
+            ffmpeg_log = session / "ffmpeg.log"
+            if ffmpeg_log.exists():
+                return ffmpeg_log
+        return None
+
     def _launch_record() -> bool:
         nonlocal record_process, record_session, record_launch_log
         if not profiles:
@@ -14427,13 +14626,11 @@ def command_ui_tui(args: argparse.Namespace) -> int:
 
         command = [
             *field_replay_command_prefix(args),
-            "go",
+            "record",
             "--profile",
             profile_name,
             "--session-name",
             session_name,
-            "--player",
-            args.player or "mpv",
             "--no-interactive",
         ]
         record_launch_log = _ui_launch_log_path(args, "record", session_name)
@@ -14456,7 +14653,17 @@ def command_ui_tui(args: argparse.Namespace) -> int:
             "assist-live",
             str(session_dir),
             "--no-interactive",
+            "--subject-classes",
+            ",".join(subject_classes),
+            "--speech-output-sink",
+            speech_output_sink or "",
         ]
+        command.append("--speak-identifiers" if speak_identifiers else "--no-speak-identifiers")
+        command.append("--speak-subjects" if speak_subjects else "--no-speak-subjects")
+        if speak_identifiers or speak_subjects:
+            command.append("--speak")
+        else:
+            command.append("--no-speak")
         proc = _launch_background_command(command)
         if proc is None:
             return False
@@ -14477,7 +14684,7 @@ def command_ui_tui(args: argparse.Namespace) -> int:
             return
 
         effective_query = query if query else "all"
-        mode = "frames" if effective_query.lower() in {"all", "frames"} else "summary"
+        mode = "frames"
         command = [
             *field_replay_command_prefix(args),
             "review",
@@ -14530,42 +14737,53 @@ def command_ui_tui(args: argparse.Namespace) -> int:
         )
 
         command_y = 3
-        _draw_panel(stdscr, command_y - 1, 0, 4, w, "Commands")
+        command_height = 9
+        _draw_panel(stdscr, command_y - 1, 0, command_height, w, "Commands")
+        _safe_addstr(stdscr, command_y, 2, "Operations", max(0, w - 4), curses.A_BOLD)
+        _safe_addstr(stdscr, command_y + 3, 2, "Detection / Reporting", max(0, w - 4), curses.A_BOLD)
         buttons = _build_buttons(w, y=command_y + 1)
         for button in buttons:
             if button.button_id == "record":
                 button.label = (
-                    "Stop capture" if _is_process_running(record_process) else "Start capture"
+                    "Stop\nCapture" if _is_process_running(record_process) else "Start\nCapture"
                 )
-                button.width = max(button.width, 16)
             elif button.button_id == "assist":
                 button.label = (
-                    "Stop assist-live" if _is_process_running(assist_process) else "Start assist-live"
+                    "Stop\nDetect" if _is_process_running(assist_process) else "Start\nDetect"
                 )
-                button.width = max(button.width, 16)
+            elif button.button_id == "subjects":
+                button.label = "Detect\nFocus"
+            elif button.button_id == "speech_rules":
+                button.label = "Speech\nRules"
+            elif button.button_id == "audio":
+                button.label = "Speech\nOutput"
+            elif button.button_id == "test_speaker":
+                button.label = "Audio\nTest"
             elif button.button_id == "quit":
-                button.label = "Quit"
+                button.label = "Quit\nUI"
             if button.button_id == "open":
-                button.label = "Open frame"
+                button.label = "Open\nFrame"
+            if button.button_id == "review":
+                button.label = "Review\nQuery"
             if button.button_id == "watch":
-                button.label = "Watch"
+                button.label = "Watch\nDVR"
 
             _draw_button(
                 stdscr,
                 button,
                 selected=False,
-                enabled=button.button_id != "open" or bool(event_rows),
+                enabled=button.button_id not in {"open", "review"} or bool(event_rows),
             )
 
-        top_y = command_y + 4
-        info_height = 7
+        top_y = command_y + command_height
+        info_height = 8
         left_w = max(38, w // 2)
         right_w = w - left_w
         _draw_panel(stdscr, top_y, 0, info_height, left_w, "Status")
         _draw_panel(stdscr, top_y, left_w, info_height, right_w, "Sessions")
 
         status = _status_lines()
-        for index, line in enumerate(status[: info_height - 2]):
+        for index, line in enumerate(status[: max(0, info_height - 3)]):
             _safe_addstr(stdscr, top_y + 1 + index, 2, line, left_w - 4)
 
         profile_text = ", ".join(profiles) if profiles else "(none)"
@@ -14579,7 +14797,7 @@ def command_ui_tui(args: argparse.Namespace) -> int:
         )
 
         if session_list:
-            visible_sessions = session_list[: info_height - 2]
+            visible_sessions = session_list[: max(0, info_height - 2)]
             for index, session in enumerate(visible_sessions):
                 marker = ">" if index == selected_session_index else " "
                 attr = _color(COLOR_SELECTED, curses.A_REVERSE) if index == selected_session_index else 0
@@ -14608,30 +14826,222 @@ def command_ui_tui(args: argparse.Namespace) -> int:
         message_height = 5
         pane_top = search_y + 3
         pane_height = h - pane_top - message_height
-        _draw_panel(stdscr, pane_top, 0, pane_height, w, "Detections")
+        side_by_side = w >= 112
+        if side_by_side:
+            events_w = max(58, (w * 3) // 5)
+            log_x = events_w
+            log_w = w - events_w
+            events_h = log_h = pane_height
+            events_y = log_y = pane_top
+        else:
+            events_w = log_w = w
+            log_x = 0
+            events_y = pane_top
+            events_h = max(7, (pane_height * 2) // 3)
+            log_y = events_y + events_h
+            log_h = max(3, pane_height - events_h)
 
-        start_row = pane_top + 1
-        visible_height = max(0, pane_height - 2)
+        _draw_panel(stdscr, events_y, 0, events_h, events_w, "Evidence")
+        event_start_row = events_y + 1
+        detail_height = 5 if events_h >= 12 else 0
+        event_visible_height = max(0, events_h - 2 - detail_height)
         if not event_rows:
-            _safe_addstr(stdscr, start_row, 2, "No matching detections yet.", w - 4)
+            _safe_addstr(
+                stdscr,
+                event_start_row,
+                2,
+                "No matching detections yet. Use / to query bibs or labels.",
+                events_w - 4,
+            )
         else:
             selected_event_index = min(selected_event_index, len(event_rows) - 1)
-            visible_rows = event_rows[:visible_height]
+            visible_rows = event_rows[:event_visible_height]
             for index, event in enumerate(visible_rows):
                 style = _color(COLOR_SELECTED, curses.A_REVERSE) if index == selected_event_index else 0
                 _safe_addstr(
                     stdscr,
-                    start_row + index,
+                    event_start_row + index,
                     2,
                     _event_row_text(event),
-                    w - 4,
+                    events_w - 4,
                     style,
+                )
+        if detail_height:
+            detail_top = events_y + events_h - detail_height - 1
+            _safe_addstr(
+                stdscr,
+                detail_top,
+                1,
+                "+" + "-" * max(0, events_w - 2) + "+",
+                events_w,
+                _color(COLOR_PANEL, curses.A_BOLD),
+            )
+            selected_event = (
+                event_rows[selected_event_index]
+                if event_rows and selected_event_index < len(event_rows)
+                else None
+            )
+            for index, line in enumerate(_selected_event_detail_lines(selected_event)[: detail_height - 1]):
+                _safe_addstr(
+                    stdscr,
+                    detail_top + 1 + index,
+                    2,
+                    line,
+                    events_w - 4,
+                )
+
+        log_path = _selected_record_log_path()
+        log_title = "FFmpeg Log"
+        if log_path:
+            log_title += f" - {log_path.name}"
+        _draw_panel(stdscr, log_y, log_x, log_h, log_w, log_title)
+        log_start_row = log_y + 1
+        log_visible_height = max(0, log_h - 2)
+        if not log_path:
+            _safe_addstr(
+                stdscr,
+                log_start_row,
+                log_x + 2,
+                "No recorder log selected.",
+                log_w - 4,
+            )
+        else:
+            lines = tail_text_lines(log_path, limit=max(log_visible_height, 1))
+            important = (
+                "error",
+                "fail",
+                "buffer",
+                "overrun",
+                "drop",
+                "non-monotonous",
+                "input/output",
+                "no such device",
+            )
+            for index, line in enumerate(lines[:log_visible_height]):
+                attr = curses.A_BOLD if any(word in line.lower() for word in important) else 0
+                _safe_addstr(
+                    stdscr,
+                    log_start_row + index,
+                    log_x + 2,
+                    line,
+                    log_w - 4,
+                    attr,
                 )
 
         log_top = h - message_height
         _draw_panel(stdscr, log_top, 0, message_height, w, "Messages")
         for line_offset, line in enumerate(messages[-3:]):
             _safe_addstr(stdscr, log_top + 1 + line_offset, 2, line, w - 4)
+
+        if quit_confirm_active:
+            _draw_quit_confirmation(stdscr)
+        if active_dialog:
+            _draw_dialog(stdscr)
+
+    def _draw_quit_confirmation(stdscr: "curses._CursesWindow") -> None:
+        h, w = stdscr.getmaxyx()
+        labels = _running_ui_process_labels()
+        if not labels:
+            return
+        dialog_width = min(max(58, len(", ".join(labels)) + 44), max(20, w - 4))
+        dialog_height = 7
+        y = max(1, (h - dialog_height) // 2)
+        x = max(0, (w - dialog_width) // 2)
+        _draw_panel(stdscr, y, x, dialog_height, dialog_width, "Quit")
+        attr = _color(COLOR_WARNING, curses.A_BOLD)
+        _safe_addstr(
+            stdscr,
+            y + 1,
+            x + 2,
+            f"{', '.join(labels).capitalize()} still running.",
+            dialog_width - 4,
+            attr,
+        )
+        _safe_addstr(
+            stdscr,
+            y + 2,
+            x + 2,
+            "Choose what to do before closing the dashboard:",
+            dialog_width - 4,
+        )
+        _safe_addstr(
+            stdscr,
+            y + 4,
+            x + 2,
+            "[s] Stop and quit    [l] Leave running    [Esc/c] Cancel",
+            dialog_width - 4,
+            curses.A_BOLD,
+        )
+
+    def _dialog_rows() -> list[tuple[str, str, bool]]:
+        if active_dialog == "focus":
+            return [
+                (item, item, item in subject_classes)
+                for item in UI_SUBJECT_CLASS_OPTIONS
+            ]
+        if active_dialog == "speech":
+            return [
+                ("identifiers", "Speak identifier reads", speak_identifiers),
+                ("subjects", "Speak subject detections", speak_subjects),
+            ]
+        if active_dialog == "audio":
+            audio_sinks[:] = available_speech_output_sinks()
+            return [
+                ("", "Default system output", speech_output_sink is None),
+                *[
+                    (sink, label, sink == speech_output_sink)
+                    for sink, label in audio_sinks
+                ],
+            ]
+        return []
+
+    def _dialog_title() -> str:
+        if active_dialog == "focus":
+            return "Detect Focus"
+        if active_dialog == "speech":
+            return "Speech Rules"
+        if active_dialog == "audio":
+            return "Speech Output"
+        return ""
+
+    def _dialog_hint() -> str:
+        if active_dialog in {"focus", "speech"}:
+            return "Up/down move  Space/Enter toggle  d done  Esc cancel"
+        if active_dialog == "audio":
+            return "Up/down move  Enter select output  Esc cancel"
+        return ""
+
+    def _draw_dialog(stdscr: "curses._CursesWindow") -> None:
+        if not active_dialog:
+            return
+        h, w = stdscr.getmaxyx()
+        rows = _dialog_rows()
+        dialog_width = min(max(54, max((len(row[1]) for row in rows), default=20) + 14), max(20, w - 4))
+        dialog_height = min(max(8, len(rows) + 5), max(8, h - 2))
+        y = max(1, (h - dialog_height) // 2)
+        x = max(0, (w - dialog_width) // 2)
+        _draw_panel(stdscr, y, x, dialog_height, dialog_width, _dialog_title())
+        visible_rows = rows[: max(0, dialog_height - 4)]
+        for index, (_, label, checked) in enumerate(visible_rows):
+            marker = "x" if checked else " "
+            prefix = ">" if index == dialog_index else " "
+            attr = _color(COLOR_SELECTED, curses.A_REVERSE) if index == dialog_index else 0
+            _safe_addstr(
+                stdscr,
+                y + 1 + index,
+                x + 2,
+                f"{prefix} [{marker}] {label}",
+                dialog_width - 4,
+                attr,
+            )
+        _safe_addstr(
+            stdscr,
+            y + dialog_height - 2,
+            x + 2,
+            _dialog_hint(),
+            dialog_width - 4,
+            curses.A_BOLD,
+        )
 
     def _handle_click(
         stdscr: "curses._CursesWindow",
@@ -14647,16 +15057,28 @@ def command_ui_tui(args: argparse.Namespace) -> int:
             return True
         h, w = stdscr.getmaxyx()
         command_y = 3
-        top_y = command_y + 4
-        info_height = 7
+        command_height = 9
+        top_y = command_y + command_height
+        info_height = 8
         search_y = top_y + info_height
         pane_top = search_y + 3
         pane_height = h - pane_top - 5
+        side_by_side = w >= 112
+        if side_by_side:
+            events_w = max(58, (w * 3) // 5)
+            events_h = pane_height
+            events_y = pane_top
+        else:
+            events_w = w
+            events_y = pane_top
+            events_h = max(7, (pane_height * 2) // 3)
+        detail_height = 5 if events_h >= 12 else 0
+        event_visible_height = max(0, events_h - 2 - detail_height)
         buttons = _build_buttons(w, y=command_y + 1)
         session = _selected_session()
         for button in buttons:
             if (
-                button.y == my
+                button.y <= my <= button.y + 1
                 and button.x <= mx < button.x + button.width
             ):
                 now = time.monotonic()
@@ -14669,15 +15091,15 @@ def command_ui_tui(args: argparse.Namespace) -> int:
                 last_mouse_action_at = now
                 return _activate_action(button.button_id)
         if (
-            pane_top + 1 <= my < pane_top + pane_height - 1
-            and 0 <= mx < w - 1
+            events_y + 1 <= my < events_y + 1 + event_visible_height
+            and 0 <= mx < events_w - 1
             and event_rows
             and session is not None
         ):
             if not event_rows:
                 return True
-            index = my - pane_top - 1
-            if 0 <= index < min(len(event_rows), max(0, pane_height - 2)):
+            index = my - events_y - 1
+            if 0 <= index < min(len(event_rows), event_visible_height):
                 selected_event_index = index
                 if _open_selected_event_viewer(
                     session,
@@ -14689,8 +15111,161 @@ def command_ui_tui(args: argparse.Namespace) -> int:
                     messages = _write_status_messages(messages, "Selected event has no frame")
         return True
 
+    def _save_ui_state() -> None:
+        save_ui_detection_config(
+            config_path,
+            config,
+            subject_classes=subject_classes,
+            speak_identifiers=speak_identifiers,
+            speak_subjects=speak_subjects,
+            speech_output_sink=speech_output_sink,
+        )
+
+    def _open_dialog(kind: str) -> None:
+        nonlocal active_dialog, dialog_index
+        active_dialog = kind
+        dialog_index = 0
+
+    def _close_dialog(message: str | None = None) -> None:
+        nonlocal active_dialog, dialog_index, messages
+        active_dialog = None
+        dialog_index = 0
+        if message:
+            messages = _write_status_messages(messages, message)
+
+    def _toggle_dialog_row(row_key: str) -> None:
+        nonlocal speak_identifiers, speak_subjects
+        if active_dialog == "focus":
+            if row_key in subject_classes and len(subject_classes) > 1:
+                subject_classes.remove(row_key)
+            elif row_key not in subject_classes:
+                subject_classes.append(row_key)
+            _save_ui_state()
+            return
+        if active_dialog == "speech":
+            if row_key == "identifiers":
+                speak_identifiers = not speak_identifiers
+            elif row_key == "subjects":
+                speak_subjects = not speak_subjects
+            _save_ui_state()
+
+    def _select_audio_row(row_key: str) -> None:
+        nonlocal speech_output_sink
+        speech_output_sink = row_key or None
+        _save_ui_state()
+        _close_dialog(f"Speech output {speech_output_label(speech_output_sink)}")
+
+    def _handle_dialog_key(key: int) -> bool:
+        nonlocal dialog_index
+        rows = _dialog_rows()
+        if key in (27, ord("c"), ord("C")):
+            _close_dialog("Dialog canceled")
+            return True
+        if key in (ord("d"), ord("D")) and active_dialog in {"focus", "speech"}:
+            _close_dialog("Detection/reporting settings saved")
+            return True
+        if key in (curses.KEY_UP, ord("k")) and rows:
+            dialog_index = max(0, dialog_index - 1)
+            return True
+        if key in (curses.KEY_DOWN, ord("j")) and rows:
+            dialog_index = min(len(rows) - 1, dialog_index + 1)
+            return True
+        if ord("1") <= key <= ord("9") and rows:
+            selected = key - ord("1")
+            if 0 <= selected < len(rows):
+                dialog_index = selected
+                row_key = rows[dialog_index][0]
+                if active_dialog == "audio":
+                    _select_audio_row(row_key)
+                else:
+                    _toggle_dialog_row(row_key)
+            return True
+        if key in (curses.KEY_ENTER, 10, 13, ord(" ")):
+            if not rows:
+                _close_dialog()
+                return True
+            row_key = rows[dialog_index][0]
+            if active_dialog == "audio":
+                _select_audio_row(row_key)
+            else:
+                _toggle_dialog_row(row_key)
+            return True
+        return True
+
+    def _test_speaker() -> None:
+        nonlocal messages
+        command = choose_speech_command(DEFAULT_SPEECH_COMMAND)
+        if not command:
+            messages = _write_status_messages(messages, "Speech command not found")
+            return
+        if speak_text(
+            "Field Replay speaker test",
+            command,
+            speech_output_sink=speech_output_sink,
+        ):
+            messages = _write_status_messages(
+                messages,
+                f"Speaker test sent to {speech_output_label(speech_output_sink)}",
+            )
+        else:
+            messages = _write_status_messages(messages, "Speaker test failed")
+
+    def _stop_running_ui_processes_for_quit() -> bool:
+        nonlocal messages, record_process, assist_process
+        ok = True
+        if _is_process_running(assist_process):
+            if _stop_process(assist_process, "assist"):
+                messages = _write_status_messages(messages, "Stopped detect")
+                assist_process = None
+            else:
+                messages = _write_status_messages(messages, "Could not stop detect")
+                ok = False
+        if _is_process_running(record_process):
+            if _stop_process(record_process, "record"):
+                messages = _write_status_messages(messages, "Stopped recording")
+                record_process = None
+            else:
+                messages = _write_status_messages(messages, "Could not stop recording")
+                ok = False
+        return ok
+
+    def _request_quit() -> bool:
+        nonlocal messages, quit_confirm_active
+        if not _running_ui_process_labels():
+            return False
+        quit_confirm_active = True
+        messages = _write_status_messages(
+            messages,
+            "Quit requested; choose stop, leave running, or cancel",
+        )
+        return True
+
+    def _handle_quit_confirmation_key(key: int) -> bool | None:
+        nonlocal messages, quit_confirm_active
+        if key in (27, ord("c"), ord("C")):
+            quit_confirm_active = False
+            messages = _write_status_messages(messages, "Quit canceled")
+            return True
+        if key in (ord("l"), ord("L")):
+            labels = _running_ui_process_labels()
+            quit_confirm_active = False
+            if labels:
+                messages = _write_status_messages(
+                    messages,
+                    f"Leaving {', '.join(labels)} running",
+                )
+            return False
+        if key in (ord("s"), ord("S"), curses.KEY_ENTER, 10, 13):
+            if _stop_running_ui_processes_for_quit():
+                quit_confirm_active = False
+                return False
+            quit_confirm_active = False
+            return True
+        return True
+
     def _activate_action(action_id: str) -> bool:
         nonlocal messages, profile_index, selected_session_index, search_active, record_process, assist_process
+        nonlocal speak_identifiers, speak_subjects
         if action_id == "record":
             if _is_process_running(record_process):
                 if _stop_process(record_process, "record"):
@@ -14733,15 +15308,31 @@ def command_ui_tui(args: argparse.Namespace) -> int:
         if action_id == "assist":
             if _is_process_running(assist_process):
                 if _stop_process(assist_process, "assist"):
-                    messages = _write_status_messages(messages, "Stopped assist-live")
+                    messages = _write_status_messages(messages, "Stopped detect")
                 else:
-                    messages = _write_status_messages(messages, "Could not stop assist-live")
+                    messages = _write_status_messages(messages, "Could not stop detect")
                 assist_process = None
                 return True
             if _launch_assist_live():
-                messages = _write_status_messages(messages, "Started assist-live")
+                messages = _write_status_messages(messages, "Started detect")
             else:
-                messages = _write_status_messages(messages, "Failed to start assist-live")
+                messages = _write_status_messages(messages, "Failed to start detect")
+            return True
+
+        if action_id == "subjects":
+            _open_dialog("focus")
+            return True
+
+        if action_id == "speech_rules":
+            _open_dialog("speech")
+            return True
+
+        if action_id == "audio":
+            _open_dialog("audio")
+            return True
+
+        if action_id == "test_speaker":
+            _test_speaker()
             return True
 
         if action_id == "open":
@@ -14763,12 +15354,12 @@ def command_ui_tui(args: argparse.Namespace) -> int:
             return True
 
         if action_id == "quit":
-            return False
+            return _request_quit()
 
         return True
 
     def _curses_main(stdscr: "curses._CursesWindow") -> int:
-        nonlocal messages, profile_index, record_process, assist_process
+        nonlocal messages, profile_index, record_process, assist_process, quit_confirm_active
         nonlocal search_active, search_query, selected_event_index, selected_session_index
         _init_colors()
         try:
@@ -14802,6 +15393,18 @@ def command_ui_tui(args: argparse.Namespace) -> int:
                     assist_process = None
                 continue
 
+            if quit_confirm_active:
+                if not _running_ui_process_labels():
+                    return 0
+                confirmation_result = _handle_quit_confirmation_key(key)
+                if confirmation_result is False:
+                    return 0
+                continue
+
+            if active_dialog:
+                _handle_dialog_key(key)
+                continue
+
             if search_active:
                 if key in (curses.KEY_ENTER, 10, 13):
                     search_active = False
@@ -14830,9 +15433,24 @@ def command_ui_tui(args: argparse.Namespace) -> int:
                 continue
 
             if key == ord("q") or key == ord("Q"):
-                return 0
-            if key in (ord("1"), ord("2"), ord("3"), ord("4"), ord("Q")):
-                mapping = {49: "record", 50: "watch", 51: "assist", 52: "open", 81: "quit"}
+                if not _request_quit():
+                    return 0
+                continue
+            if key in (
+                ord("1"), ord("2"), ord("3"), ord("4"), ord("5"),
+                ord("6"), ord("8"), ord("9"), ord("Q")
+            ):
+                mapping = {
+                    49: "record",
+                    50: "watch",
+                    51: "assist",
+                    52: "open",
+                    53: "subjects",
+                    54: "speech_rules",
+                    56: "audio",
+                    57: "test_speaker",
+                    81: "quit",
+                }
                 next_action = mapping.get(key)
                 if next_action:
                     if not _activate_action(next_action):
@@ -14921,6 +15539,15 @@ def command_ui_tui(args: argparse.Namespace) -> int:
         profile_index = profiles.index(config.get("last_profile"))
     if not profiles:
         profile_index = 0
+    subject_classes = [
+        item
+        for item in configured_ui_subject_classes(config)
+        if item in UI_SUBJECT_CLASS_OPTIONS
+    ]
+    if not subject_classes:
+        subject_classes = [UI_SUBJECT_CLASS_OPTIONS[0]]
+    speak_identifiers, speak_subjects, speech_output_sink = configured_ui_speech(config)
+    audio_sinks = available_speech_output_sinks()
 
     session_list: list[Path] = []
     selected_session_index = 0
@@ -14935,6 +15562,9 @@ def command_ui_tui(args: argparse.Namespace) -> int:
     event_rows: list[dict] = []
     selected_event_index = 0
     messages: list[str] = ["UI ready"]
+    quit_confirm_active = False
+    active_dialog: str | None = None
+    dialog_index = 0
 
     return curses.wrapper(_curses_main)
 
@@ -15887,12 +16517,28 @@ def build_parser() -> argparse.ArgumentParser:
         "--speak",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Speak promoted identifier candidates aloud.",
+        help="Enable speech for live detections. Refine categories with --speak-identifiers and --speak-subjects.",
+    )
+    assist_live.add_argument(
+        "--speak-identifiers",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Speak promoted identifier candidates aloud when speech is enabled.",
+    )
+    assist_live.add_argument(
+        "--speak-subjects",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Speak promoted subject detections aloud when speech is enabled.",
     )
     assist_live.add_argument(
         "--speech-command",
         default=DEFAULT_SPEECH_COMMAND,
         help="Speech command for --speak, such as spd-say or espeak-ng.",
+    )
+    assist_live.add_argument(
+        "--speech-output-sink",
+        help="PulseAudio/PipeWire sink name to prefer for speech output.",
     )
     assist_live.add_argument(
         "--preview-detections",

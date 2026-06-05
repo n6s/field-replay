@@ -207,13 +207,21 @@ For event use, start with the operator control plane:
 The dashboard is a ncurses control plane with an old-school pane layout:
 
 - profile + recent session visibility
-- controls to start/stop recording (with player launch), watch a session, and
-  start/stop live assist (`assist-live`) for the selected session
-- a bottom pane showing the latest detection events
+- controls to start/stop recording, watch a session, and start/stop live
+  detection (`assist-live`) for the selected session
+- two-line command buttons grouped into operations and detection/reporting
+- picker dialogs for detect focus, speech rules, and speech output, with choices
+  remembered in the normal config
+- a persistent evidence pane for latest detections plus selected-event details
+- a persistent `ffmpeg` log pane for capture warnings while recording
 - quick bib/label filtering (`/` or `_`, then type your query)
-- quick actions to open the selected evidence frame (`4`) or launch review (`r`)
+- quick actions to open the selected evidence frame (`4`), open event video
+  (`v`), or launch review for the current query (`r`)
+- speech output selection (`8`) and an audio test (`9`) for detection speech
 
-Mouse clicks on the top buttons and event rows are supported.
+Mouse clicks on the top buttons and event rows are supported. If capture or
+detect is still running, `q` opens a quit confirmation with choices to stop the
+running subprocesses, leave them running, or cancel and return to the dashboard.
 
 Legacy mode is still available if you want the previous text menu flow:
 
@@ -224,9 +232,11 @@ Legacy mode is still available if you want the previous text menu flow:
 Lower-level commands remain available for setup and debugging, but this control
 surface is the default operator entry point.
 
-If the dashboard exits unexpectedly, background recording or live assist
-processes are left alone. Reopen `./field-replay ui` and it will reattach to
-matching running processes for recent sessions when it can identify them.
+If the dashboard exits unexpectedly, or if you choose to leave subprocesses
+running from the quit confirmation, background recording or live assist
+processes are left alone. Reopen `./field-replay ui` with the same recordings
+root and it will reattach to matching running processes for recent sessions when
+it can identify them.
 
 When the dashboard runs the assist pass, identifier candidates are spoken aloud
 with the local speech command when available, while also being written to the
@@ -288,10 +298,20 @@ YOLO subject tracks that make directional progress through the frame, reads
 tentative race identifiers from the promoted crops, prints them, speaks them
 when a local speech command is available, and appends evidence under
 `yolo-live/` and `number-live/`. The default operator path is still the
-dashboard; this command exists so a second terminal tab can be dedicated to the
-live assistant during field testing. Reopen `./field-replay ui` in another
-terminal to see the latest promoted evidence count and live debug freshness
-without tailing log files manually.
+dashboard; this command exists for direct testing and second-terminal field
+work.
+
+Live speech can be narrowed without disabling all detection output:
+
+```bash
+./field-replay assist-live --no-speak-subjects
+./field-replay assist-live --no-speak-identifiers
+./field-replay assist-live --speech-output-sink alsa_output.usb-speaker
+```
+
+The dashboard exposes the same choices through dialogs: `5` opens detect focus
+checkboxes, `6` opens speech rule checkboxes, `8` opens a PulseAudio/PipeWire
+output picker when `pactl` is available, and `9` sends an audio test.
 
 To watch promoted detections as they arrive, add `--preview-detections`:
 
