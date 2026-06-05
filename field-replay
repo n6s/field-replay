@@ -14633,8 +14633,18 @@ def command_ui_tui(args: argparse.Namespace) -> int:
         for line_offset, line in enumerate(messages[-3:]):
             _safe_addstr(stdscr, log_top + 1 + line_offset, 2, line, w - 4)
 
-    def _handle_click(stdscr: "curses._CursesWindow", my: int, mx: int) -> bool:
-        nonlocal selected_event_index, messages
+    def _handle_click(
+        stdscr: "curses._CursesWindow",
+        my: int,
+        mx: int,
+        bstate: int,
+    ) -> bool:
+        nonlocal selected_event_index, messages, last_mouse_action_id, last_mouse_action_at
+        click_state = 0
+        for state_name in ("BUTTON1_CLICKED", "BUTTON1_PRESSED"):
+            click_state |= getattr(curses, state_name, 0)
+        if click_state and not (bstate & click_state):
+            return True
         h, w = stdscr.getmaxyx()
         command_y = 3
         top_y = command_y + 4
@@ -14649,6 +14659,14 @@ def command_ui_tui(args: argparse.Namespace) -> int:
                 button.y == my
                 and button.x <= mx < button.x + button.width
             ):
+                now = time.monotonic()
+                if (
+                    last_mouse_action_id == button.button_id
+                    and now - last_mouse_action_at < 0.5
+                ):
+                    return True
+                last_mouse_action_id = button.button_id
+                last_mouse_action_at = now
                 return _activate_action(button.button_id)
         if (
             pane_top + 1 <= my < pane_top + pane_height - 1
@@ -14841,10 +14859,10 @@ def command_ui_tui(args: argparse.Namespace) -> int:
 
             if key in (curses.KEY_MOUSE,):
                 try:
-                    _, mx, my, _, _ = curses.getmouse()
+                    _, mx, my, _, bstate = curses.getmouse()
                 except curses.error:
                     continue
-                if not _handle_click(stdscr, my, mx):
+                if not _handle_click(stdscr, my, mx, bstate):
                     return 0
                 continue
 
@@ -14912,6 +14930,8 @@ def command_ui_tui(args: argparse.Namespace) -> int:
     assist_process: subprocess.Popen[bytes] | _UiProcessHandle | None = None
     record_session: Path | None = None
     record_launch_log: Path | None = None
+    last_mouse_action_id: str | None = None
+    last_mouse_action_at = 0.0
     event_rows: list[dict] = []
     selected_event_index = 0
     messages: list[str] = ["UI ready"]
