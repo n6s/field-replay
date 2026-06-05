@@ -13184,9 +13184,12 @@ def _running_record_for_session(
 
 def _find_running_assist_process(
     sessions: Sequence[Path],
+    *,
+    target_session: Path | None = None,
 ) -> tuple[_UiProcessHandle, Path] | None:
+    candidates = [target_session] if target_session is not None else list(sessions)
     session_paths = []
-    for session in sessions:
+    for session in candidates:
         try:
             resolved = str(session.resolve())
         except OSError:
@@ -15206,9 +15209,27 @@ def command_ui_tui(args: argparse.Namespace) -> int:
     def _session_in_list(session_dir: Path) -> bool:
         return any(_same_session_path(candidate, session_dir) for candidate in session_list)
 
+    def _assist_target_session() -> Path | None:
+        if record_session and _is_process_running(record_process):
+            return record_session
+        return _selected_session()
+
+    def _assist_process_matches_session(session_dir: Path | None) -> bool:
+        if (
+            session_dir is None
+            or assist_session is None
+            or not _is_process_running(assist_process)
+        ):
+            return False
+        return _same_session_path(assist_session, session_dir)
+
+    def _is_current_assist_running() -> bool:
+        return _assist_process_matches_session(_assist_target_session())
+
     def _refresh_state() -> None:
         nonlocal session_list, selected_session_index, user_selected_session, selected_session_hint
-        nonlocal record_process, record_session, record_launch_log, assist_process, messages
+        nonlocal record_process, record_session, record_launch_log, assist_process
+        nonlocal assist_session, detect_attach_enabled, messages
         nonlocal pending_open_frame
         session_list = recent_sessions(args, config)
         if record_session and not _session_in_list(record_session):
@@ -15250,9 +15271,19 @@ def command_ui_tui(args: argparse.Namespace) -> int:
                     messages,
                     f"Reattached recording pid {_process_pid(record_process)}",
                 )
-        if not _is_process_running(assist_process):
+        if _is_process_running(assist_process) and not _assist_process_matches_session(
+            _assist_target_session()
+        ):
             assist_process = None
-            adopted_assist = _find_running_assist_process(session_list)
+            assist_session = None
+        if detect_attach_enabled and not _is_process_running(assist_process):
+            assist_process = None
+            assist_session = None
+            assist_target = _assist_target_session()
+            adopted_assist = _find_running_assist_process(
+                session_list,
+                target_session=assist_target,
+            )
             if adopted_assist:
                 assist_process, assist_session = adopted_assist
                 if not _session_in_list(assist_session):
@@ -15287,7 +15318,10 @@ def command_ui_tui(args: argparse.Namespace) -> int:
             lines.append("Recording session: (none)")
         lines.append(f"Active profile: {profile}")
         record_pid = _process_pid(record_process) if _is_process_running(record_process) else None
-        assist_pid = _process_pid(assist_process) if _is_process_running(assist_process) else None
+        assist_pid = _process_pid(assist_process) if _is_current_assist_running() else None
+        assist_detail = f"running pid {assist_pid}" if assist_pid else "stopped"
+        if assist_pid and assist_session is not None:
+            assist_detail += f" on {assist_session.name}"
         if _is_process_running(record_process):
             capture_mode = "attached"
         elif record_attach_enabled:
@@ -15297,7 +15331,7 @@ def command_ui_tui(args: argparse.Namespace) -> int:
         lines.append(
             "Processes: "
             f"record={'running pid ' + str(record_pid) if record_pid else 'stopped'} "
-            f"detect={'running pid ' + str(assist_pid) if assist_pid else 'stopped'} "
+            f"detect={assist_detail} "
             f"mode={capture_mode}"
         )
         lines.append(
@@ -15326,7 +15360,7 @@ def command_ui_tui(args: argparse.Namespace) -> int:
         labels: list[str] = []
         if _is_process_running(record_process):
             labels.append("capture")
-        if _is_process_running(assist_process):
+        if _is_current_assist_running():
             labels.append("detect")
         return labels
 
@@ -15424,7 +15458,7 @@ def command_ui_tui(args: argparse.Namespace) -> int:
 
     def _launch_record() -> bool:
         nonlocal record_process, record_session, record_launch_log, record_attach_enabled
-        nonlocal user_selected_session
+        nonlocal user_selected_session, detect_attach_enabled
         if not profiles:
             return False
         profile_name = profiles[profile_index]
@@ -15457,14 +15491,23 @@ def command_ui_tui(args: argparse.Namespace) -> int:
             return False
         record_process = proc
         record_attach_enabled = True
+        detect_attach_enabled = True
         user_selected_session = False
         return True
 
     def _launch_assist_live() -> bool:
-        nonlocal assist_process
+        nonlocal assist_process, assist_session, detect_attach_enabled
         session_dir = _selected_session()
         if session_dir is None:
             return False
+        adopted_assist = _find_running_assist_process(
+            session_list,
+            target_session=session_dir,
+        )
+        if adopted_assist:
+            assist_process, assist_session = adopted_assist
+            detect_attach_enabled = True
+            return True
         command = [
             *field_replay_command_prefix(args),
             "assist-live",
@@ -15488,6 +15531,8 @@ def command_ui_tui(args: argparse.Namespace) -> int:
         if proc.poll() is not None:
             return False
         assist_process = proc
+        assist_session = session_dir
+        detect_attach_enabled = True
         return True
 
     def _launch_review(query: str) -> None:
@@ -15732,7 +15777,7 @@ def command_ui_tui(args: argparse.Namespace) -> int:
                 )
             elif button.button_id == "assist":
                 button.label = (
-                    "Stop\nDetect" if _is_process_running(assist_process) else "Start\nDetect"
+                    "Stop\nDetect" if _is_current_assist_running() else "Start\nDetect"
                 )
             elif button.button_id == "subjects":
                 button.label = "Detect\nFocus"
@@ -16004,7 +16049,7 @@ def command_ui_tui(args: argparse.Namespace) -> int:
 
     def _switch_profile(row_key: str) -> bool:
         nonlocal profile_index, record_process, record_session, record_launch_log
-        nonlocal user_selected_session
+        nonlocal user_selected_session, assist_process, assist_session, detect_attach_enabled
         if row_key not in profiles:
             return False
         old_profile = profiles[profile_index] if profiles else None
@@ -16014,6 +16059,9 @@ def command_ui_tui(args: argparse.Namespace) -> int:
         record_process = None
         record_session = None
         record_launch_log = None
+        assist_process = None
+        assist_session = None
+        detect_attach_enabled = False
         user_selected_session = False
         config["last_profile"] = row_key
         save_config(config_path, config)
@@ -16080,12 +16128,13 @@ def command_ui_tui(args: argparse.Namespace) -> int:
             messages = _write_status_messages(messages, "Speaker test failed")
 
     def _stop_running_ui_processes_for_quit() -> bool:
-        nonlocal messages, record_process, assist_process
+        nonlocal messages, record_process, assist_process, assist_session
         ok = True
-        if _is_process_running(assist_process):
+        if _is_current_assist_running():
             if _stop_process(assist_process, "assist"):
                 messages = _write_status_messages(messages, "Stopped detect")
                 assist_process = None
+                assist_session = None
             else:
                 messages = _write_status_messages(messages, "Could not stop detect")
                 ok = False
@@ -16133,7 +16182,8 @@ def command_ui_tui(args: argparse.Namespace) -> int:
         return True
 
     def _activate_action(action_id: str) -> bool:
-        nonlocal messages, profile_index, selected_session_index, search_active, record_process, assist_process
+        nonlocal messages, profile_index, selected_session_index, search_active
+        nonlocal record_process, assist_process, assist_session
         nonlocal pending_open_frame, last_opened_frame_ref
         nonlocal speak_identifiers, speak_subjects
         if action_id == "record":
@@ -16176,12 +16226,13 @@ def command_ui_tui(args: argparse.Namespace) -> int:
             return True
 
         if action_id == "assist":
-            if _is_process_running(assist_process):
+            if _is_current_assist_running():
                 if _stop_process(assist_process, "assist"):
                     messages = _write_status_messages(messages, "Stopped detect")
                 else:
                     messages = _write_status_messages(messages, "Could not stop detect")
                 assist_process = None
+                assist_session = None
                 return True
             if _launch_assist_live():
                 messages = _write_status_messages(messages, "Started detect")
@@ -16256,7 +16307,8 @@ def command_ui_tui(args: argparse.Namespace) -> int:
         return True
 
     def _curses_main(stdscr: "curses._CursesWindow") -> int:
-        nonlocal messages, profile_index, record_process, assist_process, quit_confirm_active
+        nonlocal messages, profile_index, record_process, assist_process
+        nonlocal assist_session, detect_attach_enabled, quit_confirm_active
         nonlocal last_opened_frame_ref
         nonlocal search_active, search_query, selected_event_index, selected_session_index
         nonlocal user_selected_session
@@ -16291,6 +16343,7 @@ def command_ui_tui(args: argparse.Namespace) -> int:
                     record_process = None
                 if not _is_process_running(assist_process):
                     assist_process = None
+                    assist_session = None
                 continue
 
             if quit_confirm_active:
@@ -16457,6 +16510,7 @@ def command_ui_tui(args: argparse.Namespace) -> int:
                         else (selected_session_index - 1) % len(session_list)
                     )
                     user_selected_session = True
+                    detect_attach_enabled = True
                     selected_event_index = 0
                     _refresh_events()
                 continue
@@ -16468,6 +16522,7 @@ def command_ui_tui(args: argparse.Namespace) -> int:
                         else (selected_session_index + 1) % len(session_list)
                     )
                     user_selected_session = True
+                    detect_attach_enabled = True
                     selected_event_index = 0
                     _refresh_events()
                 continue
@@ -16535,6 +16590,8 @@ def command_ui_tui(args: argparse.Namespace) -> int:
     search_active = False
     record_process: subprocess.Popen[bytes] | _UiProcessHandle | None = initial_record_process
     assist_process: subprocess.Popen[bytes] | _UiProcessHandle | None = None
+    assist_session: Path | None = None
+    detect_attach_enabled = initial_record_session is not None or initial_selected_session is not None
     record_session: Path | None = initial_record_session
     record_launch_log: Path | None = None
     last_mouse_action_id: str | None = None
