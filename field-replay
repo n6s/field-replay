@@ -13335,6 +13335,25 @@ def _event_image_path(session_dir: Path, event: dict | None) -> Path | None:
     return None
 
 
+def _event_full_frame_reference(event: dict | None) -> str | None:
+    if not event:
+        return None
+    frame_reference = event.get("f")
+    if not frame_reference:
+        return None
+    return str(frame_reference)
+
+
+def _event_full_frame_path(session_dir: Path, event: dict | None) -> Path | None:
+    reference = _event_full_frame_reference(event)
+    if not reference:
+        return None
+    frame_path = session_asset_path(session_dir, reference)
+    if frame_path is None or not frame_path.exists():
+        return None
+    return frame_path.resolve()
+
+
 def _event_image_paths_for_event(session_dir: Path, event: dict | None) -> list[Path]:
     image_paths: list[Path] = []
     seen_paths: set[Path] = set()
@@ -13413,7 +13432,7 @@ def _open_selected_event_viewer(
         )
         return _launch_background_command(command) is not None
 
-    frame_path = _event_image_path(session_dir, event)
+    frame_path = _event_full_frame_path(session_dir, event)
     if frame_path is None:
         return False
     viewer = choose_image_viewer(None)
@@ -13439,14 +13458,11 @@ def _event_video_target_path(session_dir: Path) -> Path | None:
 
 
 def _event_frame_reference(event: dict | None) -> str | None:
-    if not event:
-        return None
-    references = _event_image_references(event)
-    return references[0] if references else None
+    return _event_full_frame_reference(event)
 
 
 def _event_has_existing_frame(session_dir: Path, event: dict | None) -> bool:
-    return _event_image_path(session_dir, event) is not None
+    return _event_full_frame_path(session_dir, event) is not None
 
 
 def _event_frame_open_key(session_dir: Path, event: dict | None) -> str | None:
@@ -16002,18 +16018,27 @@ def command_ui_tui(args: argparse.Namespace) -> int:
             if session is None:
                 messages = _write_status_messages(messages, "No session selected")
                 return True
-            frame_event = _latest_event_with_frame(session)
+            frame_event = (
+                event_rows[selected_event_index]
+                if event_rows and selected_event_index < len(event_rows)
+                else _latest_event_with_frame(session)
+            )
             if frame_event and _open_selected_event_viewer(
                 session,
                 frame_event,
                 use_video=False,
                 single_window=True,
             ):
-                messages = _write_status_messages(messages, "Opened latest detected frame")
+                messages = _write_status_messages(messages, "Opened selected evidence frame")
                 frame_key = _event_frame_open_key(session, frame_event)
                 if frame_key:
                     last_opened_frame_ref = frame_key
                 pending_open_frame = False
+            elif event_rows:
+                messages = _write_status_messages(
+                    messages,
+                    "Selected event has no saved frame",
+                )
             else:
                 pending_open_frame = True
                 messages = _write_status_messages(
