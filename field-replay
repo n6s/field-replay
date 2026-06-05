@@ -12489,6 +12489,56 @@ def _launch_background_command(command: Sequence[str]) -> subprocess.Popen[bytes
         return None
 
 
+def _ui_launch_log_path(
+    args: argparse.Namespace,
+    label: str,
+    session_name: str | None = None,
+) -> Path:
+    log_root = args.recordings_dir.expanduser() / ".ui-launch-logs"
+    ensure_directory(log_root)
+    timestamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
+    stem = session_name or timestamp
+    return log_root / f"{stem}-{label}.log"
+
+
+def _launch_background_command_logged(
+    command: Sequence[str],
+    log_path: Path,
+) -> subprocess.Popen[bytes] | None:
+    try:
+        ensure_directory(log_path.parent)
+        log_handle = log_path.open("ab")
+        log_handle.write(
+            (
+                f"\n=== {datetime.now().astimezone().isoformat()} start ===\n"
+                f"{shlex.join(command)}\n"
+            ).encode("utf-8")
+        )
+        log_handle.flush()
+        return subprocess.Popen(
+            list(command),
+            stdin=subprocess.DEVNULL,
+            stdout=log_handle,
+            stderr=log_handle,
+            start_new_session=True,
+        )
+    except OSError:
+        return None
+
+
+def _ui_last_log_line(log_path: Path | None) -> str | None:
+    if log_path is None:
+        return None
+    lines = [
+        line.strip()
+        for line in tail_text_lines(log_path, limit=20)
+        if line.strip() and not line.startswith("===")
+    ]
+    if not lines:
+        return None
+    return lines[-1]
+
+
 def _wait_for_pid_exit(pid: int, timeout_seconds: float) -> bool:
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
@@ -14263,15 +14313,29 @@ def command_ui_tui(args: argparse.Namespace) -> int:
 
     def _refresh_state() -> None:
         nonlocal session_list, selected_session_index
-        nonlocal record_process, record_session, assist_process, messages
+        nonlocal record_process, record_session, record_launch_log, assist_process, messages
         session_list = recent_sessions(args, config)
         if record_session and record_session not in session_list:
             session_list.insert(0, record_session)
         if not session_list:
             selected_session_index = 0
             return
-        if not _is_process_running(record_process):
+        if record_process is not None and not _is_process_running(record_process):
+            if not isinstance(record_process, _UiProcessHandle):
+                detail = _ui_last_log_line(record_launch_log)
+                exit_code = record_process.poll()
+                if detail:
+                    messages = _write_status_messages(
+                        messages,
+                        f"Recording exited {exit_code}: {detail}",
+                    )
+                else:
+                    messages = _write_status_messages(
+                        messages,
+                        f"Recording exited {exit_code}",
+                    )
             record_process = None
+        if record_process is None:
             adopted_record = _find_running_record_process(args, session_list)
             if adopted_record:
                 record_process, record_session = adopted_record
@@ -14346,19 +14410,20 @@ def command_ui_tui(args: argparse.Namespace) -> int:
         return session_list[selected_session_index]
 
     def _launch_record() -> bool:
-        nonlocal record_process, record_session
+        nonlocal record_process, record_session, record_launch_log
         if not profiles:
             return False
         profile_name = profiles[profile_index]
         profile = config.get("profiles", {}).get(profile_name, {}) if config else {}
         session_prefix = str(profile.get("session_prefix") or DEFAULT_SESSION_PREFIX)
         session_name = default_session_name(session_prefix)
-        record_session = args.recordings_dir / session_name
+        recordings_root = Path(profile.get("recordings_dir") or args.recordings_dir).expanduser()
+        record_session = recordings_root / session_name
         if record_session.exists():
             session_name = (
                 f"{session_prefix}-{int(time.time())}"
             )
-            record_session = args.recordings_dir / session_name
+            record_session = recordings_root / session_name
 
         command = [
             *field_replay_command_prefix(args),
@@ -14371,7 +14436,8 @@ def command_ui_tui(args: argparse.Namespace) -> int:
             args.player or "mpv",
             "--no-interactive",
         ]
-        proc = _launch_background_command(command)
+        record_launch_log = _ui_launch_log_path(args, "record", session_name)
+        proc = _launch_background_command_logged(command, record_launch_log)
         if proc is None:
             return False
         time.sleep(0.1)
@@ -14622,6 +14688,13 @@ def command_ui_tui(args: argparse.Namespace) -> int:
                 messages = _write_status_messages(messages, "Started recording")
                 _refresh_state()
             else:
+                detail = _ui_last_log_line(record_launch_log)
+                if detail:
+                    messages = _write_status_messages(
+                        messages,
+                        f"Failed to launch capture: {detail}",
+                    )
+                    return True
                 messages = _write_status_messages(
                     messages,
                     "Failed to launch capture command",
@@ -14838,6 +14911,7 @@ def command_ui_tui(args: argparse.Namespace) -> int:
     record_process: subprocess.Popen[bytes] | _UiProcessHandle | None = None
     assist_process: subprocess.Popen[bytes] | _UiProcessHandle | None = None
     record_session: Path | None = None
+    record_launch_log: Path | None = None
     event_rows: list[dict] = []
     selected_event_index = 0
     messages: list[str] = ["UI ready"]
