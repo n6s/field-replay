@@ -239,8 +239,11 @@ You can also open a known session directly:
 ./field-replay ui /path/to/session-dir
 ```
 
-Recording still starts from the TUI with `1`, so there is a final status check
-before a camera begins writing.
+Recording starts and stops from the TUI with `1`. If the selected session is
+stopped and already has a `timeshift.ts`, starting capture resumes that session
+by appending new DVR data to the existing TS file and refreshing `archive.*`
+when capture stops again. If no stopped DVR session is selected, the dashboard
+starts a new timestamped session.
 
 Mouse clicks on the bottom command cells and event rows are supported. If capture or
 detect is still running, `q` opens a quit confirmation with choices to stop the

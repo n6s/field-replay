@@ -870,7 +870,11 @@ def build_ffmpeg_command(paths: SessionPaths, args: argparse.Namespace) -> list[
             "0",
             "-muxpreload",
             "0",
-            str(paths.timeshift_path.name),
+            (
+                "pipe:1"
+                if getattr(args, "resume_session", False)
+                else str(paths.timeshift_path.name)
+            ),
         ]
     )
     return command
@@ -1164,6 +1168,8 @@ def build_gstreamer_jetson_command(paths: SessionPaths, args: argparse.Namespace
         "filesink",
         f"location={paths.timeshift_path.name}",
     ]
+    if getattr(args, "resume_session", False):
+        command.append("append=true")
     command.extend(gst_jetson_encoded_video_chain(args))
     command.append("mux.")
     if args.audio:
@@ -3739,15 +3745,27 @@ def release_device_locks(lock_paths: Sequence[Path]) -> None:
             continue
 
 
-def wait_for_capture_output(paths: SessionPaths, process: subprocess.Popen[bytes], timeout_seconds: float = 5.0) -> bool:
+def wait_for_capture_output(
+    paths: SessionPaths,
+    process: subprocess.Popen[bytes],
+    timeout_seconds: float = 5.0,
+    *,
+    initial_size: int = 0,
+) -> bool:
     deadline = time.time() + timeout_seconds
     while time.time() < deadline:
-        if has_timeshift_session(paths):
+        if (
+            has_timeshift_session(paths)
+            and paths.timeshift_path.stat().st_size > initial_size
+        ):
             return True
         if process.poll() is not None:
             return False
         time.sleep(0.2)
-    return has_timeshift_session(paths)
+    return (
+        has_timeshift_session(paths)
+        and paths.timeshift_path.stat().st_size > initial_size
+    )
 
 
 def update_latest_symlink(paths: SessionPaths) -> None:
@@ -3807,10 +3825,14 @@ def write_metadata(
     exit_code: int | None = None,
     archive_status: str | None = None,
 ) -> None:
+    now = datetime.now().astimezone().isoformat()
+    existing = load_json_file(paths.metadata_path)
+    created_at = existing.get("created_at") if isinstance(existing, dict) else None
     payload = {
         "state": state,
         "profile": getattr(args, "profile", None),
-        "created_at": datetime.now().astimezone().isoformat(),
+        "created_at": created_at or now,
+        "updated_at": now,
         "session_dir": str(paths.session_dir),
         "archive_path": str(paths.archive_path),
         "timeshift_path": str(paths.timeshift_path),
@@ -3846,6 +3868,7 @@ def write_metadata(
         "preset": args.preset,
         "archive_format": args.archive_format,
         "capture_backend": getattr(args, "capture_backend", "ffmpeg"),
+        "resume_session": getattr(args, "resume_session", False),
         "capture_command": list(ffmpeg_command),
         "ffmpeg_command": list(ffmpeg_command),
         "exit_code": exit_code,
@@ -10520,6 +10543,11 @@ def run_record_command(args: argparse.Namespace, *, launch_player: bool = False)
     config_path = args.config_file.expanduser()
     config = load_config(config_path)
     profiles = config.get("profiles", {})
+    explicit_resume_recordings_dir = (
+        args.recordings_dir.expanduser()
+        if getattr(args, "resume_session", False) and "--recordings-dir" in sys.argv
+        else None
+    )
     if not args.profile and not interactive_mode_enabled(args):
         last_profile = config.get("last_profile")
         if last_profile in profiles:
@@ -10530,6 +10558,8 @@ def run_record_command(args: argparse.Namespace, *, launch_player: bool = False)
             print(f"profile not found: {args.profile}", file=sys.stderr)
             return 1
         apply_profile(args, profile)
+        if explicit_resume_recordings_dir is not None:
+            args.recordings_dir = explicit_resume_recordings_dir
         config["last_profile"] = args.profile
 
     if interactive_mode_enabled(args):
@@ -10634,7 +10664,21 @@ def run_record_command(args: argparse.Namespace, *, launch_player: bool = False)
             )
         return 0
 
-    if paths.session_dir.exists():
+    resume_session = getattr(args, "resume_session", False)
+    if resume_session:
+        if not paths.session_dir.exists():
+            print(
+                f"session directory does not exist: {paths.session_dir}",
+                file=sys.stderr,
+            )
+            return 1
+        if not has_timeshift_session(paths):
+            print(
+                f"cannot resume without existing DVR data: {paths.timeshift_path}",
+                file=sys.stderr,
+            )
+            return 1
+    elif paths.session_dir.exists():
         print(f"session directory already exists: {paths.session_dir}", file=sys.stderr)
         return 1
 
@@ -10650,15 +10694,23 @@ def run_record_command(args: argparse.Namespace, *, launch_player: bool = False)
     print_session_summary(paths)
     print_record_mode_summary(args)
     print(f"Capture ({capture_backend}):", shlex.join(capture_command))
+    initial_timeshift_size = (
+        paths.timeshift_path.stat().st_size if paths.timeshift_path.exists() else 0
+    )
+    append_stdout = resume_session and capture_backend == "ffmpeg"
+    stdout_target = None
     with paths.ffmpeg_log_path.open("a", encoding="utf-8") as ffmpeg_log:
         ffmpeg_log.write(
-            f"=== {datetime.now().astimezone().isoformat()} start ===\n"
+            f"=== {datetime.now().astimezone().isoformat()} {'resume' if resume_session else 'start'} ===\n"
         )
         ffmpeg_log.write(shlex.join(capture_command) + "\n")
         ffmpeg_log.flush()
+        if append_stdout:
+            stdout_target = paths.timeshift_path.open("ab")
         process = subprocess.Popen(
             capture_command,
             cwd=paths.session_dir,
+            stdout=stdout_target if stdout_target is not None else None,
             stderr=ffmpeg_log,
         )
 
@@ -10666,7 +10718,11 @@ def run_record_command(args: argparse.Namespace, *, launch_player: bool = False)
     capture_started = False
     player_process = None
     try:
-        capture_started = wait_for_capture_output(paths, process)
+        capture_started = wait_for_capture_output(
+            paths,
+            process,
+            initial_size=initial_timeshift_size,
+        )
         if capture_started:
             update_latest_symlink(paths)
             config["last_recordings_dir"] = str(recordings_dir)
@@ -10687,6 +10743,8 @@ def run_record_command(args: argparse.Namespace, *, launch_player: bool = False)
         exit_code = process.wait()
     finally:
         release_device_locks(lock_paths)
+        if stdout_target is not None:
+            stdout_target.close()
 
     try:
         with paths.ffmpeg_log_path.open("a", encoding="utf-8") as ffmpeg_log:
@@ -15463,25 +15521,50 @@ def command_ui_tui(args: argparse.Namespace) -> int:
             return False
         profile_name = profiles[profile_index]
         profile = config.get("profiles", {}).get(profile_name, {}) if config else {}
-        session_prefix = str(profile.get("session_prefix") or DEFAULT_SESSION_PREFIX)
-        session_name = default_session_name(session_prefix)
-        recordings_root = Path(profile.get("recordings_dir") or args.recordings_dir).expanduser()
-        record_session = recordings_root / session_name
-        if record_session.exists():
-            session_name = (
-                f"{session_prefix}-{int(time.time())}"
-            )
+        selected_session = _selected_session()
+        resume_existing = (
+            selected_session is not None
+            and not _is_process_running(record_process)
+            and (selected_session / DEFAULT_TIMESHIFT_NAME).exists()
+        )
+        if resume_existing:
+            record_session = selected_session
+            recordings_root = selected_session.parent
+            session_name = selected_session.name
+        else:
+            session_prefix = str(profile.get("session_prefix") or DEFAULT_SESSION_PREFIX)
+            session_name = default_session_name(session_prefix)
+            recordings_root = Path(
+                profile.get("recordings_dir") or args.recordings_dir
+            ).expanduser()
             record_session = recordings_root / session_name
+            if record_session.exists():
+                session_name = (
+                    f"{session_prefix}-{int(time.time())}"
+                )
+                record_session = recordings_root / session_name
 
-        command = [
-            *field_replay_command_prefix(args),
-            "record",
-            "--profile",
-            profile_name,
-            "--session-name",
-            session_name,
-            "--no-interactive",
-        ]
+        command = [str(Path(__file__).resolve())]
+        if args.config_file != DEFAULT_CONFIG_PATH:
+            command.extend(["--config-file", str(args.config_file)])
+        command.extend(
+            [
+                "--recordings-dir",
+                str(recordings_root),
+            ]
+        )
+        command.extend(
+            [
+                "record",
+                "--profile",
+                profile_name,
+                "--session-name",
+                session_name,
+                "--no-interactive",
+            ]
+        )
+        if resume_existing:
+            command.append("--resume-session")
         record_launch_log = _ui_launch_log_path(args, "record", session_name)
         proc = _launch_background_command_logged(command, record_launch_log)
         if proc is None:
@@ -16903,6 +16986,14 @@ def add_record_arguments(
     parser.add_argument(
         "--session-name",
         help="Explicit session name. Overrides the generated timestamped name.",
+    )
+    parser.add_argument(
+        "--resume-session",
+        action="store_true",
+        help=(
+            "Append capture data to an existing session's timeshift.ts instead "
+            "of creating a new session."
+        ),
     )
     parser.add_argument(
         "--profile",
