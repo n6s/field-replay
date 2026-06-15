@@ -8438,6 +8438,8 @@ def speak_text(
         )
     except OSError:
         return False
+    if speech_output_sink:
+        move_speech_dispatcher_sink_inputs(speech_output_sink)
     return True
 
 
@@ -8468,6 +8470,77 @@ def speech_process_env(speech_output_sink: str | None) -> dict[str, str] | None:
     env = os.environ.copy()
     env["PULSE_SINK"] = sink
     return env
+
+
+def speech_dispatcher_sink_input_indexes() -> set[int]:
+    pactl = shutil.which("pactl")
+    if not pactl:
+        return set()
+    try:
+        result = subprocess.run(
+            [pactl, "list", "sink-inputs"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+    except OSError:
+        return set()
+    indexes: set[int] = set()
+    current_index: int | None = None
+    current_is_speech = False
+    for raw_line in [*result.stdout.splitlines(), "Sink Input #"]:
+        line = raw_line.strip()
+        if line.startswith("Sink Input #"):
+            if current_index is not None and current_is_speech:
+                indexes.add(current_index)
+            current_index = None
+            current_is_speech = False
+            raw_index = line.split("#", 1)[1].strip()
+            if not raw_index:
+                continue
+            try:
+                current_index = int(raw_index)
+            except ValueError:
+                current_index = None
+            continue
+        if line.startswith("application.name") and "speech-dispatcher" in line:
+            current_is_speech = True
+        elif (
+            line.startswith("application.process.binary")
+            and "speech-dispatcher" in line
+        ):
+            current_is_speech = True
+        elif line.startswith("module-stream-restore.id") and "speech-dispatcher" in line:
+            current_is_speech = True
+    return indexes
+
+
+def move_speech_dispatcher_sink_inputs(sink: str) -> None:
+    pactl = shutil.which("pactl")
+    if not pactl:
+        return
+    target_sink = sink.strip()
+    if not target_sink:
+        return
+    moved: set[int] = set()
+    deadline = time.monotonic() + 1.5
+    while time.monotonic() < deadline:
+        indexes = speech_dispatcher_sink_input_indexes()
+        for index in sorted(indexes - moved):
+            try:
+                subprocess.run(
+                    [pactl, "move-sink-input", str(index), target_sink],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except OSError:
+                return
+            moved.add(index)
+        if moved:
+            return
+        time.sleep(0.05)
 
 
 def available_speech_output_sinks() -> list[tuple[str, str]]:
