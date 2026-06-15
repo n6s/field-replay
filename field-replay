@@ -9476,9 +9476,6 @@ def command_yolo_scan(args: argparse.Namespace) -> int:
     if args.sample_interval <= 0:
         print("sample-interval must be greater than 0", file=sys.stderr)
         return 1
-    if args.duration_probe_interval < 0:
-        print("duration-probe-interval must be non-negative", file=sys.stderr)
-        return 1
     if args.yolo_input_size <= 0:
         print("yolo-input-size must be greater than 0", file=sys.stderr)
         return 1
