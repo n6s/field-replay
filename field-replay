@@ -4114,6 +4114,46 @@ def load_session_metadata(session_dir: Path) -> dict:
     return load_json_file(session_dir / "session.json")
 
 
+def session_recording_frame_rate(session_dir: Path) -> float | None:
+    metadata = load_session_metadata(session_dir)
+    value = metadata.get("framerate")
+    try:
+        frame_rate = float(value)
+    except (TypeError, ValueError):
+        return None
+    if frame_rate <= 0:
+        return None
+    return frame_rate
+
+
+def yolo_scan_frame_rate(
+    source_info: dict,
+    source: ExportSource,
+    capture=None,
+    requested_frame_rate: float | None = None,
+) -> float:
+    if requested_frame_rate and requested_frame_rate > 0:
+        return requested_frame_rate
+
+    frame_rate = float(source_info.get("nominal_frame_rate") or source_info["frame_rate"])
+    if 0.0 < frame_rate <= 240.0:
+        return frame_rate
+
+    session_frame_rate = session_recording_frame_rate(source.session_dir)
+    if session_frame_rate:
+        return session_frame_rate
+
+    if capture is not None:
+        try:
+            capture_frame_rate = float(capture.get(5) or 0.0)
+        except (TypeError, ValueError):
+            capture_frame_rate = 0.0
+        if 0.0 < capture_frame_rate <= 240.0:
+            return capture_frame_rate
+
+    return frame_rate
+
+
 def video_size_label(video_size: str | None) -> str:
     if not video_size or "x" not in video_size:
         return "video"
@@ -9499,21 +9539,12 @@ def command_yolo_scan(args: argparse.Namespace) -> int:
         output_root, output_notice = default_vision_output_root(source, "yolo-scan")
         if output_notice:
             print(f"warning: {output_notice}", file=sys.stderr)
-    paths = yolo_scan_output_paths(output_root)
-    for key in ("root", "frames_dir", "crops_dir"):
-        ensure_directory(paths[key])
-    for key in ("events_jsonl", "events_log", "debug_log", "summary_json", "summary_text"):
-        try:
-            paths[key].unlink()
-        except FileNotFoundError:
-            pass
-
     allowed_classes = {
         item.strip().lower()
         for item in (args.subject_classes or "").split(",")
         if item.strip()
     }
-    frame_rate = float(source_info.get("nominal_frame_rate") or source_info["frame_rate"])
+    frame_rate = yolo_scan_frame_rate(source_info, source, requested_frame_rate=args.scan_frame_rate)
     frame_step = max(1, int(round(args.sample_interval * frame_rate)))
     duration_seconds = probe_media_duration(args.ffmpeg_bin, source.source_path) or 0.0
     estimated_samples = (
@@ -9530,6 +9561,7 @@ def command_yolo_scan(args: argparse.Namespace) -> int:
     print(f"YOLO labels:        {labels_path}")
     print(f"Classes:            {', '.join(sorted(allowed_classes)) or 'all'}")
     print(f"Cadence:            {args.sample_interval:g}s")
+    print(f"Scan frame rate:    {frame_rate:g} fps")
     if estimated_samples is not None:
         print(f"Samples:            {estimated_samples}")
     print(
@@ -9539,6 +9571,15 @@ def command_yolo_scan(args: argparse.Namespace) -> int:
     )
     if args.dry_run:
         return 0
+
+    paths = yolo_scan_output_paths(output_root)
+    for key in ("root", "frames_dir", "crops_dir"):
+        ensure_directory(paths[key])
+    for key in ("events_jsonl", "events_log", "debug_log", "summary_json", "summary_text"):
+        try:
+            paths[key].unlink()
+        except FileNotFoundError:
+            pass
 
     labels = load_yolo_labels(labels_path)
     try:
@@ -9563,7 +9604,13 @@ def command_yolo_scan(args: argparse.Namespace) -> int:
     if not capture.isOpened():
         print(f"could not open media for YOLO scan: {source.source_path}", file=sys.stderr)
         return 1
-    frame_count = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    frame_rate = yolo_scan_frame_rate(
+        source_info,
+        source,
+        capture,
+        requested_frame_rate=args.scan_frame_rate,
+    )
+    frame_step = max(1, int(round(args.sample_interval * frame_rate)))
     min_area = (
         int(source_info.get("width") or 0)
         * int(source_info.get("height") or 0)
@@ -9572,11 +9619,17 @@ def command_yolo_scan(args: argparse.Namespace) -> int:
     started_at = time.perf_counter()
     detections: list[dict] = []
     sample_count = 0
-    for frame_index in range(0, max(frame_count, 1), frame_step):
+    frame_index = 0
+    while True:
         if args.max_samples is not None and sample_count >= max(args.max_samples, 0):
             break
-        capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
-        ok, frame = capture.read()
+        ok = capture.grab()
+        if not ok:
+            break
+        if frame_index % frame_step != 0:
+            frame_index += 1
+            continue
+        ok, frame = capture.retrieve()
         if not ok:
             break
         offset_seconds = frame_index / frame_rate
@@ -9602,12 +9655,16 @@ def command_yolo_scan(args: argparse.Namespace) -> int:
                 }
             )
         sample_count += 1
+        if sample_count % 250 == 0:
+            print(f"Sampled:            {sample_count} frames at t={offset_seconds:.1f}s", flush=True)
+        frame_index += 1
     capture.release()
 
     raw_tracks = link_subject_tracks(
         detections,
         frame_rate=frame_rate,
         source_info=source_info,
+        max_gap_seconds=max(0.75, args.sample_interval * 1.5),
     )
     tracks, scored_tracks = summarize_subject_tracks(
         raw_tracks,
@@ -9691,6 +9748,7 @@ def command_yolo_scan(args: argparse.Namespace) -> int:
         "source_height": source_info.get("height"),
         "frame_rate": source_info.get("frame_rate"),
         "nominal_frame_rate": source_info.get("nominal_frame_rate"),
+        "scan_frame_rate": frame_rate,
         "model": str(model_path),
         "labels": str(labels_path),
         "backend": backend,
@@ -18438,6 +18496,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_YOLO_SAMPLE_INTERVAL,
         help="Seconds between sampled frames.",
+    )
+    yolo_scan.add_argument(
+        "--scan-frame-rate",
+        type=float,
+        help="Override the media frame rate used for offline scan sampling and timing.",
     )
     yolo_scan.add_argument(
         "--max-samples",
