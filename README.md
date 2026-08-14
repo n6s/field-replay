@@ -61,15 +61,22 @@ continuous DVR -> broad DeepStream/TensorRT detector -> NvDCF tracks
                -> transit scoring -> promoted crops -> identifier reading
 ```
 
-Current Jetson handoff as of 2026-06-01:
+Current Jetson handoff as of 2026-08-14:
 
-- DeepStream 7.1 is installed on the Orin target.
-- `nvinfer` and `nvinferserver` are both available.
+- JetPack 7.2.1 / L4T 39.2.1, CUDA 13.2, TensorRT 10.16, and
+  DeepStream 9.1 are installed on the Orin target.
+- `nvinfer` and NvDCF are available. `nvinferserver` is optional and currently
+  unavailable because Triton (`libtritonserver.so`) is not installed.
+- DeepStream paths are discovered through `/opt/nvidia/deepstream/deepstream`
+  rather than assuming a specific SDK version.
+- A ten-minute 1080p30 V4L2+ALSA smoke completed through
+  `gstreamer-jetson`, produced a readable H.264/AAC DVR and MKV archive, and
+  reported no capture warnings. This is not a substitute for an overnight soak.
 - NVIDIA's Triton YOLOv3 ONNX sample was staged at
   `/home/roger/deepstream-models/triton-yolov3`.
 - That staged pack includes `field-replay-pack.json`, so `field-replay` knows
   to generate `plugin-type=1` and run it through `nvinferserver`.
-- The sample completed against
+- On the previous DeepStream 7.1 installation, the sample completed against
   `/home/roger/recordings/field-replay-yolo-eval/NORC-NS-narrow-20s.mp4` and
   emitted KITTI detection files under the pack's `streamscl/` directory.
 - The sample averaged only about `4.4 FPS`, so treat it as a compatibility
@@ -78,8 +85,10 @@ Current Jetson handoff as of 2026-06-01:
   `/home/roger/deepstream-models/yolo-field` pack were removed. Do not restart
   from that path unless there is a specific reason.
 
-Next NVIDIA work should start from the working `nvinferserver`/Triton proof and
-move toward a faster TensorRT-native broad YOLO subject pack that can feed the
+The old Triton pack is retained as historical compatibility evidence, not as an
+event dependency. Current work uses `nvinfer`/NvDCF for a DeepStream 9.1 smoke
+and the checked-in replay corpus for detector decisions. A future production
+pack should still be a fast TensorRT-native broad detector that feeds the
 existing `subject-scan`/`assist` evidence path.
 
 A promoted subject should make meaningful directional progress through the
@@ -160,7 +169,7 @@ sudo apt install ffmpeg vlc v4l-utils alsa-utils
 Useful extras:
 
 ```bash
-sudo apt install eog mpv vainfo usbutils gstreamer1.0-tools
+sudo apt install eog mpv vainfo usbutils gstreamer1.0-tools tesseract-ocr
 ```
 
 What they are for:
@@ -174,6 +183,14 @@ What they are for:
 - `vainfo`: checking video acceleration support
 - `usbutils`: identifying USB capture hardware with `lsusb`
 - `gstreamer1.0-tools`: checking and running Jetson hardware encode/decode paths
+- `tesseract-ocr`: optional CPU identifier baseline; it is not enabled by default
+
+DeepStream 9.1 NvDCF also needs its runtime dependencies to be loadable. On the
+current JetPack 7 image, install `libmosquitto1` if `doctor` reports it missing:
+
+```bash
+sudo apt install libmosquitto1
+```
 
 For cleaner Jetson DVR containers, also install the GStreamer plugin sets that provide `h264parse` and `mpegtsmux` when they are not already present on the image.
 
@@ -786,6 +803,32 @@ In live comparison mode, it also accepts comparison responses like:
 {"detections":[{"label":"person","status":"new"},{"label":"car","status":"unchanged"}]}
 ```
 
+### Replay regression on real event footage
+
+Use the checked-in marathon corpus to compare detection changes against labeled
+purposeful transits, empty/background windows, stationary staff zones, and
+known readable race-number crops:
+
+```bash
+./field-replay vision-eval --dry-run
+./field-replay vision-eval
+./field-replay vision-eval --identifier-engine tesseract
+```
+
+Runs write under `~/recordings/field-replay-eval/`, never into source evidence.
+The recall-first gate requires at least 95% purposeful-transit recall and no
+more than 15% negative-window promotions. Identifier engines additionally need
+80% exact matches, no more than 2% false positives, and p95 latency at or below
+250 ms. `off` is the default for new assist workflows; `number-scan` retains
+its legacy explicit Ollama path. Tesseract and an external TensorRT OCRNet
+adapter are opt-in and remain tentative even if they pass.
+
+The first JetPack 7 baseline on 2026-08-14 did not pass: it reached 85.7%
+transit recall, promoted events in 60% of labeled negative windows, and produced
+usable crops for 6 of 7 bib-visible transit cases. Tesseract produced 0% exact
+matches at roughly 2.5 seconds p95. Keep these failures visible while improving
+association, staff suppression, crop selection, and accelerated OCR.
+
 ### 6. Look up and review a bib or custom label
 
 ```bash
@@ -922,6 +965,13 @@ If `h264_nvenc` is unavailable, the tool falls back to another available encoder
 ./field-replay go --no-audio
 ```
 
+`doctor` validates the last-used saved recording profile by default so its
+source, audio, backend, and storage result matches the next `go` run. Use
+`--profile NAME` to inspect another profile or `--no-profile` to inspect raw
+defaults. On Jetson it also reports JetPack/L4T, power mode, CUDA, TensorRT,
+DeepStream, `nvinfer`, optional `nvinferserver`, NvDCF loadability, and estimated
+recording capacity.
+
 Use `--capture-backend gstreamer-jetson` to require that path, or `--capture-backend ffmpeg` to force the older FFmpeg path. The Jetson backend currently supports V4L2 capture with optional ALSA audio; RTSP and direct timelapse recordings use FFmpeg.
 
 Normal `record` and `go` sessions capture audio by default, including when an older saved normal profile had audio disabled. Use `--no-audio` for a deliberately silent normal recording. Direct `--timelapse` recording is always video-only.
@@ -961,11 +1011,28 @@ When a V4L2 profile selects `--video-input-format h264`, the tool defaults that 
 ./field-replay setup
 ./field-replay go
 ./field-replay watch
+./field-replay library
 ./field-replay vision-live
 ./field-replay find-bib 241
 ./field-replay review 241
 ./field-replay export
 ```
+
+### Browse and clean up recordings
+
+`./field-replay library` browses the configured recordings directory and shows
+Watch, Rename, and Trash controls. Enter opens a folder or previews a movie in
+mpv; `W` previews the preferred `archive.mkv`, `archive.mp4`, or `timeshift.ts`
+inside a session; `R` renames one folder or clip with its current name
+prepopulated and the cursor ready to prepend a label; and `D` moves the highlighted
+item through the desktop trash after requiring the word `yes`. While browsing
+inside a run folder, `X` moves that entire current folder to trash, which is
+useful after previewing its archive and deciding the whole test run is disposable.
+Backspace returns to the parent and keeps the folder you just left highlighted.
+The browser refuses paths outside its root, will not trash the library root, and
+never performs a permanent recursive delete. Use
+`./field-replay library --dry-run` to inspect the initial listing without
+opening the interface.
 
 A few common variations:
 

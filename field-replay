@@ -26,6 +26,7 @@ from typing import Sequence
 
 DEFAULT_RECORDINGS_DIR = Path("~/recordings").expanduser()
 DEFAULT_CONFIG_PATH = Path("~/.config/field-replay/config.json").expanduser()
+DEFAULT_VISION_EVAL_MANIFEST = Path(__file__).resolve().parent / "extras/eval/marathon-v1.json"
 DEFAULT_SESSION_PREFIX = "run"
 DEFAULT_TIMESHIFT_NAME = "timeshift.ts"
 DEFAULT_ARCHIVE_STEM = "archive"
@@ -79,6 +80,8 @@ DEFAULT_SUBJECT_INFER_CONFIG = "config_infer_primary.txt"
 DEFAULT_SUBJECT_PACK_MANIFEST = "field-replay-pack.json"
 DEFAULT_SUBJECT_TRACKER = "nvdcf-perf"
 SUBJECT_TRACKERS = ("nvdcf-perf", "none")
+IDENTIFIER_ENGINES = ("off", "ollama", "tesseract", "ocrnet")
+DEFAULT_IDENTIFIER_ENGINE = "off"
 DEFAULT_YOLO_MODEL = Path("~/recordings/field-replay-yolo-eval/models/yolov5n.onnx").expanduser()
 DEFAULT_YOLO_LABELS = Path("~/recordings/field-replay-yolo-eval/models/coco.names").expanduser()
 DEFAULT_YOLO_CLASSES = "person,bicycle,car,motorbike,bus,truck"
@@ -893,6 +896,22 @@ def gst_element_available(element: str) -> bool:
     return result.returncode == 0
 
 
+def gst_element_status(element: str) -> tuple[bool, str]:
+    gst_inspect = shutil.which("gst-inspect-1.0")
+    if not gst_inspect:
+        return False, "gst-inspect-1.0 is missing"
+    result = subprocess.run(
+        [gst_inspect, element],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode == 0:
+        return True, "available"
+    detail = (result.stderr or result.stdout).strip().splitlines()
+    return False, detail[0] if detail else f"gst-inspect exited {result.returncode}"
+
+
 def python_gst_available() -> bool:
     try:
         import gi  # type: ignore
@@ -975,6 +994,70 @@ def deepstream_available() -> tuple[bool, str]:
         return True, first_line
     detail = (result.stderr or result.stdout).strip().splitlines()
     return False, detail[0] if detail else f"deepstream-app exited {result.returncode}"
+
+
+def deepstream_version_details() -> dict[str, str]:
+    deepstream_path = shutil.which("deepstream-app")
+    if not deepstream_path:
+        return {}
+    result = subprocess.run(
+        [deepstream_path, "--version-all"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return {}
+    details: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        if ":" in line:
+            key, value = line.split(":", 1)
+            details[key.strip()] = value.strip()
+        elif line.startswith("DeepStreamSDK "):
+            details["DeepStreamSDK"] = line.removeprefix("DeepStreamSDK ").strip()
+    return details
+
+
+def read_os_release() -> dict[str, str]:
+    result: dict[str, str] = {}
+    try:
+        lines = Path("/etc/os-release").read_text().splitlines()
+    except OSError:
+        return result
+    for line in lines:
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        result[key] = value.strip().strip('"')
+    return result
+
+
+def dpkg_package_version(package: str) -> str | None:
+    dpkg_query = shutil.which("dpkg-query")
+    if not dpkg_query:
+        return None
+    result = subprocess.run(
+        [dpkg_query, "-W", "-f=${Version}", package],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    value = result.stdout.strip()
+    return value if result.returncode == 0 and value else None
+
+
+def jetson_power_mode() -> str | None:
+    nvpmodel = shutil.which("nvpmodel")
+    if not nvpmodel:
+        return None
+    result = subprocess.run(
+        [nvpmodel, "-q"], capture_output=True, text=True, check=False
+    )
+    lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    for line in lines:
+        if line.lower().startswith("nv power mode:"):
+            return line.split(":", 1)[1].strip()
+    return lines[0] if lines else None
 
 
 def parse_gst_bitrate(value: str | None, default_bps: int = 8_000_000) -> int:
@@ -8367,34 +8450,133 @@ def normalize_number_scan_results(response_text: str) -> list[str]:
     return numbers
 
 
+def identifier_engine_status(engine: str, ocrnet_command: str | None = None) -> tuple[bool, str]:
+    if engine == "off":
+        return True, "identifier reading disabled; crops only"
+    if engine == "ollama":
+        return True, "HTTP API availability is checked on first request"
+    if engine == "tesseract":
+        path = shutil.which("tesseract")
+        return bool(path), path or "tesseract executable is missing"
+    if engine == "ocrnet":
+        command = shlex.split(ocrnet_command or "field-replay-ocrnet")
+        path = shutil.which(command[0]) if command else None
+        return bool(path), path or "OCRNet adapter command is missing"
+    return False, f"unsupported identifier engine: {engine}"
+
+
+def read_tesseract_identifier(image_path: Path, timeout_seconds: float) -> tuple[str, list[str]]:
+    tesseract = shutil.which("tesseract")
+    if not tesseract:
+        raise RuntimeError("tesseract executable is missing")
+    command = [
+        tesseract,
+        str(image_path),
+        "stdout",
+        "--psm",
+        "6",
+        "-l",
+        "eng",
+        "-c",
+        "tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+    ]
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=max(timeout_seconds, 1.0),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("tesseract identifier read timed out") from exc
+    if result.returncode != 0:
+        detail = result.stderr.strip() or f"tesseract exited {result.returncode}"
+        raise RuntimeError(detail)
+    raw_text = result.stdout.strip()
+    numbers: list[str] = []
+    for token in re.findall(r"[A-Za-z0-9]+", raw_text):
+        normalized = normalize_door_number_text(token)
+        if normalized and normalized not in numbers:
+            numbers.append(normalized)
+    return raw_text, numbers
+
+
+def read_ocrnet_identifier(
+    image_path: Path, timeout_seconds: float, command_text: str | None
+) -> tuple[str, list[str]]:
+    command = shlex.split(command_text or "field-replay-ocrnet")
+    if not command or not shutil.which(command[0]):
+        raise RuntimeError("OCRNet adapter command is missing")
+    try:
+        result = subprocess.run(
+            [*command, str(image_path)],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=max(timeout_seconds, 1.0),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("OCRNet identifier read timed out") from exc
+    if result.returncode != 0:
+        detail = result.stderr.strip() or f"OCRNet adapter exited {result.returncode}"
+        raise RuntimeError(detail)
+    response_text = result.stdout.strip()
+    try:
+        numbers = normalize_number_scan_results(response_text)
+    except (ValueError, json.JSONDecodeError):
+        numbers = []
+        for token in re.findall(r"[A-Za-z0-9]+", response_text):
+            normalized = normalize_door_number_text(token)
+            if normalized and normalized not in numbers:
+                numbers.append(normalized)
+    return response_text, numbers
+
+
 def read_identifier_crop_job(
     *,
     image_path: Path,
+    engine: str,
     model: str,
     ollama_host: str,
     prompt: str,
     timeout_seconds: float,
     keepalive: str,
+    ocrnet_command: str | None = None,
 ) -> dict:
     started_at = time.perf_counter()
     try:
-        response_text = request_ollama_vision_response(
-            image_paths=[image_path],
-            model=model,
-            ollama_host=ollama_host,
-            prompt=prompt,
-            timeout_seconds=timeout_seconds,
-            keepalive=keepalive,
-        )
+        if engine == "off":
+            response_text, numbers = "", []
+        elif engine == "tesseract":
+            response_text, numbers = read_tesseract_identifier(image_path, timeout_seconds)
+        elif engine == "ocrnet":
+            response_text, numbers = read_ocrnet_identifier(
+                image_path, timeout_seconds, ocrnet_command
+            )
+        elif engine == "ollama":
+            response_text = request_ollama_vision_response(
+                image_paths=[image_path],
+                model=model,
+                ollama_host=ollama_host,
+                prompt=prompt,
+                timeout_seconds=timeout_seconds,
+                keepalive=keepalive,
+            )
+            numbers = normalize_number_scan_results(response_text)
+        else:
+            raise RuntimeError(f"unsupported identifier engine: {engine}")
         elapsed_ms = int(round((time.perf_counter() - started_at) * 1000))
         return {
+            "engine": engine,
             "elapsed_ms": elapsed_ms,
             "response": response_text,
-            "numbers": normalize_number_scan_results(response_text),
+            "numbers": numbers,
         }
     except RuntimeError as exc:
         elapsed_ms = int(round((time.perf_counter() - started_at) * 1000))
         return {
+            "engine": engine,
             "elapsed_ms": elapsed_ms,
             "error": str(exc),
             "numbers": [],
@@ -8687,8 +8869,41 @@ def yolo_scan_output_paths(output_root: Path) -> dict[str, Path]:
     }
 
 
+def deepstream_install_root() -> Path:
+    base = Path("/opt/nvidia/deepstream")
+    canonical = base / "deepstream"
+    if canonical.exists():
+        return canonical.resolve()
+    def version_key(path: Path) -> tuple[int, ...]:
+        return tuple(int(value) for value in re.findall(r"\d+", path.name))
+
+    candidates = sorted(
+        (path for path in base.glob("deepstream-*") if path.is_dir()),
+        key=version_key,
+        reverse=True,
+    )
+    return candidates[0] if candidates else canonical
+
+
 def deepstream_sample_root() -> Path:
-    return Path("/opt/nvidia/deepstream/deepstream-7.1/samples")
+    return deepstream_install_root() / "samples"
+
+
+def nvinferserver_status() -> tuple[bool, str]:
+    available, status = gst_element_status("nvinferserver")
+    if available:
+        return True, status
+    plugin = deepstream_install_root() / "lib/gst-plugins/libnvdsgst_inferserver.so"
+    missing = shared_library_missing_dependencies(plugin)
+    return False, ("missing " + ", ".join(missing)) if missing else status
+
+
+def deepstream_runtime_signature() -> str:
+    details = deepstream_version_details()
+    deepstream_version = details.get("DeepStreamSDK", "unknown")
+    tensorrt_version = details.get("TensorRT Version", "unknown")
+    raw = f"ds{deepstream_version}-trt{tensorrt_version}"
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", raw)
 
 
 def deepstream_trafficcamnet_available() -> tuple[bool, str]:
@@ -8724,6 +8939,10 @@ def deepstream_subject_pack_available(detector_pack: Path) -> tuple[bool, str]:
             False,
             f"subject detector pack missing required file: {infer_config}",
         )
+    if pack_spec["plugin_type"] == 1:
+        available, status = nvinferserver_status()
+        if not available:
+            return False, f"nvinferserver pack cannot run: {status}"
     plugin_name = deepstream_plugin_type_label(pack_spec["plugin_type"])
     return True, f"subject detector pack found: {detector_pack} ({plugin_name})"
 
@@ -8844,6 +9063,18 @@ def deepstream_tracker_assets(tracker_name: str) -> tuple[Path, Path] | None:
     )
 
 
+def shared_library_missing_dependencies(path: Path) -> list[str]:
+    ldd = shutil.which("ldd")
+    if not ldd or not path.exists():
+        return []
+    result = subprocess.run([ldd, str(path)], capture_output=True, text=True, check=False)
+    missing: list[str] = []
+    for line in result.stdout.splitlines():
+        if "=> not found" in line:
+            missing.append(line.split("=>", 1)[0].strip())
+    return missing
+
+
 def deepstream_tracker_available(tracker_name: str) -> tuple[bool, str]:
     if tracker_name == "none":
         return True, "tracker disabled"
@@ -8853,6 +9084,9 @@ def deepstream_tracker_available(tracker_name: str) -> tuple[bool, str]:
     missing = [str(path) for path in assets if not path.exists()]
     if missing:
         return False, "missing DeepStream tracker assets: " + ", ".join(missing)
+    missing_dependencies = shared_library_missing_dependencies(assets[0])
+    if missing_dependencies:
+        return False, "DeepStream tracker dependencies missing: " + ", ".join(missing_dependencies)
     return True, f"DeepStream tracker {tracker_name} assets found"
 
 
@@ -8873,21 +9107,29 @@ def prepare_subject_deepstream_configs(
         infer_template = samples / "configs/deepstream-app/config_infer_primary.txt"
         infer_text = infer_template.read_text()
         source_model_dir = samples / "models/Primary_Detector"
-        for asset_name in (
-            "resnet18_trafficcamnet_pruned.onnx",
-            "labels.txt",
-            "cal_trt.bin",
-        ):
-            local_asset = model_dir / asset_name
+        signature = deepstream_runtime_signature()
+        staged_assets = {
+            "resnet18_trafficcamnet_pruned.onnx": f"resnet18_trafficcamnet_pruned.{signature}.onnx",
+            "labels.txt": "labels.txt",
+            "cal_trt.bin": "cal_trt.bin",
+        }
+        for asset_name, local_name in staged_assets.items():
+            local_asset = model_dir / local_name
             if stage_model_assets and not local_asset.exists():
                 shutil.copy2(source_model_dir / asset_name, local_asset)
-        engine_path = model_dir / "resnet18_trafficcamnet_pruned.onnx_b1_gpu0_int8.engine"
+        onnx_path = model_dir / staged_assets["resnet18_trafficcamnet_pruned.onnx"]
+        engine_path = model_dir / (
+            f"{onnx_path.name}_b1_gpu0_fp16.engine"
+        )
         infer_text = infer_text.replace("../../models/Primary_Detector", str(model_dir))
+        infer_text = re.sub(r"^onnx-file=.*$", f"onnx-file={onnx_path}", infer_text, flags=re.MULTILINE)
         infer_text = re.sub(
             r"model-engine-file=.*",
             f"model-engine-file={engine_path}",
             infer_text,
         )
+        infer_text = re.sub(r"^int8-calib-file=.*$", "", infer_text, flags=re.MULTILINE)
+        infer_text = re.sub(r"^network-mode=.*$", "network-mode=1", infer_text, flags=re.MULTILINE)
     else:
         pack_spec = deepstream_subject_pack_spec(subject_model_dir)
         gie_plugin_type = pack_spec["plugin_type"]
@@ -8986,6 +9228,23 @@ def run_deepstream_subject_detector(runtime_paths: dict[str, Path]) -> None:
         raise RuntimeError(
             f"deepstream-app exited {result.returncode}; see {runtime_paths['deepstream_log']}"
         )
+    infer_text = runtime_paths["infer_config"].read_text()
+    engine_match = re.search(r"^model-engine-file=(.+)$", infer_text, re.MULTILINE)
+    if engine_match:
+        engine_path = Path(engine_match.group(1).strip()).expanduser()
+        if engine_path.exists():
+            details = deepstream_version_details()
+            provenance = {
+                "created_at": datetime.now().astimezone().isoformat(),
+                "engine_path": str(engine_path),
+                "deepstream_version": details.get("DeepStreamSDK"),
+                "tensorrt_version": details.get("TensorRT Version"),
+                "cuda_runtime_version": details.get("CUDA Runtime Version"),
+                "runtime_signature": deepstream_runtime_signature(),
+            }
+            engine_path.with_suffix(engine_path.suffix + ".json").write_text(
+                json.dumps(provenance, indent=2) + "\n"
+            )
 
 
 def parse_deepstream_frame_index(path: Path) -> int | None:
@@ -10149,7 +10408,9 @@ def command_number_scan(args: argparse.Namespace) -> int:
     print(f"Number scan source: {source.source_path}")
     print(f"Source events:      {motion_events_path}")
     print(f"Number output dir:  {output_root}")
-    print(f"Number model:       {args.model}")
+    print(f"Identifier engine:  {args.identifier_engine}")
+    if args.identifier_engine == "ollama":
+        print(f"Number model:       {args.model}")
     print(f"Crops:              {len(candidates)}")
     if args.dry_run:
         for motion_event, crop_path in candidates[:20]:
@@ -10160,6 +10421,13 @@ def command_number_scan(args: argparse.Namespace) -> int:
         if len(candidates) > 20:
             print(f"  ... {len(candidates) - 20} more")
         return 0
+
+    engine_ok, engine_status = identifier_engine_status(
+        args.identifier_engine, args.ocrnet_command
+    )
+    if not engine_ok:
+        print(f"identifier engine unavailable: {engine_status}", file=sys.stderr)
+        return 1
 
     prompt = args.prompt or default_number_scan_prompt()
     speech_command = choose_speech_command(args.speech_command) if args.speak else None
@@ -10175,20 +10443,22 @@ def command_number_scan(args: argparse.Namespace) -> int:
     number_counts: dict[str, int] = {}
     for motion_event, crop_path in candidates:
         crop_count += 1
-        started_at = time.perf_counter()
         now = datetime.now().astimezone()
         crop_reference = relative_to_session(crop_path, source.session_dir)
-        try:
-            response_text = request_ollama_vision_response(
-                image_paths=[crop_path],
-                model=args.model,
-                ollama_host=args.ollama_host,
-                prompt=prompt,
-                timeout_seconds=args.timeout,
-                keepalive=args.keepalive,
-            )
-            elapsed_ms = int(round((time.perf_counter() - started_at) * 1000))
-            numbers = normalize_number_scan_results(response_text)
+        result = read_identifier_crop_job(
+            image_path=crop_path,
+            engine=args.identifier_engine,
+            model=args.model,
+            ollama_host=args.ollama_host,
+            prompt=prompt,
+            timeout_seconds=args.timeout,
+            keepalive=args.keepalive,
+            ocrnet_command=args.ocrnet_command,
+        )
+        response_text = str(result.get("response") or "")
+        elapsed_ms = int(result.get("elapsed_ms") or 0)
+        numbers = list(result.get("numbers") or [])
+        if not result.get("error"):
             append_jsonl(
                 paths["debug_log"],
                 {
@@ -10196,14 +10466,14 @@ def command_number_scan(args: argparse.Namespace) -> int:
                     "t": motion_event.get("t"),
                     "motion_event": motion_event.get("l"),
                     "crop": crop_reference,
+                    "engine": args.identifier_engine,
                     "model": args.model,
                     "elapsed_ms": elapsed_ms,
                     "response": response_text,
                     "numbers": numbers,
                 },
             )
-        except RuntimeError as exc:
-            elapsed_ms = int(round((time.perf_counter() - started_at) * 1000))
+        else:
             append_jsonl(
                 paths["debug_log"],
                 {
@@ -10211,9 +10481,10 @@ def command_number_scan(args: argparse.Namespace) -> int:
                     "t": motion_event.get("t"),
                     "motion_event": motion_event.get("l"),
                     "crop": crop_reference,
+                    "engine": args.identifier_engine,
                     "model": args.model,
                     "elapsed_ms": elapsed_ms,
-                    "error": str(exc),
+                    "error": str(result["error"]),
                 },
             )
             continue
@@ -10225,7 +10496,7 @@ def command_number_scan(args: argparse.Namespace) -> int:
                 "k": "identifier",
                 "l": number,
                 "s": "number-scan",
-                "m": args.model,
+                "m": args.model if args.identifier_engine == "ollama" else args.identifier_engine,
                 "f": crop_reference,
                 "crop": crop_reference,
                 "source_event": motion_event.get("l"),
@@ -10256,6 +10527,7 @@ def command_number_scan(args: argparse.Namespace) -> int:
         "crops_scanned": crop_count,
         "identifier_events": promoted_count,
         "identifiers": number_counts,
+        "identifier_engine": args.identifier_engine,
         "model": args.model,
         "speech": bool(args.speak and speech_command),
     }
@@ -13962,6 +14234,20 @@ def command_assist_live(args: argparse.Namespace) -> int:
     if not 0.0 <= args.min_directionality <= 1.0:
         print("min-directionality must be between 0 and 1", file=sys.stderr)
         return 1
+    if args.read_identifiers:
+        if args.identifier_engine == "off":
+            print(
+                "warning: --read-identifiers requested with identifier engine off; saving crops only",
+                file=sys.stderr,
+            )
+            args.read_identifiers = False
+        else:
+            engine_ok, engine_status = identifier_engine_status(
+                args.identifier_engine, args.ocrnet_command
+            )
+            if not engine_ok:
+                print(f"identifier engine unavailable: {engine_status}", file=sys.stderr)
+                return 1
 
     try:
         import cv2
@@ -14031,6 +14317,10 @@ def command_assist_live(args: argparse.Namespace) -> int:
     print(f"YOLO model:          {model_path}")
     print(f"YOLO labels:         {labels_path}")
     print(f"Backend:             {backend}")
+    print(
+        "Identifier engine:   "
+        + (args.identifier_engine if args.read_identifiers else "off (crops only)")
+    )
     print(f"Cadence:             {args.sample_interval:g}s, tail {args.tail_offset:g}s")
     print(f"Next subject event:  subject-live-{next_event_id:04d}")
     print(f"Duration probe:      every {args.duration_probe_interval:g}s")
@@ -14107,11 +14397,13 @@ def command_assist_live(args: argparse.Namespace) -> int:
         future = identifier_executor.submit(
             read_identifier_crop_job,
             image_path=crop_path,
+            engine=args.identifier_engine,
             model=args.model,
             ollama_host=args.ollama_host,
             prompt=prompt,
             timeout_seconds=args.timeout,
             keepalive=args.keepalive,
+            ocrnet_command=args.ocrnet_command,
         )
         pending_identifier_reads.append((future, dict(payload), crop_reference))
 
@@ -15087,10 +15379,14 @@ def command_assist(args: argparse.Namespace) -> int:
         str(number_output_root),
         "--max-crops-per-event",
         str(args.max_crops_per_event),
+        "--identifier-engine",
+        args.identifier_engine,
         "--speech-command",
         args.speech_command,
         "--no-interactive",
     ]
+    if args.ocrnet_command:
+        number_command.extend(["--ocrnet-command", args.ocrnet_command])
     if args.speak:
         number_command.append("--speak")
     else:
@@ -15111,6 +15407,7 @@ def command_assist(args: argparse.Namespace) -> int:
         print("DeepStream fallback: " + str(deepstream_reason))
     print("Subject output:      " + str(subject_output_root))
     print("Identifier output:   " + str(number_output_root))
+    print("Identifier engine:   " + args.identifier_engine)
     print("Speech:              " + ("enabled" if args.speak else "disabled"))
     if args.dry_run:
         print("Subjects:", shlex.join(subject_command))
@@ -16825,11 +17122,706 @@ def command_ui(args: argparse.Namespace) -> int:
     return command_ui_tui(args)
 
 
+LIBRARY_MEDIA_SUFFIXES = {
+    ".avi", ".m2ts", ".m4v", ".mkv", ".mov", ".mp4", ".mpeg", ".mpg", ".ts", ".webm"
+}
+
+
+def library_path_within(root: Path, candidate: Path) -> bool:
+    try:
+        candidate.resolve(strict=False).relative_to(root.resolve())
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def library_entries(root: Path, current: Path) -> list[Path]:
+    entries: list[Path] = []
+    try:
+        candidates = list(current.iterdir())
+    except OSError:
+        return entries
+    for path in candidates:
+        if path.name.startswith(".") or not library_path_within(root, path):
+            continue
+        if path.is_dir() or (path.is_file() and path.suffix.lower() in LIBRARY_MEDIA_SUFFIXES):
+            entries.append(path)
+    return sorted(entries, key=lambda path: (not path.is_dir(), path.name.lower()))
+
+
+def library_preview_target(path: Path) -> Path | None:
+    if path.is_file() and path.suffix.lower() in LIBRARY_MEDIA_SUFFIXES:
+        return path
+    if not path.is_dir():
+        return None
+    preferred = [path / "archive.mkv", path / "archive.mp4", path / DEFAULT_TIMESHIFT_NAME]
+    for candidate in preferred:
+        if candidate.is_file():
+            return candidate
+    try:
+        media = sorted(
+            candidate
+            for candidate in path.iterdir()
+            if candidate.is_file() and candidate.suffix.lower() in LIBRARY_MEDIA_SUFFIXES
+        )
+    except OSError:
+        return None
+    return media[0] if media else None
+
+
+def library_item_detail(path: Path) -> str:
+    try:
+        stat = path.stat()
+    except OSError:
+        return "unavailable"
+    modified = datetime.fromtimestamp(stat.st_mtime).astimezone().strftime("%Y-%m-%d %H:%M")
+    if path.is_dir():
+        try:
+            count = len(library_entries(path, path))
+        except OSError:
+            count = 0
+        return f"folder, {count} visible items, modified {modified}"
+    return f"{format_bytes(stat.st_size)}, modified {modified}"
+
+
+def library_trash_command(path: Path) -> list[str] | None:
+    gio = shutil.which("gio")
+    if gio:
+        return [gio, "trash", str(path)]
+    trash_put = shutil.which("trash-put")
+    if trash_put:
+        return [trash_put, str(path)]
+    return None
+
+
+def command_library(args: argparse.Namespace) -> int:
+    root = (args.root or args.recordings_dir).expanduser().resolve(strict=False)
+    if not root.exists() or not root.is_dir():
+        print(f"library root is not a directory: {root}", file=sys.stderr)
+        return 1
+    player = choose_player(args.player or "mpv")
+    if not player:
+        print("mpv is required for library previews", file=sys.stderr)
+        return 1
+    if args.dry_run:
+        print(f"Library root: {root}")
+        for path in library_entries(root, root):
+            preview = library_preview_target(path)
+            kind = "folder" if path.is_dir() else "media"
+            suffix = f" -> {preview.name}" if preview and path.is_dir() else ""
+            print(f"  {kind:6} {path.name}{suffix}")
+        print(
+            "Actions: Enter=browse/watch, W=watch, R=rename, "
+            "D=trash item, X=trash current folder"
+        )
+        return 0
+
+    import curses
+
+    def run_browser(screen) -> int:
+        curses.curs_set(0)
+        screen.keypad(True)
+        current = root
+        selected = 0
+        scroll = 0
+        message = "Enter browses folders or watches media"
+
+        def prompt_text(
+            label: str,
+            initial: str = "",
+            *,
+            cursor_at_start: bool = False,
+        ) -> str | None:
+            value = list(initial)
+            cursor = 0 if cursor_at_start else len(value)
+            cancelled = False
+            curses.noecho()
+            curses.curs_set(1)
+            try:
+                while True:
+                    height, width = screen.getmaxyx()
+                    field_start = min(len(label), max(width - 2, 0))
+                    field_width = max(width - field_start - 1, 1)
+                    viewport_start = max(0, cursor - field_width + 1)
+                    if cursor < viewport_start:
+                        viewport_start = cursor
+                    visible = "".join(value[viewport_start : viewport_start + field_width])
+                    screen.move(height - 1, 0)
+                    screen.clrtoeol()
+                    screen.addnstr(height - 1, 0, label, max(width - 1, 1))
+                    screen.addnstr(height - 1, field_start, visible, field_width)
+                    screen.move(height - 1, field_start + cursor - viewport_start)
+                    screen.refresh()
+                    key = screen.getch()
+                    if key in (curses.KEY_ENTER, 10, 13):
+                        break
+                    if key == 27:
+                        cancelled = True
+                        break
+                    if key in (curses.KEY_LEFT,):
+                        cursor = max(cursor - 1, 0)
+                    elif key in (curses.KEY_RIGHT,):
+                        cursor = min(cursor + 1, len(value))
+                    elif key in (curses.KEY_HOME, 1):
+                        cursor = 0
+                    elif key in (curses.KEY_END, 5):
+                        cursor = len(value)
+                    elif key in (curses.KEY_BACKSPACE, 8, 127):
+                        if cursor:
+                            del value[cursor - 1]
+                            cursor -= 1
+                    elif key == curses.KEY_DC:
+                        if cursor < len(value):
+                            del value[cursor]
+                    elif 32 <= key <= 126:
+                        value.insert(cursor, chr(key))
+                        cursor += 1
+            finally:
+                curses.curs_set(0)
+            if cancelled:
+                return None
+            result = "".join(value).strip()
+            return result or None
+
+        while True:
+            entries = library_entries(root, current)
+            selected = min(selected, max(len(entries) - 1, 0))
+            height, width = screen.getmaxyx()
+            page_size = max(height - 7, 1)
+            if selected < scroll:
+                scroll = selected
+            elif selected >= scroll + page_size:
+                scroll = selected - page_size + 1
+            screen.erase()
+            relative = "." if current == root else str(current.relative_to(root))
+            screen.addnstr(0, 0, f"Recordings Library: {root}", max(width - 1, 1), curses.A_BOLD)
+            screen.addnstr(1, 0, f"Folder: {relative}", max(width - 1, 1))
+            screen.addnstr(
+                2,
+                0,
+                "[Enter Browse/Watch] [W Watch] [R Rename] [D Trash Item] "
+                "[X Trash Folder] [Backspace Up] [Q Quit]",
+                max(width - 1, 1),
+                curses.A_REVERSE,
+            )
+            for row, path in enumerate(entries[scroll : scroll + page_size], start=4):
+                index = scroll + row - 4
+                marker = ">" if index == selected else " "
+                kind = "/" if path.is_dir() else " "
+                text_value = f"{marker} {kind} {path.name}"
+                attr = curses.A_REVERSE if index == selected else curses.A_NORMAL
+                screen.addnstr(row, 0, text_value, max(width - 1, 1), attr)
+            detail_row = height - 2
+            if entries:
+                screen.addnstr(
+                    detail_row,
+                    0,
+                    library_item_detail(entries[selected]),
+                    max(width - 1, 1),
+                )
+            screen.addnstr(height - 1, 0, message, max(width - 1, 1), curses.A_BOLD)
+            screen.refresh()
+            key = screen.getch()
+            if key in (ord("q"), ord("Q"), 27):
+                return 0
+            if key in (curses.KEY_UP, ord("k")) and entries:
+                selected = max(selected - 1, 0)
+                continue
+            if key in (curses.KEY_DOWN, ord("j")) and entries:
+                selected = min(selected + 1, len(entries) - 1)
+                continue
+            if key in (curses.KEY_BACKSPACE, 8, 127, curses.KEY_LEFT):
+                if current != root:
+                    previous = current
+                    current = current.parent
+                    parent_entries = library_entries(root, current)
+                    selected = next(
+                        (index for index, path in enumerate(parent_entries) if path == previous),
+                        0,
+                    )
+                    scroll = max(selected - 1, 0)
+                    message = f"Moved up; {previous.name} is selected"
+                continue
+            if key in (ord("x"), ord("X")):
+                if current == root:
+                    message = "The library root cannot be trashed here"
+                    continue
+                folder = current
+                parent = folder.parent
+                parent_entries = library_entries(root, parent)
+                former_index = next(
+                    (index for index, path in enumerate(parent_entries) if path == folder),
+                    0,
+                )
+                command = library_trash_command(folder)
+                if not command:
+                    message = "No recoverable trash command is installed"
+                    continue
+                confirmation = prompt_text(
+                    f"Move ENTIRE folder {folder.name} to trash? Type yes: "
+                )
+                if confirmation != "yes":
+                    message = "Folder trash cancelled"
+                    continue
+                result = subprocess.run(command, capture_output=True, text=True, check=False)
+                if result.returncode == 0:
+                    current = parent
+                    remaining = library_entries(root, current)
+                    selected = min(former_index, max(len(remaining) - 1, 0))
+                    scroll = max(selected - 1, 0)
+                    message = f"Moved entire folder {folder.name} to trash"
+                else:
+                    message = (result.stderr or result.stdout).strip() or "Trash failed"
+                continue
+            if not entries:
+                continue
+            target = entries[selected]
+            if key in (curses.KEY_ENTER, 10, 13) and target.is_dir():
+                current = target
+                selected = scroll = 0
+                message = f"Opened {target.name}"
+                continue
+            if key in (curses.KEY_ENTER, 10, 13, ord("w"), ord("W")):
+                preview = library_preview_target(target)
+                if not preview:
+                    message = f"No playable media in {target.name}"
+                    continue
+                command = build_player_command(
+                    player,
+                    preview,
+                    args.file_caching_ms,
+                    player_hwdec=args.player_hwdec,
+                )
+                try:
+                    subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    message = f"Playing {preview.name}"
+                except OSError as exc:
+                    message = f"Could not launch player: {exc}"
+                continue
+            if key in (ord("r"), ord("R")):
+                new_name = prompt_text(
+                    "Rename to: ", target.name, cursor_at_start=True
+                )
+                if not new_name:
+                    message = "Rename cancelled"
+                    continue
+                if new_name in {".", ".."} or "/" in new_name or "\x00" in new_name:
+                    message = "Name must be one filename without slashes"
+                    continue
+                destination = target.with_name(new_name)
+                if not library_path_within(root, destination) or destination.exists():
+                    message = "Rename target is unsafe or already exists"
+                    continue
+                try:
+                    target.rename(destination)
+                    message = f"Renamed to {new_name}"
+                except OSError as exc:
+                    message = f"Rename failed: {exc}"
+                continue
+            if key in (ord("d"), ord("D")):
+                command = library_trash_command(target)
+                if not command:
+                    message = "No recoverable trash command is installed"
+                    continue
+                confirmation = prompt_text(f"Move {target.name} to trash? Type yes: ")
+                if confirmation != "yes":
+                    message = "Trash cancelled"
+                    continue
+                result = subprocess.run(command, capture_output=True, text=True, check=False)
+                if result.returncode == 0:
+                    message = f"Moved {target.name} to trash"
+                    selected = min(selected, max(len(entries) - 2, 0))
+                else:
+                    message = (result.stderr or result.stdout).strip() or "Trash failed"
+        return 0
+
+    try:
+        return curses.wrapper(run_browser)
+    except curses.error as exc:
+        print(f"library terminal UI failed: {exc}", file=sys.stderr)
+        return 1
+
+
+def percentile_value(values: Sequence[float], percentile: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(float(value) for value in values)
+    index = max(0, min(len(ordered) - 1, math.ceil(percentile * len(ordered)) - 1))
+    return ordered[index]
+
+
+def load_vision_eval_manifest(path: Path) -> dict:
+    try:
+        payload = json.loads(path.read_text())
+    except OSError as exc:
+        raise ValueError(f"could not read evaluation manifest {path}: {exc}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid evaluation manifest {path}: {exc}") from exc
+    if not isinstance(payload, dict) or payload.get("version") != 1:
+        raise ValueError("evaluation manifest must be a version 1 JSON object")
+    if not isinstance(payload.get("sources"), list) or not isinstance(payload.get("cases"), list):
+        raise ValueError("evaluation manifest requires sources and cases arrays")
+    return payload
+
+
+def eval_event_in_window(event: dict, start: float, end: float) -> bool:
+    try:
+        event_start = float(event.get("t_start", event.get("t")))
+        event_end = float(event.get("t_end", event.get("t")))
+    except (TypeError, ValueError):
+        return False
+    return event_end >= start and event_start <= end
+
+
+def eval_event_in_roi(event: dict, roi: object) -> bool:
+    if not isinstance(roi, dict):
+        return True
+    box = event.get("box")
+    if not isinstance(box, dict):
+        return False
+    try:
+        center_x = float(box["x"]) + float(box["w"]) / 2
+        center_y = float(box["y"]) + float(box["h"]) / 2
+        x = float(roi["x"])
+        y = float(roi["y"])
+        width = float(roi["w"])
+        height = float(roi["h"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    return x <= center_x <= x + width and y <= center_y <= y + height
+
+
+def command_vision_eval(args: argparse.Namespace) -> int:
+    manifest_path = args.manifest.expanduser()
+    try:
+        manifest = load_vision_eval_manifest(manifest_path)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    media_root = args.media_root.expanduser()
+    if args.media_root == DEFAULT_RECORDINGS_DIR and args.recordings_dir != DEFAULT_RECORDINGS_DIR:
+        media_root = args.recordings_dir.expanduser()
+    timestamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
+    output_root = (
+        args.output_dir.expanduser()
+        if args.output_dir
+        else args.recordings_dir.expanduser() / "field-replay-eval" / timestamp
+    )
+    source_specs: dict[str, dict] = {}
+    for raw_source in manifest["sources"]:
+        if not isinstance(raw_source, dict):
+            print("evaluation source entries must be objects", file=sys.stderr)
+            return 1
+        source_id = str(raw_source.get("id") or "").strip()
+        source_path_value = str(raw_source.get("path") or "").strip()
+        if not source_id or not source_path_value or source_id in source_specs:
+            print("evaluation sources require unique non-empty id and path values", file=sys.stderr)
+            return 1
+        source_specs[source_id] = raw_source
+
+    detector_settings = manifest.get("detector", {})
+    if not isinstance(detector_settings, dict):
+        print("evaluation detector settings must be an object", file=sys.stderr)
+        return 1
+    allowed_detector_options = {
+        "sample_interval": "--sample-interval",
+        "scan_frame_rate": "--scan-frame-rate",
+        "max_samples": "--max-samples",
+        "min_confidence": "--min-confidence",
+        "min_area_pct": "--min-area-pct",
+        "min_movement_pct": "--min-movement-pct",
+        "min_directionality": "--min-directionality",
+        "subject_classes": "--subject-classes",
+        "yolo_input_size": "--yolo-input-size",
+        "yolo_backend": "--yolo-backend",
+    }
+    source_events: dict[str, list[dict]] = {}
+    prefix = field_replay_command_prefix(args)
+    for source_id, spec in source_specs.items():
+        source_path = Path(str(spec["path"])).expanduser()
+        if not source_path.is_absolute():
+            source_path = media_root / source_path
+        source_output = output_root / "detector" / source_id
+        events_path = source_output / "events.jsonl"
+        command = [
+            *prefix,
+            "yolo-scan",
+            str(source_path),
+            "--no-interactive",
+            "--output-dir",
+            str(source_output),
+            "--yolo-model",
+            str(args.yolo_model.expanduser()),
+            "--yolo-labels",
+            str(args.yolo_labels.expanduser()),
+        ]
+        combined_settings = dict(detector_settings)
+        if isinstance(spec.get("detector"), dict):
+            combined_settings.update(spec["detector"])
+        for key, option in allowed_detector_options.items():
+            if combined_settings.get(key) is not None:
+                command.extend([option, str(combined_settings[key])])
+        print(f"Evaluation source {source_id}: {source_path}")
+        if args.dry_run:
+            print("  " + shlex.join(command))
+            source_events[source_id] = []
+            continue
+        if not source_path.exists():
+            print(f"evaluation media is missing: {source_path}", file=sys.stderr)
+            return 1
+        if not args.reuse_results:
+            result = subprocess.run(command, check=False)
+            if result.returncode != 0:
+                return result.returncode
+        if not events_path.exists():
+            print(f"evaluation events are missing: {events_path}", file=sys.stderr)
+            return 1
+        source_events[source_id] = load_jsonl_records(events_path)
+
+    if args.dry_run:
+        print(f"Evaluation output: {output_root}")
+        return 0
+
+    ensure_directory(output_root)
+    for result_name in ("cases.jsonl", "identifier-cases.jsonl", "summary.json", "summary.txt"):
+        try:
+            (output_root / result_name).unlink()
+        except FileNotFoundError:
+            pass
+    case_results: list[dict] = []
+    transit_total = transit_hits = negative_total = negative_hits = 0
+    bib_total = bib_crop_hits = 0
+    for raw_case in manifest["cases"]:
+        if not isinstance(raw_case, dict):
+            continue
+        case_id = str(raw_case.get("id") or f"case-{len(case_results) + 1:03d}")
+        source_id = str(raw_case.get("source") or "")
+        expectation = str(raw_case.get("expect") or "").lower()
+        try:
+            start = float(raw_case.get("start"))
+            end = float(raw_case.get("end"))
+        except (TypeError, ValueError):
+            print(f"evaluation case {case_id} has invalid start/end", file=sys.stderr)
+            return 1
+        if source_id not in source_events or expectation not in {"transit", "negative"} or end < start:
+            print(f"evaluation case {case_id} is invalid", file=sys.stderr)
+            return 1
+        matches = [
+            event
+            for event in source_events[source_id]
+            if eval_event_in_window(event, start, end)
+            and eval_event_in_roi(event, raw_case.get("roi"))
+        ]
+        promoted = bool(matches)
+        passed = promoted if expectation == "transit" else not promoted
+        if expectation == "transit":
+            transit_total += 1
+            transit_hits += int(promoted)
+        else:
+            negative_total += 1
+            negative_hits += int(promoted)
+        if raw_case.get("bib_visible") is True:
+            bib_total += 1
+            crop_found = any(event.get("crop") or event.get("crops") for event in matches)
+            bib_crop_hits += int(crop_found)
+        result = {
+            "id": case_id,
+            "source": source_id,
+            "start": start,
+            "end": end,
+            "expect": expectation,
+            "passed": passed,
+            "promoted_events": len(matches),
+            "note": raw_case.get("note"),
+        }
+        case_results.append(result)
+        append_jsonl(output_root / "cases.jsonl", result)
+
+    ocr_results: list[dict] = []
+    ocr_positive = ocr_exact = ocr_negative = ocr_false_positive = 0
+    ocr_latencies: list[float] = []
+    if args.identifier_engine != "off":
+        engine_ok, engine_status = identifier_engine_status(
+            args.identifier_engine, args.ocrnet_command
+        )
+        if not engine_ok:
+            print(f"identifier engine unavailable: {engine_status}", file=sys.stderr)
+            return 1
+        for index, raw_case in enumerate(manifest.get("identifier_cases", []), start=1):
+            if not isinstance(raw_case, dict) or not raw_case.get("crop"):
+                continue
+            crop_path = Path(str(raw_case["crop"])).expanduser()
+            if not crop_path.is_absolute():
+                crop_path = media_root / crop_path
+            expected = raw_case.get("expected_identifier")
+            expected_normalized = (
+                normalize_door_number_text(expected) if expected not in (None, "") else None
+            )
+            result = read_identifier_crop_job(
+                image_path=crop_path,
+                engine=args.identifier_engine,
+                model=args.model,
+                ollama_host=args.ollama_host,
+                prompt=default_number_scan_prompt(),
+                timeout_seconds=args.timeout,
+                keepalive=args.keepalive,
+                ocrnet_command=args.ocrnet_command,
+            )
+            numbers = list(result.get("numbers") or [])
+            if expected_normalized:
+                ocr_positive += 1
+                ocr_exact += int(expected_normalized in numbers)
+            else:
+                ocr_negative += 1
+                ocr_false_positive += int(bool(numbers))
+            ocr_latencies.append(float(result.get("elapsed_ms") or 0))
+            row = {
+                "id": raw_case.get("id") or f"identifier-{index:03d}",
+                "crop": str(crop_path),
+                "expected_identifier": expected_normalized,
+                **result,
+            }
+            ocr_results.append(row)
+            append_jsonl(output_root / "identifier-cases.jsonl", row)
+
+    recall = transit_hits / transit_total if transit_total else 0.0
+    negative_promotion_rate = negative_hits / negative_total if negative_total else 0.0
+    crop_coverage = bib_crop_hits / bib_total if bib_total else None
+    exact_accuracy = ocr_exact / ocr_positive if ocr_positive else None
+    false_positive_rate = ocr_false_positive / ocr_negative if ocr_negative else None
+    p95_latency = percentile_value(ocr_latencies, 0.95)
+    gates = manifest.get("gates", {}) if isinstance(manifest.get("gates"), dict) else {}
+    detector_passed = (
+        recall >= float(gates.get("min_transit_recall", 0.95))
+        and negative_promotion_rate <= float(gates.get("max_negative_promotion_rate", 0.15))
+    )
+    identifier_passed = None
+    if args.identifier_engine != "off":
+        identifier_passed = bool(
+            exact_accuracy is not None
+            and exact_accuracy >= float(gates.get("min_identifier_exact_accuracy", 0.80))
+            and false_positive_rate is not None
+            and false_positive_rate <= float(gates.get("max_identifier_false_positive_rate", 0.02))
+            and p95_latency is not None
+            and p95_latency <= float(gates.get("max_identifier_p95_ms", 250))
+        )
+    summary = {
+        "created_at": datetime.now().astimezone().isoformat(),
+        "manifest": str(manifest_path),
+        "media_root": str(media_root),
+        "detector": {
+            "transit_cases": transit_total,
+            "transit_hits": transit_hits,
+            "transit_recall": recall,
+            "negative_cases": negative_total,
+            "negative_promotions": negative_hits,
+            "negative_promotion_rate": negative_promotion_rate,
+            "bib_visible_cases": bib_total,
+            "bib_crop_coverage": crop_coverage,
+            "passed": detector_passed,
+        },
+        "identifier": {
+            "engine": args.identifier_engine,
+            "positive_cases": ocr_positive,
+            "exact_matches": ocr_exact,
+            "exact_accuracy": exact_accuracy,
+            "negative_cases": ocr_negative,
+            "false_positives": ocr_false_positive,
+            "false_positive_rate": false_positive_rate,
+            "p95_latency_ms": p95_latency,
+            "passed": identifier_passed,
+        },
+    }
+    (output_root / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+    summary_lines = [
+        "Field Replay Vision Evaluation",
+        f"Transit recall: {transit_hits}/{transit_total} ({recall:.1%})",
+        f"Negative promotions: {negative_hits}/{negative_total} ({negative_promotion_rate:.1%})",
+        f"Bib crop coverage: {bib_crop_hits}/{bib_total}" if bib_total else "Bib crop coverage: not labeled",
+        f"Detector gate: {'PASS' if detector_passed else 'FAIL'}",
+        f"Identifier engine: {args.identifier_engine}",
+    ]
+    if identifier_passed is not None:
+        exact_label = f"{exact_accuracy:.1%}" if exact_accuracy is not None else "not measured"
+        false_positive_label = (
+            f"{false_positive_rate:.1%}" if false_positive_rate is not None else "not measured"
+        )
+        latency_label = f"{p95_latency:.0f} ms" if p95_latency is not None else "not measured"
+        summary_lines.extend(
+            [
+                f"Identifier exact accuracy: {exact_label}",
+                f"Identifier false-positive rate: {false_positive_label}",
+                f"Identifier p95 latency: {latency_label}",
+                f"Identifier gate: {'PASS' if identifier_passed else 'FAIL'}",
+            ]
+        )
+    summary_lines.append(f"Output: {output_root}")
+    (output_root / "summary.txt").write_text("\n".join(summary_lines) + "\n")
+    print("\n".join(summary_lines))
+    return 0 if detector_passed and identifier_passed is not False else 1
+
+
+def apply_doctor_profile(args: argparse.Namespace, config: dict) -> str | None:
+    if getattr(args, "no_profile", False):
+        return None
+    profiles = config.get("profiles", {})
+    if not isinstance(profiles, dict):
+        return None
+    profile_name = getattr(args, "profile", None) or config.get("last_profile")
+    profile = profiles.get(profile_name)
+    if not isinstance(profile, dict):
+        return None
+    defaults = {
+        "source_type": DEFAULT_SOURCE_TYPE,
+        "device": "/dev/video2",
+        "rtsp_url": "",
+        "rtsp_transport": DEFAULT_RTSP_TRANSPORT,
+        "video_input_format": DEFAULT_VIDEO_INPUT_FORMAT,
+        "video_codec_mode": DEFAULT_VIDEO_CODEC_MODE,
+        "capture_backend": DEFAULT_CAPTURE_BACKEND,
+        "audio_device": "hw:Capture,0",
+        "encoder": DEFAULT_ENCODER,
+        "framerate": 30,
+        "video_size": "1920x1080",
+        "video_bitrate": None,
+    }
+    provided_options = getattr(args, "_provided_options", set())
+    for key, default in defaults.items():
+        option = "--" + key.replace("_", "-")
+        if key in profile and option not in provided_options and getattr(args, key, default) == default:
+            value = profile[key]
+            if key == "recordings_dir":
+                value = Path(value).expanduser()
+            setattr(args, key, value)
+    if args.audio is None and "--audio" not in provided_options and "--no-audio" not in provided_options:
+        args.audio = profile_record_audio_enabled(profile)
+    recordings_dir = profile.get("recordings_dir")
+    if recordings_dir and "--recordings-dir" not in provided_options and args.recordings_dir == DEFAULT_RECORDINGS_DIR:
+        args.recordings_dir = Path(recordings_dir).expanduser()
+    return str(profile_name)
+
+
+def recording_capacity_summary(args: argparse.Namespace) -> str:
+    target = args.recordings_dir.expanduser()
+    existing = target if target.exists() else target.parent
+    try:
+        free_bytes = shutil.disk_usage(existing).free
+    except OSError:
+        return "unknown"
+    video_bps = parse_gst_bitrate(getattr(args, "video_bitrate", None))
+    audio_bps = 32_000 if args.audio else 0
+    hours = free_bytes * 8 / max(video_bps + audio_bps, 1) / 3600
+    return f"{format_bytes(free_bytes)} free; about {hours:.1f}h at {(video_bps + audio_bps) / 1_000_000:.2f} Mbps"
+
+
 def command_doctor(args: argparse.Namespace) -> int:
+    config = load_config(args.config_file.expanduser())
+    profile_name = apply_doctor_profile(args, config)
+    if args.audio is None:
+        args.audio = DEFAULT_RECORD_AUDIO_ENABLED
     for warning in auto_select_video_codec_mode(args):
         print(f"warning: {warning}", file=sys.stderr)
 
-    config = load_config(args.config_file.expanduser())
     ffmpeg_path, supported_encoders = detect_supported_encoders(args.ffmpeg_bin)
     has_nvenc = bool(
         ffmpeg_path
@@ -16847,6 +17839,9 @@ def command_doctor(args: argparse.Namespace) -> int:
     player = choose_player(args.player)
     jetson_player = shutil.which("nvgstplayer-1.0") or shutil.which("nvgstplayer")
     deepstream_ok, deepstream_status = deepstream_available()
+    deepstream_details = deepstream_version_details()
+    nvinfer_ok, nvinfer_status = gst_element_status("nvinfer")
+    nvinferserver_ok, nvinferserver_detail = nvinferserver_status()
     nvdcf_ok, nvdcf_status = deepstream_tracker_available(DEFAULT_SUBJECT_TRACKER)
     assist_detector_state, assist_detector_status = assist_subject_detector_status(config)
     assist_detector_ok = assist_detector_state in {"ok", "off"}
@@ -16864,6 +17859,13 @@ def command_doctor(args: argparse.Namespace) -> int:
         audio_ok = True
         audio_status = "embedded stream audio (connectivity not checked)" if args.audio else "disabled"
 
+    os_release = read_os_release()
+    print(f"profile:  {profile_name or 'none (raw defaults)'}")
+    print(f"platform: {os_release.get('PRETTY_NAME', sys.platform)}")
+    print(f"kernel:   {os.uname().release}")
+    print(f"jetpack:  {dpkg_package_version('nvidia-jetpack') or 'unknown'}")
+    print(f"l4t:      {dpkg_package_version('nvidia-l4t-core') or 'unknown'}")
+    print(f"power:    {jetson_power_mode() or 'unknown'}")
     print(f"ffmpeg:   {ffmpeg_path or 'missing'}")
     print(f"nvenc:    {'yes' if has_nvenc else 'no'}")
     print(f"gst-jetson:{' yes' if jetson_gstreamer_available() else ' no'}")
@@ -16876,10 +17878,29 @@ def command_doctor(args: argparse.Namespace) -> int:
         print(f"gst-decode-reason: {jetson_gstreamer_decode_unavailable_reason()}")
     print(f"deepstream:{' yes' if deepstream_ok else ' no'}")
     print(f"deepstream-status: {deepstream_status}")
+    print(f"deepstream-root: {deepstream_install_root()}")
+    print(f"tensorrt: {deepstream_details.get('TensorRT Version', 'unknown')}")
+    print(f"cuda:     {deepstream_details.get('CUDA Runtime Version', 'unknown')}")
+    print(f"nvinfer:  {'yes' if nvinfer_ok else 'no'} ({nvinfer_status})")
+    print(
+        f"nvinferserver: {'yes' if nvinferserver_ok else 'optional/unavailable'} "
+        f"({nvinferserver_detail})"
+    )
     print(f"nvdcf:    {'yes' if nvdcf_ok else 'no'}")
     print(f"nvdcf-status: {nvdcf_status}")
     print(f"assist-detector: {assist_detector_state}")
     print(f"assist-detector-status: {assist_detector_status}")
+    for identifier_engine in ("tesseract", "ocrnet", "ollama"):
+        if identifier_engine == "ollama":
+            ollama_path = shutil.which("ollama")
+            engine_ok = bool(ollama_path)
+            engine_status = ollama_path or "ollama executable is missing"
+        else:
+            engine_ok, engine_status = identifier_engine_status(identifier_engine)
+        print(
+            f"identifier-{identifier_engine}: {'yes' if engine_ok else 'optional/unavailable'} "
+            f"({engine_status})"
+        )
     print(f"gst-player:{' '}{jetson_player or 'missing'}")
     print(f"video:    {args.video_codec_mode}")
     print(f"backend:  {capture_backend or 'missing'}")
@@ -16893,6 +17914,7 @@ def command_doctor(args: argparse.Namespace) -> int:
         print(f"rtsp:     transport={args.rtsp_transport}")
     print(f"audio:    {audio_status}")
     print(f"outputs:  {args.recordings_dir.expanduser()}")
+    print(f"capacity: {recording_capacity_summary(args)}")
 
     if (
         not ffmpeg_path
@@ -17374,6 +18396,30 @@ def build_parser() -> argparse.ArgumentParser:
     )
     watch.set_defaults(func=command_watch)
 
+    library = subparsers.add_parser(
+        "library",
+        help="Browse recordings, preview media in mpv, rename items, or move them to trash.",
+    )
+    library.add_argument(
+        "root",
+        nargs="?",
+        type=Path,
+        help="Folder to browse. Defaults to the configured recordings directory.",
+    )
+    library.add_argument(
+        "--player", default="mpv", help="Player used for previews. Defaults to mpv."
+    )
+    library.add_argument(
+        "--file-caching-ms", type=int, default=300, help="Player cache for previews."
+    )
+    library.add_argument(
+        "--player-hwdec", default=DEFAULT_PLAYER_HWDEC, help="Player hardware decode mode."
+    )
+    library.add_argument(
+        "--dry-run", action="store_true", help="List visible items and preview choices without opening the UI."
+    )
+    library.set_defaults(func=command_library)
+
     ui = subparsers.add_parser(
         "ui",
         help="Open the operator dashboard for recording, DVR playback, and assistive review.",
@@ -17504,6 +18550,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=3,
         help="Maximum crop images to inspect for each promoted subject.",
+    )
+    assist.add_argument(
+        "--identifier-engine",
+        choices=IDENTIFIER_ENGINES,
+        default=DEFAULT_IDENTIFIER_ENGINE,
+        help="Identifier reader. Defaults to crop-only/off for new event workflows.",
+    )
+    assist.add_argument(
+        "--ocrnet-command",
+        help="OCRNet adapter command; it receives a crop path and returns JSON or text.",
     )
     assist.add_argument(
         "--speak",
@@ -17749,8 +18805,18 @@ def build_parser() -> argparse.ArgumentParser:
     assist_live.add_argument(
         "--read-identifiers",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="Read tentative race identifiers from promoted subject crops.",
+    )
+    assist_live.add_argument(
+        "--identifier-engine",
+        choices=IDENTIFIER_ENGINES,
+        default=DEFAULT_IDENTIFIER_ENGINE,
+        help="Identifier reader used when --read-identifiers is enabled.",
+    )
+    assist_live.add_argument(
+        "--ocrnet-command",
+        help="OCRNet adapter command; it receives a crop path and returns JSON or text.",
     )
     assist_live.add_argument(
         "--model",
@@ -18578,6 +19644,57 @@ def build_parser() -> argparse.ArgumentParser:
     )
     yolo_scan.set_defaults(func=command_yolo_scan)
 
+    vision_eval = subparsers.add_parser(
+        "vision-eval",
+        help="Run repeatable detector and identifier regression against labeled field footage.",
+    )
+    vision_eval.add_argument(
+        "--manifest",
+        type=Path,
+        default=DEFAULT_VISION_EVAL_MANIFEST,
+        help="Version 1 evaluation manifest. Defaults to the bundled marathon corpus manifest.",
+    )
+    vision_eval.add_argument(
+        "--media-root",
+        type=Path,
+        default=DEFAULT_RECORDINGS_DIR,
+        help="Root used to resolve relative media and crop paths in the manifest.",
+    )
+    vision_eval.add_argument(
+        "--output-dir",
+        type=Path,
+        help="Evaluation output directory. Defaults to a timestamped directory under recordings.",
+    )
+    vision_eval.add_argument(
+        "--reuse-results",
+        action="store_true",
+        help="Score detector events already present in --output-dir without rerunning scans.",
+    )
+    vision_eval.add_argument(
+        "--yolo-model", type=Path, default=DEFAULT_YOLO_MODEL, help="YOLO ONNX model path."
+    )
+    vision_eval.add_argument(
+        "--yolo-labels", type=Path, default=DEFAULT_YOLO_LABELS, help="YOLO label file."
+    )
+    vision_eval.add_argument(
+        "--identifier-engine",
+        choices=IDENTIFIER_ENGINES,
+        default=DEFAULT_IDENTIFIER_ENGINE,
+        help="Optional identifier engine to score; off evaluates detection and crop coverage only.",
+    )
+    vision_eval.add_argument(
+        "--ocrnet-command",
+        help="OCRNet adapter command; it receives a crop path and returns JSON or text.",
+    )
+    vision_eval.add_argument("--model", default=DEFAULT_VISION_MODEL, help="Ollama model when selected.")
+    vision_eval.add_argument("--ollama-host", default=DEFAULT_OLLAMA_HOST, help="Ollama host when selected.")
+    vision_eval.add_argument("--timeout", type=float, default=120.0, help="Per-crop OCR timeout.")
+    vision_eval.add_argument("--keepalive", default="5m", help="Ollama keepalive when selected.")
+    vision_eval.add_argument(
+        "--dry-run", action="store_true", help="Print planned scans without writing evaluation output."
+    )
+    vision_eval.set_defaults(func=command_vision_eval)
+
     subject_scan = subparsers.add_parser(
         "subject-scan",
         help="Experimentally promote directional transits from DeepStream subject tracks.",
@@ -18685,6 +19802,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--model",
         default=DEFAULT_VISION_MODEL,
         help="Ollama vision model to query.",
+    )
+    number_scan.add_argument(
+        "--identifier-engine",
+        choices=IDENTIFIER_ENGINES,
+        default="ollama",
+        help="Identifier reader. Legacy number-scan defaults to Ollama.",
+    )
+    number_scan.add_argument(
+        "--ocrnet-command",
+        help="OCRNet adapter command; it receives a crop path and returns JSON or text.",
     )
     number_scan.add_argument(
         "--ollama-host",
@@ -19014,6 +20141,15 @@ def build_parser() -> argparse.ArgumentParser:
         "doctor", help="Check the main dependencies and source configuration."
     )
     doctor.add_argument(
+        "--profile",
+        help="Saved recording profile to validate. Defaults to the last-used profile.",
+    )
+    doctor.add_argument(
+        "--no-profile",
+        action="store_true",
+        help="Validate raw command defaults instead of a saved profile.",
+    )
+    doctor.add_argument(
         "--source-type",
         choices=SOURCE_TYPES,
         default=DEFAULT_SOURCE_TYPE,
@@ -19039,7 +20175,7 @@ def build_parser() -> argparse.ArgumentParser:
     doctor.add_argument(
         "--audio",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=None,
         help="Check the configured audio capture device too.",
     )
     doctor.add_argument(
@@ -19055,6 +20191,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--encoder",
         default=DEFAULT_ENCODER,
         help="Preferred video encoder to validate, with automatic fallback.",
+    )
+    doctor.add_argument("--framerate", type=int, default=30, help="Capture framerate to report.")
+    doctor.add_argument(
+        "--video-size", default="1920x1080", help="Capture resolution to report."
+    )
+    doctor.add_argument(
+        "--video-bitrate", help="Target video bitrate for storage estimation, such as 8M."
     )
     doctor.add_argument(
         "--video-codec-mode",
@@ -19092,7 +20235,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    raw_argv = list(argv) if argv is not None else sys.argv[1:]
+    args = parser.parse_args(raw_argv)
+    args._provided_options = {
+        token.split("=", 1)[0] for token in raw_argv if token.startswith("--")
+    }
     return args.func(args)
 
 

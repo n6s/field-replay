@@ -1,0 +1,166 @@
+{
+  "version": 1,
+  "description": "Recall-first field replay corpus using real marathon and road-race footage.",
+  "detector": {
+    "sample_interval": 0.25,
+    "min_confidence": 0.15,
+    "min_area_pct": 0.005,
+    "min_movement_pct": 0.5,
+    "min_directionality": 0.2,
+    "subject_classes": "person,bicycle,car,motorbike,bus,truck",
+    "yolo_backend": "auto"
+  },
+  "gates": {
+    "min_transit_recall": 0.95,
+    "max_negative_promotion_rate": 0.15,
+    "min_identifier_exact_accuracy": 0.8,
+    "max_identifier_false_positive_rate": 0.02,
+    "max_identifier_p95_ms": 250
+  },
+  "sources": [
+    {
+      "id": "marathon-60s",
+      "path": "marathon_clip_60s.mp4"
+    },
+    {
+      "id": "norc-narrow-20s",
+      "path": "field-replay-yolo-eval/NORC-NS-narrow-20s.mp4"
+    }
+  ],
+  "cases": [
+    {
+      "id": "marathon-opening-runners",
+      "source": "marathon-60s",
+      "start": 0.0,
+      "end": 5.5,
+      "expect": "transit",
+      "roi": {"x": 0, "y": 350, "w": 1920, "h": 730},
+      "bib_visible": true,
+      "note": "Purposeful runners crossing the foreground; stationary event staff are not the target."
+    },
+    {
+      "id": "marathon-middle-runners-a",
+      "source": "marathon-60s",
+      "start": 12.0,
+      "end": 20.0,
+      "expect": "transit",
+      "roi": {"x": 0, "y": 350, "w": 1920, "h": 730},
+      "bib_visible": true
+    },
+    {
+      "id": "marathon-middle-runners-b",
+      "source": "marathon-60s",
+      "start": 22.0,
+      "end": 28.0,
+      "expect": "transit",
+      "roi": {"x": 0, "y": 350, "w": 1920, "h": 730},
+      "bib_visible": true
+    },
+    {
+      "id": "marathon-late-runners-a",
+      "source": "marathon-60s",
+      "start": 34.0,
+      "end": 44.0,
+      "expect": "transit",
+      "roi": {"x": 0, "y": 350, "w": 1920, "h": 730},
+      "bib_visible": true
+    },
+    {
+      "id": "marathon-late-runners-b",
+      "source": "marathon-60s",
+      "start": 53.0,
+      "end": 60.0,
+      "expect": "transit",
+      "roi": {"x": 0, "y": 350, "w": 1920, "h": 730},
+      "bib_visible": true
+    },
+    {
+      "id": "marathon-staff-zone-a",
+      "source": "marathon-60s",
+      "start": 12.0,
+      "end": 20.0,
+      "expect": "negative",
+      "roi": {"x": 600, "y": 220, "w": 500, "h": 190},
+      "note": "Staff and spectators lingering beside the course must not be promoted as transits."
+    },
+    {
+      "id": "marathon-staff-zone-b",
+      "source": "marathon-60s",
+      "start": 34.0,
+      "end": 44.0,
+      "expect": "negative",
+      "roi": {"x": 600, "y": 220, "w": 500, "h": 190}
+    },
+    {
+      "id": "norc-car-a",
+      "source": "norc-narrow-20s",
+      "start": 1.0,
+      "end": 4.0,
+      "expect": "transit",
+      "roi": {"x": 0, "y": 250, "w": 1920, "h": 650},
+      "bib_visible": true
+    },
+    {
+      "id": "norc-empty-a",
+      "source": "norc-narrow-20s",
+      "start": 3.2,
+      "end": 4.8,
+      "expect": "negative"
+    },
+    {
+      "id": "norc-car-b",
+      "source": "norc-narrow-20s",
+      "start": 5.0,
+      "end": 7.5,
+      "expect": "transit",
+      "roi": {"x": 0, "y": 250, "w": 1920, "h": 650},
+      "bib_visible": true
+    },
+    {
+      "id": "norc-empty-b",
+      "source": "norc-narrow-20s",
+      "start": 8.0,
+      "end": 12.0,
+      "expect": "negative"
+    },
+    {
+      "id": "norc-empty-c",
+      "source": "norc-narrow-20s",
+      "start": 12.0,
+      "end": 19.2,
+      "expect": "negative"
+    }
+  ],
+  "identifier_cases": [
+    {
+      "id": "norc-322",
+      "crop": "field-replay-yolo-eval/runs/norc-narrow-yolov5n/crops/subject-0002-000014197.jpg",
+      "expected_identifier": "322"
+    },
+    {
+      "id": "norc-326",
+      "crop": "field-replay-yolo-eval/runs/norc-narrow-yolov5n/crops/subject-0003-000018000.jpg",
+      "expected_identifier": "326"
+    },
+    {
+      "id": "norc-348",
+      "crop": "field-replay-yolo-eval/runs/norc-narrow-yolov5n/crops/subject-0004-000033972.jpg",
+      "expected_identifier": "348"
+    },
+    {
+      "id": "norc-421",
+      "crop": "field-replay-yolo-eval/runs/norc-narrow-yolov5n/crops/subject-0005-000057042.jpg",
+      "expected_identifier": "421"
+    },
+    {
+      "id": "negative-staff-sign",
+      "crop": "field-replay-yolo-eval/runs/marathon-yolov5n/crops/subject-0002-000003036.jpg",
+      "expected_identifier": null
+    },
+    {
+      "id": "negative-bicycle",
+      "crop": "field-replay-yolo-eval/runs/marathon-yolov5n/crops/subject-0011-000055822.jpg",
+      "expected_identifier": null
+    }
+  ]
+}
